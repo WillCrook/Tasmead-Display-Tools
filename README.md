@@ -1,5 +1,8 @@
 # famborough-aircraft-route-converter
 
+## How to Use
+
+Just add your input KML files into the input folder and it will convert the coordinates to the Farnborough Runway
 
 
 ## Getting started
