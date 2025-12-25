@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QFileDialog,
     QLineEdit, QCheckBox, QFrame,
     QListWidget, QInputDialog, QMessageBox,
-    QComboBox
+    QComboBox, QSplitter,
 )
 from PyQt6.QtCore import Qt
 import json
@@ -33,13 +33,30 @@ class DebrisPage(QWidget):
 
         layout = QHBoxLayout(self)
 
-        presets = QVBoxLayout()
-        config = QVBoxLayout()
-        file_panel = QVBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: black;
+                width: 6px;
+            }
+        """)
+        layout.addWidget(splitter)
 
-        layout.addLayout(presets, 1)
-        layout.addLayout(config, 2)
-        layout.addLayout(file_panel, 3)
+        presets_widget = QWidget()
+        config_widget = QWidget()
+        file_widget = QWidget()
+
+        presets = QVBoxLayout(presets_widget)
+        config = QVBoxLayout(config_widget)
+        file_panel = QVBoxLayout(file_widget)
+
+        splitter.addWidget(presets_widget)
+        splitter.addWidget(config_widget)
+        splitter.addWidget(file_widget)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 2)
 
         self.presets_path = "data/presets.json"
         self.presets = {}
@@ -128,15 +145,14 @@ class DebrisPage(QWidget):
 
     def build_config(self, layout):
         defaults = {
-            "mass_kg": "",
-            "area_m2": "",
-            "Cd": "",
-            "rho": "",
-            "g": "",
-            "dt": "",
-            "ktas": "",
-            "terrain_ft": "",
-            "vz_bounce_min": ""
+            "Mass (kg)": "",
+            "Frontal area A (m²)": "",
+            "Drag Coefficient Cd": "",
+            "Air Density ρ (kg/m³)": "",
+            "Gravity g (m/s²)": "",
+            "KTAS (knots true airspeed)": "",
+            "Time step (s)": "",
+            "Impact / slide physics": ""
         }
 
         title = QLabel("Config")
@@ -167,6 +183,123 @@ class DebrisPage(QWidget):
         layout.addStretch()
 
     def build_file_panel(self, layout):
+        title = QLabel("Flight Input & Simulation")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(title)
+
+        self.mode_group = QButtonGroup(self)
+        self.rb_kml = QRadioButton("From KML")
+        self.rb_coords = QRadioButton("From Coordinates")
+        self.rb_bearing = QRadioButton("From Bearing")
+
+        self.rb_kml.setChecked(True)
+
+        self.mode_group.addButton(self.rb_kml)
+        self.mode_group.addButton(self.rb_coords)
+        self.mode_group.addButton(self.rb_bearing)
+
+        hbox_modes = QHBoxLayout()
+        hbox_modes.addWidget(self.rb_kml)
+        hbox_modes.addWidget(self.rb_coords)
+        hbox_modes.addWidget(self.rb_bearing)
+        hbox_modes.addStretch()
+        layout.addLayout(hbox_modes)
+
+        self.flight_mode = "kml"
+
+        self.rb_kml.toggled.connect(lambda checked: self.set_flight_mode("kml") if checked else None)
+        self.rb_coords.toggled.connect(lambda checked: self.set_flight_mode("coords") if checked else None)
+        self.rb_bearing.toggled.connect(lambda checked: self.set_flight_mode("bearing") if checked else None)
+
+        self.mode_stack = QWidget()
+        self.mode_stack_layout = QVBoxLayout(self.mode_stack)
+        layout.addWidget(self.mode_stack)
+
+        # Altitude inputs
+        alt_layout = QHBoxLayout()
+        alt_m_label = QLabel("Altitude (m)")
+        self.alt_m = QLineEdit()
+        alt_ft_label = QLabel("Altitude (ft)")
+        self.alt_ft = QLineEdit()
+        alt_layout.addWidget(alt_m_label)
+        alt_layout.addWidget(self.alt_m)
+        alt_layout.addWidget(alt_ft_label)
+        alt_layout.addWidget(self.alt_ft)
+        layout.addLayout(alt_layout)
+
+        self._alt_updating = False
+
+        def alt_m_changed(text):
+            if self._alt_updating:
+                return
+            self._alt_updating = True
+            try:
+                m = float(text)
+                ft = m * 3.28084
+                self.alt_ft.setText(f"{ft:.2f}")
+            except ValueError:
+                self.alt_ft.clear()
+            self._alt_updating = False
+
+        def alt_ft_changed(text):
+            if self._alt_updating:
+                return
+            self._alt_updating = True
+            try:
+                ft = float(text)
+                m = ft / 3.28084
+                self.alt_m.setText(f"{m:.2f}")
+            except ValueError:
+                self.alt_m.clear()
+            self._alt_updating = False
+
+        self.alt_m.textChanged.connect(alt_m_changed)
+        self.alt_ft.textChanged.connect(alt_ft_changed)
+
+        # Terrain inputs
+        terrain_layout = QHBoxLayout()
+        terrain_m_label = QLabel("Terrain (m)")
+        self.terrain_m = QLineEdit()
+        terrain_ft_label = QLabel("Terrain (ft)")
+        self.terrain_ft = QLineEdit()
+        terrain_layout.addWidget(terrain_m_label)
+        terrain_layout.addWidget(self.terrain_m)
+        terrain_layout.addWidget(terrain_ft_label)
+        terrain_layout.addWidget(self.terrain_ft)
+        layout.addLayout(terrain_layout)
+
+        self._terrain_updating = False
+
+        def terrain_m_changed(text):
+            if self._terrain_updating:
+                return
+            self._terrain_updating = True
+            try:
+                m = float(text)
+                ft = m * 3.28084
+                self.terrain_ft.setText(f"{ft:.2f}")
+            except ValueError:
+                self.terrain_ft.clear()
+            self._terrain_updating = False
+
+        def terrain_ft_changed(text):
+            if self._terrain_updating:
+                return
+            self._terrain_updating = True
+            try:
+                ft = float(text)
+                m = ft / 3.28084
+                self.terrain_m.setText(f"{m:.2f}")
+            except ValueError:
+                self.terrain_m.clear()
+            self._terrain_updating = False
+
+        self.terrain_m.textChanged.connect(terrain_m_changed)
+        self.terrain_ft.textChanged.connect(terrain_ft_changed)
+
+        # KML drop area (only for KML mode)
+        self.kml_container = QWidget()
+        kml_layout = QVBoxLayout(self.kml_container)
         self.file_label = QLabel("Drop KML file here\nor click to browse")
         self.file_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.file_label.setFrameShape(QFrame.Shape.Box)
@@ -177,13 +310,95 @@ class DebrisPage(QWidget):
         self.file_label.dragEnterEvent = self.drag_enter
         self.file_label.dropEvent = self.drop_event
 
-        layout.addWidget(self.file_label)
+        kml_layout.addWidget(self.file_label)
+
+        # Coordinates mode inputs
+        self.coords_container = QWidget()
+        coords_layout = QVBoxLayout(self.coords_container)
+        lat1_label = QLabel("Lat 1")
+        self.lat1_input = QLineEdit()
+        lon1_label = QLabel("Lon 1")
+        self.lon1_input = QLineEdit()
+        lat2_label = QLabel("Lat 2")
+        self.lat2_input = QLineEdit()
+        lon2_label = QLabel("Lon 2")
+        self.lon2_input = QLineEdit()
+
+        coords_layout.addWidget(lat1_label)
+        coords_layout.addWidget(self.lat1_input)
+        coords_layout.addWidget(lon1_label)
+        coords_layout.addWidget(self.lon1_input)
+        coords_layout.addWidget(lat2_label)
+        coords_layout.addWidget(self.lat2_input)
+        coords_layout.addWidget(lon2_label)
+        coords_layout.addWidget(self.lon2_input)
+
+        # Bearing mode inputs
+        self.bearing_container = QWidget()
+        bearing_layout = QVBoxLayout(self.bearing_container)
+        lat_label = QLabel("Lat")
+        self.bearing_lat_input = QLineEdit()
+        lon_label = QLabel("Lon")
+        self.bearing_lon_input = QLineEdit()
+        azimuth_label = QLabel("Azimuth (degrees)")
+        self.azimuth_input = QLineEdit()
+
+        bearing_layout.addWidget(lat_label)
+        bearing_layout.addWidget(self.bearing_lat_input)
+        bearing_layout.addWidget(lon_label)
+        bearing_layout.addWidget(self.bearing_lon_input)
+        bearing_layout.addWidget(azimuth_label)
+        bearing_layout.addWidget(self.azimuth_input)
+
+        # Store all flight inputs
+        self.flight_inputs = {
+            "kml": {},
+            "coords": {
+                "lat1": self.lat1_input,
+                "lon1": self.lon1_input,
+                "lat2": self.lat2_input,
+                "lon2": self.lon2_input,
+            },
+            "bearing": {
+                "lat": self.bearing_lat_input,
+                "lon": self.bearing_lon_input,
+                "azimuth": self.azimuth_input,
+            }
+        }
+
+        layout.addWidget(self.kml_container)
 
         self.run_btn = QPushButton("Run Simulation")
         self.run_btn.clicked.connect(self.run_simulation)
         layout.addWidget(self.run_btn)
 
         layout.addStretch()
+
+        self.update_flight_mode_ui()
+
+    def set_flight_mode(self, mode):
+        self.flight_mode = mode
+        self.update_flight_mode_ui()
+
+    def update_flight_mode_ui(self):
+        # Clear mode stack
+        for i in reversed(range(self.mode_stack_layout.count())):
+            w = self.mode_stack_layout.itemAt(i).widget()
+            if w:
+                w.setParent(None)
+
+        if self.flight_mode == "kml":
+            self.kml_container.show()
+        else:
+            self.kml_container.hide()
+
+        if self.flight_mode == "kml":
+            # no additional widgets in mode_stack for kml
+            pass
+        elif self.flight_mode == "coords":
+            self.mode_stack_layout.addWidget(self.coords_container)
+        elif self.flight_mode == "bearing":
+            self.mode_stack_layout.addWidget(self.bearing_container)
 
     def browse_file(self, _):
         file, _ = QFileDialog.getOpenFileName(
@@ -204,8 +419,66 @@ class DebrisPage(QWidget):
             self.file_label.setText(self.kml_input_path)
 
     def run_simulation(self):
-        if not hasattr(self, "kml_input_path"):
-            QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
+        # Validate altitude input
+        try:
+            altitude_m = float(self.alt_m.text())
+        except (ValueError, AttributeError):
+            QMessageBox.warning(self, "Invalid input", "Please enter a valid altitude in metres.")
+            return
+
+        # Validate terrain input
+        try:
+            terrain_m = float(self.terrain_m.text())
+        except (ValueError, AttributeError):
+            QMessageBox.warning(self, "Invalid input", "Please enter a valid terrain height in metres.")
+            return
+
+        # Validate config inputs
+        try:
+            config = {k: float(v.text()) for k, v in self.inputs.items()}
+        except ValueError:
+            QMessageBox.warning(self, "Invalid input", "Please enter valid numerical values in config fields.")
+            return
+
+        config["include_ground_drag"] = self.include_ground_drag.isChecked()
+        config["surface"] = self.surface_combo.currentText()
+
+        # Prepare input params based on flight mode
+        if self.flight_mode == "kml":
+            if not hasattr(self, "kml_input_path") or not self.kml_input_path:
+                QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
+                return
+
+            input_kml = self.kml_input_path
+            input_coords = None
+            input_bearing = None
+
+        elif self.flight_mode == "coords":
+            try:
+                lat1 = float(self.lat1_input.text())
+                lon1 = float(self.lon1_input.text())
+                lat2 = float(self.lat2_input.text())
+                lon2 = float(self.lon2_input.text())
+            except ValueError:
+                QMessageBox.warning(self, "Invalid input", "Please enter valid coordinates for Lat 1, Lon 1, Lat 2, Lon 2.")
+                return
+            input_kml = None
+            input_coords = (lat1, lon1, lat2, lon2)
+            input_bearing = None
+
+        elif self.flight_mode == "bearing":
+            try:
+                lat = float(self.bearing_lat_input.text())
+                lon = float(self.bearing_lon_input.text())
+                azimuth = float(self.azimuth_input.text())
+            except ValueError:
+                QMessageBox.warning(self, "Invalid input", "Please enter valid latitude, longitude, and azimuth.")
+                return
+            input_kml = None
+            input_coords = None
+            input_bearing = (lat, lon, azimuth)
+        else:
+            QMessageBox.warning(self, "Invalid mode", "Unknown flight input mode selected.")
             return
 
         save_path, _ = QFileDialog.getSaveFileName(
@@ -217,36 +490,38 @@ class DebrisPage(QWidget):
         if not save_path:
             return
 
-        config = {k: float(v.text()) for k, v in self.inputs.items()}
-        config["include_ground_drag"] = self.include_ground_drag.isChecked()
-        config["surface"] = self.surface_combo.currentText()
-
         self.run_debris_calculator(
-            input_kml=self.kml_input_path,
+            input_kml=input_kml,
+            input_coords=input_coords,
+            input_bearing=input_bearing,
             output_kml=save_path,
-            config=config
+            config=config,
+            altitude_m=altitude_m,
+            terrain_m=terrain_m,
         )
 
-        QMessageBox.information(self, "Complete", "Debris trajectory KML saved.")
-
-    def run_debris_calculator(self, input_kml, output_kml, config):
+    def run_debris_calculator(self, input_kml, input_coords, input_bearing, output_kml, config, altitude_m, terrain_m):
         """
         Hook point for Debris_Trajectory_Calculator.py
         """
-        
-        simulation = DebrisTrajectoryCalculator(
-            mass_kg=config["mass_kg"],
-            area_m2=config["area_m2"],
-            Cd=config["Cd"],
-            rho=config["rho"],
-            g=config["g"],
-            dt=config["dt"],
-            ktas=config["ktas"],
-            surface=config.get("surface", "asphalt"),
-            input_file=input_kml,
-            output_file=output_kml
-        )
         try:
+            simulation = DebrisTrajectoryCalculator(
+                mass_kg=config["Mass (kg)"],
+                area_m2=config["Frontal area A (m²)"],
+                Cd=config["Drag Coefficient Cd"],
+                rho=config["Air Density ρ (kg/m³)"],
+                g=config["Gravity g (m/s²)"],
+                dt=config["Time step (s)"],
+                ktas=config["KTAS (knots true airspeed)"],
+                surface=config.get("surface", "asphalt"),
+                input_file=input_kml,
+                output_file=output_kml,
+                include_ground_drag=config["include_ground_drag"],
+                terrain_ft=terrain_m * 3.28084,
+                altitude_m=altitude_m,
+                input_coords=input_coords,
+                input_bearing=input_bearing,
+            )
             simulation.run_debris_trajectory_simulation()
         except Exception as e:
             QMessageBox.critical(self, "Simulation Error", str(e))

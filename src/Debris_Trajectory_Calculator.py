@@ -1,9 +1,9 @@
 import math
 import pandas as pd
-import xml.etree.ElementTree as ET
+from KML_File_Handling import load_last_two_points_from_kml
 
 class DebrisTrajectoryCalculator:
-    def __init__(self,mass_kg, area_m2, Cd, rho, g, dt, ktas, surface, input_file, output_file):
+    def __init__(self,mass_kg, area_m2, Cd, rho, g, dt, ktas, surface, input_file, output_file, include_ground_drag, terrain_ft):
 
         # INPUTS
         self.mass_kg = mass_kg
@@ -15,10 +15,10 @@ class DebrisTrajectoryCalculator:
         self.ktas = ktas
         self.surface = surface
         self.vz_bounce_min = 0.5
-        self.include_ground_drag = True
+        self.include_ground_drag = include_ground_drag
 
         # Terrain elevation (AMSL)
-        self.terrain_ft = 190.288
+        self.terrain_ft = terrain_ft
         self.terrain_m = self.terrain_ft * 0.3048
 
         # Final two lead-in points (lon, lat, alt metres AMSL)
@@ -35,31 +35,6 @@ class DebrisTrajectoryCalculator:
         self.output_file = output_file
 
         # CALCULATION all credit goes to: https://github.com/mkarachalios-1/airshow-trajectory-app/blob/main/streamlit_app.py
-
-    # def load_last_two_points_from_kml(self):
-    #     tree = ET.parse(self.input_file)
-    #     root = tree.getroot()
-
-    #     ns = {
-    #         'kml': 'http://www.opengis.net/kml/2.2',
-    #         'gx': 'http://www.google.com/kml/ext/2.2'
-    #     }
-
-    #     coord_elements = root.findall('.//gx:coord', ns)
-    #     if len(coord_elements) < 2:
-    #         raise ValueError("Not enough <gx:coord> elements in KML file.")
-
-    #     # Take the last two coordinates
-    #     penultimate = coord_elements[-2].text.strip().split()
-    #     final = coord_elements[-1].text.strip().split()
-
-    #     self.penultimate_lon = float(penultimate[0])
-    #     self.penultimate_lat = float(penultimate[1])
-
-    #     self.final_lon = float(final[0])
-    #     self.final_lat = float(final[1])
-    #     self.alt_m = float(final[2]) if len(final) > 2 else 0.0
-    #     self.alt_ft = self.alt_m / 0.3048
 
     @staticmethod
     def bearing_deg(lat1, lon1, lat2, lon2):
@@ -86,7 +61,7 @@ class DebrisTrajectoryCalculator:
     def simulate_3d(
         self,
         m, A, Cd, rho, g, dt,
-        alt_m, ktas, angle_deg, surface="grass",
+        alt_m, ktas, angle_deg, surface,
         vz0=0.0, include_ground_drag=True,
         vz_bounce_min=0.5, max_steps=300000
     ):
@@ -100,6 +75,7 @@ class DebrisTrajectoryCalculator:
         theta = math.radians(angle_deg)
         vx0, vy0 = V * math.cos(theta), V * math.sin(theta)
 
+        print("Surface used:", surface)
         s = self.SURFSETS[surface]
         mu_imp, mu_slide, e0, einf, vc = s["mu_imp"], s["mu_slide"], s["e0"], s["einf"], s["vc"]
 
@@ -200,7 +176,6 @@ class DebrisTrajectoryCalculator:
         return pd.DataFrame(rows)
 
     def run_debris_trajectory_simulation(self):
-        # self.load_last_two_points_from_kml()
         az_deg = self.bearing_deg(self.penultimate_lat, self.penultimate_lon, self.final_lat, self.final_lon)
         self.az_world = math.radians(az_deg)
 
@@ -226,7 +201,7 @@ class DebrisTrajectoryCalculator:
             x = float(row["x"])
             y = float(row["y"])
             z = float(row["z"])
-            print(z)
+            
             east = x * math.sin(self.az_world) + y * math.sin(self.az_world + math.pi/2.0)
             north = x * math.cos(self.az_world) + y * math.cos(self.az_world + math.pi/2.0)
 
@@ -244,8 +219,7 @@ class DebrisTrajectoryCalculator:
             else:
                 coords_ground.append((lon, lat, alt_real))
 
-        out_kml = self.output_file
-        with open(out_kml, "w", encoding="utf-8") as f:
+        with open(self.output_file, "w", encoding="utf-8") as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
             f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n')
             f.write('<Document>\n')
@@ -267,5 +241,8 @@ class DebrisTrajectoryCalculator:
 
             f.write('</Document>\n</kml>\n')
 
-        print(f"Wrote: {out_kml}")
+        print(f"Wrote: {self.output_file}")
         print(f"Azimuth used (deg): {az_deg:.3f}")
+        print(f"Total ground‑planar distance (m): {df['x'].iloc[-1]:.3f}")
+        print(f"Ground distance to rest (m): {df[df['phase']=='slide']['x'].iloc[-1]:.3f}")
+        print(f"Air distance to first impact (m): {df[df['phase']=='air']['x'].iloc[-1]:.3f}")
