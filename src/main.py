@@ -229,33 +229,6 @@ class DebrisPage(QWidget):
 
         self._alt_updating = False
 
-        def alt_m_changed(text):
-            if self._alt_updating:
-                return
-            self._alt_updating = True
-            try:
-                m = float(text)
-                ft = m * 3.28084
-                self.alt_ft.setText(f"{ft:.2f}")
-            except ValueError:
-                self.alt_ft.clear()
-            self._alt_updating = False
-
-        def alt_ft_changed(text):
-            if self._alt_updating:
-                return
-            self._alt_updating = True
-            try:
-                ft = float(text)
-                m = ft / 3.28084
-                self.alt_m.setText(f"{m:.2f}")
-            except ValueError:
-                self.alt_m.clear()
-            self._alt_updating = False
-
-        self.alt_m.textChanged.connect(alt_m_changed)
-        self.alt_ft.textChanged.connect(alt_ft_changed)
-
         # Terrain inputs
         terrain_layout = QHBoxLayout()
         terrain_m_label = QLabel("Terrain (m)")
@@ -270,32 +243,27 @@ class DebrisPage(QWidget):
 
         self._terrain_updating = False
 
-        def terrain_m_changed(text):
-            if self._terrain_updating:
-                return
-            self._terrain_updating = True
-            try:
-                m = float(text)
-                ft = m * 3.28084
-                self.terrain_ft.setText(f"{ft:.2f}")
-            except ValueError:
-                self.terrain_ft.clear()
-            self._terrain_updating = False
+        # Height above ground inputs (NEW BLOCK)
+        height_layout = QHBoxLayout()
+        height_m_label = QLabel("Height (m)")
+        self.height_m = QLineEdit()
+        height_ft_label = QLabel("Height (ft)")
+        self.height_ft = QLineEdit()
+        height_layout.addWidget(height_m_label)
+        height_layout.addWidget(self.height_m)
+        height_layout.addWidget(height_ft_label)
+        height_layout.addWidget(self.height_ft)
+        layout.addLayout(height_layout)
 
-        def terrain_ft_changed(text):
-            if self._terrain_updating:
-                return
-            self._terrain_updating = True
-            try:
-                ft = float(text)
-                m = ft / 3.28084
-                self.terrain_m.setText(f"{m:.2f}")
-            except ValueError:
-                self.terrain_m.clear()
-            self._terrain_updating = False
+        self._height_updating = False
 
-        self.terrain_m.textChanged.connect(terrain_m_changed)
-        self.terrain_ft.textChanged.connect(terrain_ft_changed)
+        # Connect signals for fully linked behaviour
+        self.alt_m.textChanged.connect(self.alt_m_changed)
+        self.alt_ft.textChanged.connect(self.alt_ft_changed)
+        self.terrain_m.textChanged.connect(self.terrain_m_changed)
+        self.terrain_ft.textChanged.connect(self.terrain_ft_changed)
+        self.height_m.textChanged.connect(self.height_m_changed)
+        self.height_ft.textChanged.connect(self.height_ft_changed)
 
         # KML drop area (only for KML mode)
         self.kml_container = QWidget()
@@ -399,6 +367,109 @@ class DebrisPage(QWidget):
             self.mode_stack_layout.addWidget(self.coords_container)
         elif self.flight_mode == "bearing":
             self.mode_stack_layout.addWidget(self.bearing_container)
+
+    # --- Fully linked handlers ---
+    def alt_m_changed(self, text):
+        if self._alt_updating:
+            return
+        self._alt_updating = True
+        try:
+            m = float(text)
+            self.alt_ft.setText(f"{m * 3.28084:.2f}")
+        except ValueError:
+            self.alt_ft.clear()
+        self._alt_updating = False
+        self.update_from_alt_terrain()
+
+    def alt_ft_changed(self, text):
+        if self._alt_updating:
+            return
+        self._alt_updating = True
+        try:
+            ft = float(text)
+            self.alt_m.setText(f"{ft / 3.28084:.2f}")
+        except ValueError:
+            self.alt_m.clear()
+        self._alt_updating = False
+        self.update_from_alt_terrain()
+
+    def terrain_m_changed(self, text):
+        if self._terrain_updating:
+            return
+        self._terrain_updating = True
+        try:
+            m = float(text)
+            self.terrain_ft.setText(f"{m * 3.28084:.2f}")
+        except ValueError:
+            self.terrain_ft.clear()
+        self._terrain_updating = False
+        self.update_from_alt_terrain()
+
+    def terrain_ft_changed(self, text):
+        if self._terrain_updating:
+            return
+        self._terrain_updating = True
+        try:
+            ft = float(text)
+            self.terrain_m.setText(f"{ft / 3.28084:.2f}")
+        except ValueError:
+            self.terrain_m.clear()
+        self._terrain_updating = False
+        self.update_from_alt_terrain()
+
+    def height_m_changed(self, text):
+        if self._height_updating:
+            return
+        self._height_updating = True
+        try:
+            m = float(text)
+            self.height_ft.setText(f"{m * 3.28084:.2f}")
+        except ValueError:
+            self.height_ft.clear()
+        self._height_updating = False
+        self.update_from_height()
+
+    def height_ft_changed(self, text):
+        if self._height_updating:
+            return
+        self._height_updating = True
+        try:
+            ft = float(text)
+            self.height_m.setText(f"{ft / 3.28084:.2f}")
+        except ValueError:
+            self.height_m.clear()
+        self._height_updating = False
+        self.update_from_height()
+
+    def update_from_alt_terrain(self):
+        if self._height_updating:
+            return
+        try:
+            alt_m = float(self.alt_m.text())
+            terr_m = float(self.terrain_m.text())
+        except ValueError:
+            return
+
+        self._height_updating = True
+        height_m = alt_m - terr_m
+        self.height_m.setText(f"{height_m:.2f}")
+        self.height_ft.setText(f"{height_m * 3.28084:.2f}")
+        self._height_updating = False
+
+    def update_from_height(self):
+        if self._alt_updating or self._terrain_updating:
+            return
+        try:
+            height_m = float(self.height_m.text())
+            terr_m = float(self.terrain_m.text())
+        except ValueError:
+            return
+
+        self._alt_updating = True
+        alt_m = height_m + terr_m
+        self.alt_m.setText(f"{alt_m:.2f}")
+        self.alt_ft.setText(f"{alt_m * 3.28084:.2f}")
+        self._alt_updating = False
 
     def browse_file(self, _):
         file, _ = QFileDialog.getOpenFileName(
@@ -517,10 +588,11 @@ class DebrisPage(QWidget):
                 input_file=input_kml,
                 output_file=output_kml,
                 include_ground_drag=config["include_ground_drag"],
-                terrain_ft=terrain_m * 3.28084,
-                altitude_m=altitude_m,
-                input_coords=input_coords,
-                input_bearing=input_bearing,
+                terrain_m_hook=terrain_m,
+                altitude_m_hook=altitude_m,
+                input_coords_hook=input_coords,
+                input_bearing_hook=input_bearing,
+                slide_physics=config["Impact / slide physics"]
             )
             simulation.run_debris_trajectory_simulation()
         except Exception as e:
@@ -585,6 +657,7 @@ class App(QMainWindow):
             self.set_page(self.transpose_page)
         else:
             self.set_page(self.debris_page)
+
 
 
 if __name__ == "__main__":

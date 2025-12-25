@@ -3,9 +3,9 @@ import pandas as pd
 from KML_File_Handling import load_last_two_points_from_kml
 
 class DebrisTrajectoryCalculator:
-    def __init__(self,mass_kg, area_m2, Cd, rho, g, dt, ktas, surface, input_file, output_file, include_ground_drag, terrain_ft):
+    def __init__(self,mass_kg, area_m2, Cd, rho, g, dt, ktas, surface, input_file, output_file, include_ground_drag, terrain_m, slide_physics):
 
-        # INPUTS
+        #CONFIG INPUTS
         self.mass_kg = mass_kg
         self.area_m2 = area_m2
         self.Cd = Cd
@@ -14,12 +14,11 @@ class DebrisTrajectoryCalculator:
         self.dt = dt
         self.ktas = ktas
         self.surface = surface
-        self.vz_bounce_min = 0.5
+        self.vz_bounce_min = slide_physics
         self.include_ground_drag = include_ground_drag
 
-        # Terrain elevation (AMSL)
-        self.terrain_ft = terrain_ft
-        self.terrain_m = self.terrain_ft * 0.3048
+        #FLIGHT INPUTS 
+        self.terrain_m = terrain_m
 
         # Final two lead-in points (lon, lat, alt metres AMSL)
         self.penultimate_lon = 1.0581636
