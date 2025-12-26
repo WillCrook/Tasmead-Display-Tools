@@ -179,13 +179,14 @@ if __name__ == "__main__":
                     print(f"Skipping file due to missing coordinates: {kml_file_name}")
                     continue
 
-                first_coordinate = waypoints[0]
-                try:
-                    ground_reference_elevation = fetch_single_elevation(first_coordinate)
-                except Exception as e:
-                    print(f"Failed to fetch elevation for {kml_file_name}: {e}")
-                    continue
-
+                #first_coordinate = waypoints[0]
+                # try:
+                #     ground_reference_elevation = fetch_single_elevation(first_coordinate)
+                # except Exception as e:
+                #     print(f"Failed to fetch elevation for {kml_file_name}: {e}")
+                #     continue
+                ground_reference_elevation = 0  # Assuming sea level if elevation fetching is disabled
+                
                 rotated_waypoints = rotate_route(waypoints, target_lat, target_lon, target_heading)
                 adjusted_waypoints = [(lat, lon, ele - ground_reference_elevation) for lat, lon, ele in rotated_waypoints]
                 output_kml_file = os.path.join(output_dir, f"Farnborough_{kml_file_name}")
