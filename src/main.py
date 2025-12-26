@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 import json
+import os
 
 from Debris_Trajectory_Calculator import DebrisTrajectoryCalculator
 from KML_File_Handling import load_last_two_points_from_kml
@@ -50,7 +51,13 @@ class DebrisPage(QWidget):
         self.kml_meta_pen_lon.setText(f"Penultimate longitude: {penultimate_lon}")
         self.kml_meta_fin_lat.setText(f"Final latitude: {final_lat}")
         self.kml_meta_fin_lon.setText(f"Final longitude: {final_lon}")
-        self.kml_meta_alt.setText(f"Altitude (m): {alt_m}")
+
+        #package up for hooking into DebrisTrajectoryCalculator
+        self.kml_values = (penultimate_lat, penultimate_lon, final_lat, final_lon)
+
+        # Populate the shared altitude field from KML
+        self.alt_m.setText(f"{alt_m}")
+
     def __init__(self):
         super().__init__()
 
@@ -81,7 +88,9 @@ class DebrisPage(QWidget):
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
 
-        self.presets_path = "data/presets.json"
+        # self.presets_path = "data/presets.json"
+        self.presets_dir = "data/presets"
+        os.makedirs(self.presets_dir, exist_ok=True)
         self.presets = {}
 
         self.build_presets_panel(presets)
@@ -100,22 +109,34 @@ class DebrisPage(QWidget):
         layout.addWidget(self.preset_list)
 
         save_btn = QPushButton("Save preset")
-        load_btn = QPushButton("Delete preset")
+        load_btn = QPushButton("Load preset")
+        delete_btn = QPushButton("Delete preset")
 
         save_btn.clicked.connect(self.save_preset)
-        load_btn.clicked.connect(self.delete_preset)
+        load_btn.clicked.connect(self.load_preset_from_file)
+        delete_btn.clicked.connect(self.delete_preset)
 
         layout.addWidget(save_btn)
         layout.addWidget(load_btn)
+        layout.addWidget(delete_btn)
 
         layout.addStretch()
 
     def load_presets_from_disk(self):
-        try:
-            with open(self.presets_path, "r") as f:
-                self.presets = json.load(f)
-        except FileNotFoundError:
-            self.presets = {}
+        self.presets = {}
+        if not os.path.isdir(self.presets_dir):
+            return
+
+        for filename in os.listdir(self.presets_dir):
+            if filename.endswith(".json"):
+                path = os.path.join(self.presets_dir, filename)
+                try:
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                    name = filename.replace(".json", "")
+                    self.presets[name] = {"data": data, "path": path}
+                except Exception:
+                    pass
 
         self.refresh_preset_list()
 
@@ -125,33 +146,119 @@ class DebrisPage(QWidget):
             self.preset_list.addItem(name)
 
     def save_preset(self):
-        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
-        if not ok or not name:
+        preset = {
+            "config": {k: v.text() for k, v in self.inputs.items()},
+            "surface": self.surface_combo.currentText(),
+            "include_ground_drag": self.include_ground_drag.isChecked(),
+            "altitude_m": self.alt_m.text(),
+            "terrain_m": self.terrain_m.text(),
+            "height_m": self.height_m.text(),
+            "flight_mode": self.flight_mode,
+            "flight_inputs": {
+                "kml": {
+                    "kml_path": getattr(self, "kml_input_path", "")
+                },
+                "coords": {
+                    "lat1": self.lat1_input.text(),
+                    "lon1": self.lon1_input.text(),
+                    "lat2": self.lat2_input.text(),
+                    "lon2": self.lon2_input.text(),
+                },
+                "bearing": {
+                    "lat": self.bearing_lat_input.text(),
+                    "lon": self.bearing_lon_input.text(),
+                    "azimuth": self.azimuth_input.text(),
+                }
+            }
+        }
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Aircraft Preset",
+            os.path.join(self.presets_dir, "aircraft_preset.json"),
+            "JSON Files (*.json)"
+        )
+        if not path:
             return
 
-        self.presets[name] = {
-            k: float(v.text()) for k, v in self.inputs.items()
-        }
-        # Save surface selection as string
-        self.presets[name]["surface"] = self.surface_combo.currentText()
+        with open(path, "w") as f:
+            json.dump(preset, f, indent=2)
 
-        with open(self.presets_path, "w") as f:
-            json.dump(self.presets, f, indent=2)
+        name = os.path.basename(path).replace(".json", "")
+        self.presets[name] = {"data": preset, "path": path}
+        self.refresh_preset_list()
 
+    def load_preset_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Aircraft Preset",
+            "",
+            "JSON Files (*.json)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Preset Error", str(e))
+            return
+
+        name = os.path.basename(path).replace(".json", "")
+        self.presets[name] = {"data": data, "path": path}
         self.refresh_preset_list()
 
     def load_selected_preset(self, item):
-        data = self.presets.get(item.text())
-        if not data:
+        entry = self.presets.get(item.text())
+        if not entry:
             return
+        data = entry["data"]
 
-        for k, v in data.items():
+        for k, v in data.get("config", {}).items():
             if k in self.inputs:
-                self.inputs[k].setText(str(v))
-            elif k == "surface":
-                index = self.surface_combo.findText(v)
-                if index >= 0:
-                    self.surface_combo.setCurrentIndex(index)
+                self.inputs[k].setText(v)
+
+        surface = data.get("surface")
+        if surface:
+            index = self.surface_combo.findText(surface)
+            if index >= 0:
+                self.surface_combo.setCurrentIndex(index)
+
+        self.include_ground_drag.setChecked(data.get("include_ground_drag", True))
+        self.alt_m.setText(data.get("altitude_m", ""))
+        self.terrain_m.setText(data.get("terrain_m", ""))
+        self.height_m.setText(data.get("height_m", ""))
+
+        mode = data.get("flight_mode", "kml")
+        if mode == "kml":
+            self.rb_kml.setChecked(True)
+        elif mode == "coords":
+            self.rb_coords.setChecked(True)
+        elif mode == "bearing":
+            self.rb_bearing.setChecked(True)
+
+        # Restore flight_inputs after setting radio buttons
+        flight_inputs = data.get("flight_inputs", {})
+
+        if self.flight_mode == "kml":
+            kml_data = flight_inputs.get("kml", {})
+            self.kml_input_path = kml_data.get("kml_path", "")
+            if self.kml_input_path:
+                self.file_label.setText(self.kml_input_path)
+
+        elif self.flight_mode == "coords":
+            coords = flight_inputs.get("coords", {})
+            self.lat1_input.setText(coords.get("lat1", ""))
+            self.lon1_input.setText(coords.get("lon1", ""))
+            self.lat2_input.setText(coords.get("lat2", ""))
+            self.lon2_input.setText(coords.get("lon2", ""))
+
+        elif self.flight_mode == "bearing":
+            bearing = flight_inputs.get("bearing", {})
+            self.bearing_lat_input.setText(bearing.get("lat", ""))
+            self.bearing_lon_input.setText(bearing.get("lon", ""))
+            self.azimuth_input.setText(bearing.get("azimuth", ""))
 
     def delete_preset(self):
         item = self.preset_list.currentItem()
@@ -159,23 +266,31 @@ class DebrisPage(QWidget):
             return
 
         name = item.text()
+        entry = self.presets.get(name)
+        if not entry:
+            return
+
+        path = entry.get("path")
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Delete Error", str(e))
+                return
+
         del self.presets[name]
-
-        with open(self.presets_path, "w") as f:
-            json.dump(self.presets, f, indent=2)
-
         self.refresh_preset_list()
 
     def build_config(self, layout):
         defaults = {
             "Mass (kg)": "",
             "Frontal area A (m²)": "",
-            "Drag Coefficient Cd": "",
-            "Air Density ρ (kg/m³)": "",
-            "Gravity g (m/s²)": "",
+            "Drag Coefficient Cd": "1.1",
+            "Air Density ρ (kg/m³)": "1.23",
+            "Gravity g (m/s²)": "9.81",
             "KTAS (knots true airspeed)": "",
-            "Time step (s)": "",
-            "Impact / slide physics": ""
+            "Time step (s)": "0.01",
+            "Impact / slide physics": "0.5"
         }
 
         title = QLabel("Config")
@@ -188,6 +303,8 @@ class DebrisPage(QWidget):
             lbl = QLabel(key)
             edit = QLineEdit()
             edit.setPlaceholderText(key)
+            if value != "":
+                edit.setText(value)
             layout.addWidget(lbl)
             layout.addWidget(edit)
             self.inputs[key] = edit
@@ -238,55 +355,6 @@ class DebrisPage(QWidget):
         self.mode_stack_layout = QVBoxLayout(self.mode_stack)
         layout.addWidget(self.mode_stack)
 
-        # Altitude inputs
-        alt_layout = QHBoxLayout()
-        alt_m_label = QLabel("Altitude (m)")
-        self.alt_m = QLineEdit()
-        alt_ft_label = QLabel("Altitude (ft)")
-        self.alt_ft = QLineEdit()
-        alt_layout.addWidget(alt_m_label)
-        alt_layout.addWidget(self.alt_m)
-        alt_layout.addWidget(alt_ft_label)
-        alt_layout.addWidget(self.alt_ft)
-        layout.addLayout(alt_layout)
-
-        self._alt_updating = False
-
-        # Terrain inputs
-        terrain_layout = QHBoxLayout()
-        terrain_m_label = QLabel("Terrain (m)")
-        self.terrain_m = QLineEdit()
-        terrain_ft_label = QLabel("Terrain (ft)")
-        self.terrain_ft = QLineEdit()
-        terrain_layout.addWidget(terrain_m_label)
-        terrain_layout.addWidget(self.terrain_m)
-        terrain_layout.addWidget(terrain_ft_label)
-        terrain_layout.addWidget(self.terrain_ft)
-        layout.addLayout(terrain_layout)
-
-        self._terrain_updating = False
-
-        # Height above ground inputs (NEW BLOCK)
-        height_layout = QHBoxLayout()
-        height_m_label = QLabel("Height (m)")
-        self.height_m = QLineEdit()
-        height_ft_label = QLabel("Height (ft)")
-        self.height_ft = QLineEdit()
-        height_layout.addWidget(height_m_label)
-        height_layout.addWidget(self.height_m)
-        height_layout.addWidget(height_ft_label)
-        height_layout.addWidget(self.height_ft)
-        layout.addLayout(height_layout)
-
-        self._height_updating = False
-
-        # Connect signals for fully linked behaviour
-        self.alt_m.textChanged.connect(self.alt_m_changed)
-        self.alt_ft.textChanged.connect(self.alt_ft_changed)
-        self.terrain_m.textChanged.connect(self.terrain_m_changed)
-        self.terrain_ft.textChanged.connect(self.terrain_ft_changed)
-        self.height_m.textChanged.connect(self.height_m_changed)
-        self.height_ft.textChanged.connect(self.height_ft_changed)
 
         # KML drop area (only for KML mode)
         self.kml_container = QWidget()
@@ -306,7 +374,7 @@ class DebrisPage(QWidget):
         kml_layout.addWidget(self.file_label)
 
         # Load KML button
-        self.load_kml_btn = QPushButton("Load KML file")
+        self.load_kml_btn = QPushButton("Extract Values from KML")
         self.load_kml_btn.clicked.connect(self.load_kml_metadata)
         kml_layout.addWidget(self.load_kml_btn)
 
@@ -315,13 +383,11 @@ class DebrisPage(QWidget):
         self.kml_meta_pen_lon = QLabel("Penultimate longitude: —")
         self.kml_meta_fin_lat = QLabel("Final latitude: —")
         self.kml_meta_fin_lon = QLabel("Final longitude: —")
-        self.kml_meta_alt = QLabel("Altitude (m): —")
 
         kml_layout.addWidget(self.kml_meta_pen_lat)
         kml_layout.addWidget(self.kml_meta_pen_lon)
         kml_layout.addWidget(self.kml_meta_fin_lat)
         kml_layout.addWidget(self.kml_meta_fin_lon)
-        kml_layout.addWidget(self.kml_meta_alt)
 
         # Coordinates mode inputs
         self.coords_container = QWidget()
@@ -378,6 +444,55 @@ class DebrisPage(QWidget):
         }
 
         layout.addWidget(self.kml_container)
+
+        # Altitude inputs (shared by all modes)
+        alt_layout = QHBoxLayout()
+        alt_m_label = QLabel("Altitude (m)")
+        self.alt_m = QLineEdit()
+        alt_ft_label = QLabel("Altitude (ft)")
+        self.alt_ft = QLineEdit()
+        alt_layout.addWidget(alt_m_label)
+        alt_layout.addWidget(self.alt_m)
+        alt_layout.addWidget(alt_ft_label)
+        alt_layout.addWidget(self.alt_ft)
+        layout.addLayout(alt_layout)
+
+        # Terrain inputs
+        terrain_layout = QHBoxLayout()
+        terrain_m_label = QLabel("Terrain (m)")
+        self.terrain_m = QLineEdit()
+        terrain_ft_label = QLabel("Terrain (ft)")
+        self.terrain_ft = QLineEdit()
+        terrain_layout.addWidget(terrain_m_label)
+        terrain_layout.addWidget(self.terrain_m)
+        terrain_layout.addWidget(terrain_ft_label)
+        terrain_layout.addWidget(self.terrain_ft)
+        layout.addLayout(terrain_layout)
+
+        # Height above ground inputs
+        height_layout = QHBoxLayout()
+        height_m_label = QLabel("Height (m)")
+        self.height_m = QLineEdit()
+        height_ft_label = QLabel("Height (ft)")
+        self.height_ft = QLineEdit()
+        height_layout.addWidget(height_m_label)
+        height_layout.addWidget(self.height_m)
+        height_layout.addWidget(height_ft_label)
+        height_layout.addWidget(self.height_ft)
+        layout.addLayout(height_layout)
+
+        # Update flags
+        self._alt_updating = False
+        self._terrain_updating = False
+        self._height_updating = False
+
+        # Connect signals
+        self.alt_m.textChanged.connect(self.alt_m_changed)
+        self.alt_ft.textChanged.connect(self.alt_ft_changed)
+        self.terrain_m.textChanged.connect(self.terrain_m_changed)
+        self.terrain_ft.textChanged.connect(self.terrain_ft_changed)
+        self.height_m.textChanged.connect(self.height_m_changed)
+        self.height_ft.textChanged.connect(self.height_ft_changed)
 
         self.run_btn = QPushButton("Run Simulation")
         self.run_btn.clicked.connect(self.run_simulation)
@@ -549,7 +664,7 @@ class DebrisPage(QWidget):
 
         # Validate config inputs
         try:
-            config = {k: float(v.text()) for k, v in self.inputs.items()}
+            config = {k: float(v.text()) for k, v in self.inputs.items() if v.text() != ""}
         except ValueError:
             QMessageBox.warning(self, "Invalid input", "Please enter valid numerical values in config fields.")
             return
@@ -563,8 +678,7 @@ class DebrisPage(QWidget):
                 QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
                 return
 
-            input_kml = self.kml_input_path
-            input_coords = None
+            input_coords = self.kml_values
             input_bearing = None
 
         elif self.flight_mode == "coords":
@@ -576,7 +690,7 @@ class DebrisPage(QWidget):
             except ValueError:
                 QMessageBox.warning(self, "Invalid input", "Please enter valid coordinates for Lat 1, Lon 1, Lat 2, Lon 2.")
                 return
-            input_kml = None
+            
             input_coords = (lat1, lon1, lat2, lon2)
             input_bearing = None
 
@@ -588,7 +702,7 @@ class DebrisPage(QWidget):
             except ValueError:
                 QMessageBox.warning(self, "Invalid input", "Please enter valid Latitude, Longitude, and Track.")
                 return
-            input_kml = None
+            
             input_coords = None
             input_bearing = (lat, lon, azimuth)
         else:
@@ -605,16 +719,15 @@ class DebrisPage(QWidget):
             return
 
         self.run_debris_calculator(
-            input_kml=input_kml,
-            input_coords=input_coords,
-            input_bearing=input_bearing,
+            input_coords_hook=input_coords,
+            input_bearing_hook=input_bearing,
             output_kml=save_path,
             config=config,
-            altitude_m=altitude_m,
-            terrain_m=terrain_m,
+            altitude_m_hook=altitude_m,
+            terrain_m_hook=terrain_m,
         )
 
-    def run_debris_calculator(self, input_kml, input_coords, input_bearing, output_kml, config, altitude_m, terrain_m):
+    def run_debris_calculator(self, input_coords_hook, input_bearing_hook, output_kml, config, altitude_m_hook, terrain_m_hook):
         """
         Hook point for Debris_Trajectory_Calculator.py
         """
@@ -629,14 +742,14 @@ class DebrisPage(QWidget):
                 ktas=config["KTAS (knots true airspeed)"],
                 surface=config.get("surface", "asphalt"),
                 slide_physics=config["Impact / slide physics"],
-                input_file=input_kml,
-                output_file=output_kml,
                 include_ground_drag=config["include_ground_drag"],
-                terrain_m_hook=terrain_m,
-                altitude_m_hook=altitude_m,
-                input_coords_hook=input_coords,
-                input_bearing_hook=input_bearing
+                terrain_m=terrain_m_hook,
+                altitude_m=altitude_m_hook,
+                input_coords=input_coords_hook,
+                input_bearing=input_bearing_hook,
+                output_file=output_kml
             )
+
             simulation.run_debris_trajectory_simulation()
         except Exception as e:
             QMessageBox.critical(self, "Simulation Error", str(e))
