@@ -127,8 +127,28 @@ class TransposePage(QWidget):
 
         self.orig_height_input = QLineEdit()
         self.orig_height_input.setPlaceholderText("Elevation (m)")
-        layout.addWidget(QLabel("Original Elevation (m)"))
-        layout.addWidget(self.orig_height_input)
+        self.orig_height_input.textChanged.connect(self.orig_height_m_changed)
+        
+        m_layout = QVBoxLayout()
+        m_layout.addWidget(QLabel("Original Elevation (m)"))
+        m_layout.addWidget(self.orig_height_input)
+
+        self.orig_height_ft_input = QLineEdit()
+        self.orig_height_ft_input.setPlaceholderText("Elevation (ft)")
+        self.orig_height_ft_input.textChanged.connect(self.orig_height_ft_changed)
+
+        ft_layout = QVBoxLayout()
+        ft_layout.addWidget(QLabel("Original Elevation (ft)"))
+        ft_layout.addWidget(self.orig_height_ft_input)
+        
+        # Container for both
+        h_layout = QHBoxLayout()
+        h_layout.addLayout(m_layout)
+        h_layout.addLayout(ft_layout)
+
+        layout.addLayout(h_layout)
+
+        self._orig_height_updating = False
         
         layout.addSpacing(20)
 
@@ -386,6 +406,28 @@ class TransposePage(QWidget):
             QMessageBox.information(self, "Success", f"Transposition complete!\nSaved to {output_dir}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Transposition failed: {e}")
+
+    def orig_height_m_changed(self, text):
+        if self._orig_height_updating:
+            return
+        self._orig_height_updating = True
+        try:
+            val_m = float(text)
+            self.orig_height_ft_input.setText(f"{val_m * 3.28084:.2f}")
+        except ValueError:
+            self.orig_height_ft_input.clear()
+        self._orig_height_updating = False
+
+    def orig_height_ft_changed(self, text):
+        if self._orig_height_updating:
+            return
+        self._orig_height_updating = True
+        try:
+            val_ft = float(text)
+            self.orig_height_input.setText(f"{val_ft / 3.28084:.2f}")
+        except ValueError:
+            self.orig_height_input.clear()
+        self._orig_height_updating = False
 
 
 class DebrisPage(QWidget):
@@ -690,7 +732,7 @@ class DebrisPage(QWidget):
         self.mode_group = QButtonGroup(self)
         self.rb_kml = QRadioButton("From KML")
         self.rb_coords = QRadioButton("From Coordinates")
-        self.rb_bearing = QRadioButton("From Bearing")
+        self.rb_bearing = QRadioButton("From Track")
 
         self.rb_kml.setChecked(True)
 
@@ -862,7 +904,7 @@ class DebrisPage(QWidget):
         summary_title.setStyleSheet("font-weight: bold;")
         layout.addWidget(summary_title)
 
-        self.summary_heading = QLabel("Heading used (deg): —")
+        self.summary_heading = QLabel("Track used (deg): —")
         self.summary_air = QLabel("Air distance to first impact (m): —")
         self.summary_ground = QLabel("Ground distance to rest (m): —")
         self.summary_total = QLabel("Total ground‑planar distance (m): —")
@@ -1129,7 +1171,7 @@ class DebrisPage(QWidget):
             summary = simulation.run_debris_trajectory_simulation()
 
             if summary:
-                self.summary_heading.setText(f"Heading used (deg): {summary['heading']:.1f}")
+                self.summary_heading.setText(f"Track used (deg): {summary['heading']:.1f}")
                 self.summary_air.setText(f"Air distance to first impact (m): {summary['air_dist_xy_m']:.1f}")
                 self.summary_ground.setText(f"Ground distance to rest (m): {summary['ground_dist_xy_m']:.1f}")
                 self.summary_total.setText(f"Total ground‑planar distance (m): {summary['total_dist_xy_m']:.1f}")
@@ -1211,7 +1253,10 @@ class App(QMainWindow):
             "https://github.com/WillCrook\n\n"
             "- Debris Trajectory Calculations Created by mkarachalios-1\n"
             "GitHub:\n"
-            "https://github.com/mkarachalios-1/airshow-trajectory-app/blob/main/streamlit_app.py"
+            "GitHub:\n"
+            "https://github.com/mkarachalios-1/airshow-trajectory-app/blob/main/streamlit_app.py\n\n"
+            "Contact us:\n"
+            "rich.pillans@tasmead.com"
         )
 
     def set_page(self, widget):
