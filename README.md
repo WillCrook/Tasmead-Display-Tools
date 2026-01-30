@@ -50,4 +50,5 @@ You are free to use, modify, and distribute this software under the following co
 	•	No warranty is provided; use at your own risk.
 For the full license text, see the LICENSE file in this repository.
 
+<img width="809" height="614" alt="Screenshot 2026-01-14 at 19 38 58" src="https://github.com/user-attachments/assets/8b54d580-a282-4881-b1a4-643ae0ec73cf" />
 
