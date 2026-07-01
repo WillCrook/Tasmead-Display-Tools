@@ -1,7 +1,7 @@
 import os
 import math
 import sys
-from KML_File_Handling import parse_kml
+from .kml_file_handling import parse_kml
 
 # def fetch_single_elevation(coordinate):
 #     """
