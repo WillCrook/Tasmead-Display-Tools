@@ -22,8 +22,13 @@ class PresetStore:
 
     def save(self, name, data):
         path = self.directory / f"{name}.json"
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self.write_file(path, data)
         return {"data": data, "path": str(path)}
+
+    @staticmethod
+    def write_file(path, data):
+        """Write a preset JSON copy to an explicitly supplied destination."""
+        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     @staticmethod
     def load_file(path):

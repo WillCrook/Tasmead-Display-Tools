@@ -1,9 +1,11 @@
 import os
+from pathlib import Path
+from uuid import uuid4
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
     QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -72,6 +74,9 @@ class DebrisPage(QWidget):
         # self.presets_path = "data/presets.json"
         self.presets_dir = resource_path("data/presets")
         self.preset_store = PresetStore(self.presets_dir)
+        # Entries are keyed by an internal id, not their display name.  An
+        # external import can therefore safely coexist with a saved preset of
+        # the same name.
         self.presets = {}
 
         self.build_presets_panel(presets)
@@ -87,31 +92,67 @@ class DebrisPage(QWidget):
 
         self.preset_list = QListWidget()
         self.preset_list.itemClicked.connect(self.load_selected_preset)
+        self.preset_list.currentItemChanged.connect(self.update_preset_actions)
         layout.addWidget(self.preset_list)
 
         save_btn = QPushButton("Save preset")
         load_btn = QPushButton("Load preset")
         delete_btn = QPushButton("Delete preset")
+        self.export_preset_btn = QPushButton("Export preset")
+        self.export_preset_btn.setEnabled(False)
 
         save_btn.clicked.connect(self.save_preset)
         load_btn.clicked.connect(self.load_preset_from_file)
         delete_btn.clicked.connect(self.delete_preset)
+        self.export_preset_btn.clicked.connect(self.export_preset)
 
         layout.addWidget(save_btn)
         layout.addWidget(load_btn)
         layout.addWidget(delete_btn)
+        layout.addWidget(self.export_preset_btn)
 
         layout.addStretch()
 
     def load_presets_from_disk(self):
-        self.presets = self.preset_store.load_all()
+        self.presets = {
+            self.managed_preset_id(name): {
+                **entry,
+                "name": name,
+                "ownership": "app_managed",
+            }
+            for name, entry in self.preset_store.load_all().items()
+        }
 
         self.refresh_preset_list()
 
+    @staticmethod
+    def managed_preset_id(name):
+        return f"app_managed:{name}"
+
+    @staticmethod
+    def external_preset_id():
+        return f"external:{uuid4()}"
+
+    def selected_preset_entry(self):
+        item = self.preset_list.currentItem()
+        if not item:
+            return None, None
+        preset_id = item.data(Qt.ItemDataRole.UserRole)
+        return preset_id, self.presets.get(preset_id)
+
     def refresh_preset_list(self):
         self.preset_list.clear()
-        for name in self.presets:
-            self.preset_list.addItem(name)
+        for preset_id, entry in self.presets.items():
+            label = entry["name"]
+            if entry["ownership"] == "external":
+                label = f"{label} (imported)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, preset_id)
+            self.preset_list.addItem(item)
+        self.update_preset_actions()
+
+    def update_preset_actions(self, *_):
+        self.export_preset_btn.setEnabled(self.preset_list.currentItem() is not None)
 
     def save_preset(self):
         preset = {
@@ -148,7 +189,17 @@ class DebrisPage(QWidget):
         if not ok or not name:
             return
 
-        self.presets[name] = self.preset_store.save(name, preset)
+        try:
+            entry = self.preset_store.save(name, preset)
+        except Exception as e:
+            QMessageBox.critical(self, "Preset Error", f"Failed to save preset: {e}")
+            return
+
+        self.presets[self.managed_preset_id(name)] = {
+            **entry,
+            "name": name,
+            "ownership": "app_managed",
+        }
         self.refresh_preset_list()
 
     def load_preset_from_file(self):
@@ -167,12 +218,41 @@ class DebrisPage(QWidget):
             QMessageBox.critical(self, "Preset Error", str(e))
             return
 
-        name = os.path.basename(path).replace(".json", "")
-        self.presets[name] = {"data": data, "path": path}
+        name = Path(path).stem
+        managed_id = self.managed_preset_id(name)
+        if managed_id in self.presets:
+            replace = QMessageBox.question(
+                self,
+                "Replace saved preset?",
+                f'A saved preset named "{name}" already exists. Replace the app-managed copy?\n\n'
+                "The imported file will not be changed.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if replace != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                entry = self.preset_store.save(name, data)
+            except Exception as e:
+                QMessageBox.critical(self, "Preset Error", f"Failed to replace preset: {e}")
+                return
+            self.presets[managed_id] = {
+                **entry,
+                "name": name,
+                "ownership": "app_managed",
+            }
+        else:
+            self.presets[self.external_preset_id()] = {
+                "data": data,
+                "path": path,
+                "name": name,
+                "ownership": "external",
+            }
         self.refresh_preset_list()
 
     def load_selected_preset(self, item):
-        entry = self.presets.get(item.text())
+        preset_id = item.data(Qt.ItemDataRole.UserRole)
+        entry = self.presets.get(preset_id)
         if not entry:
             return
         data = entry["data"]
@@ -223,13 +303,23 @@ class DebrisPage(QWidget):
             self.azimuth_input.setText(bearing.get("azimuth", ""))
 
     def delete_preset(self):
-        item = self.preset_list.currentItem()
-        if not item:
+        preset_id, entry = self.selected_preset_entry()
+        if not entry:
             return
 
-        name = item.text()
-        entry = self.presets.get(name)
-        if not entry:
+        if entry["ownership"] == "external":
+            remove = QMessageBox.question(
+                self,
+                "Remove imported preset?",
+                f'Remove "{entry["name"]}" from this app session?\n\n'
+                "Its original file will not be deleted or changed.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if remove != QMessageBox.StandardButton.Yes:
+                return
+            del self.presets[preset_id]
+            self.refresh_preset_list()
             return
 
         path = entry.get("path")
@@ -240,8 +330,29 @@ class DebrisPage(QWidget):
                 QMessageBox.critical(self, "Delete Error", str(e))
                 return
 
-        del self.presets[name]
+        del self.presets[preset_id]
         self.refresh_preset_list()
+
+    def export_preset(self):
+        _, entry = self.selected_preset_entry()
+        if not entry:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Preset",
+            f'{entry["name"]}.json',
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path = f"{path}.json"
+
+        try:
+            self.preset_store.write_file(path, entry["data"])
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export preset: {e}")
 
     def build_config(self, layout):
         defaults = {

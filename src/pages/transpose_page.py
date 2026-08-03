@@ -60,19 +60,24 @@ class TransposePage(QWidget):
 
         self.preset_list = QListWidget()
         self.preset_list.itemClicked.connect(self.load_selected_preset)
+        self.preset_list.currentItemChanged.connect(self.update_preset_actions)
         layout.addWidget(self.preset_list)
 
         save_btn = QPushButton("Save Preset")
         load_btn = QPushButton("Load Preset from File")
         delete_btn = QPushButton("Delete Preset")
+        self.export_preset_btn = QPushButton("Export Preset")
+        self.export_preset_btn.setEnabled(False)
 
         save_btn.clicked.connect(self.save_preset)
         load_btn.clicked.connect(self.load_preset_from_file)
         delete_btn.clicked.connect(self.delete_preset)
+        self.export_preset_btn.clicked.connect(self.export_preset)
 
         layout.addWidget(save_btn)
         layout.addWidget(load_btn)
         layout.addWidget(delete_btn)
+        layout.addWidget(self.export_preset_btn)
         layout.addStretch()
 
     def build_config_panel(self, layout):
@@ -217,6 +222,10 @@ class TransposePage(QWidget):
         self.preset_list.clear()
         for name in sorted(self.presets.keys()):
             self.preset_list.addItem(name)
+        self.update_preset_actions()
+
+    def update_preset_actions(self, *_):
+        self.export_preset_btn.setEnabled(self.preset_list.currentItem() is not None)
 
     def save_preset(self):
         default_name = self.airfield_name_input.text()
@@ -280,6 +289,32 @@ class TransposePage(QWidget):
                 self.refresh_preset_list()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete preset: {e}")
+
+    def export_preset(self):
+        item = self.preset_list.currentItem()
+        if not item:
+            return
+
+        name = item.text()
+        entry = self.presets.get(name)
+        if not entry:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Preset",
+            f"{name}.json",
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path = f"{path}.json"
+
+        try:
+            self.preset_store.write_file(path, entry["data"])
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export preset: {e}")
 
     def run_transposition_ui(self):
         if not self.input_files:
