@@ -1,7 +1,17 @@
 """Reusable application services."""
 
 from .debris_trajectory_calculator import DebrisTrajectoryCalculator
-from .kml_file_handling import load_last_two_points_from_kml, parse_kml
+from .kml_file_handling import (
+    KmlCoordinateError,
+    KmlParseError,
+    KmlPoint,
+    KmlStructureError,
+    KmlTrack,
+    KmlXmlError,
+    load_last_two_points_from_kml,
+    parse_kml,
+    parse_kml_track,
+)
 from .preset_filenames import canonical_filename, canonical_stem, readable_export_filename
 from .preset_model import (
     CURRENT_FORMAT_VERSION,
@@ -34,6 +44,12 @@ __all__ = [
     "CURRENT_FORMAT_VERSION",
     "DebrisTrajectoryCalculator",
     "ImportInspection",
+    "KmlCoordinateError",
+    "KmlParseError",
+    "KmlPoint",
+    "KmlStructureError",
+    "KmlTrack",
+    "KmlXmlError",
     "Preset",
     "PresetAlreadyExistsError",
     "PresetDestinationExistsError",
@@ -57,6 +73,7 @@ __all__ = [
     "canonical_stem",
     "load_last_two_points_from_kml",
     "parse_kml",
+    "parse_kml_track",
     "readable_export_filename",
     "run_transposition",
 ]

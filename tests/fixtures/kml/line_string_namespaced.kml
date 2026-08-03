@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Folder>
+      <Placemark>
+        <name>Display route</name>
+        <Point><coordinates>-1.0,50.0,5</coordinates></Point>
+        <MultiGeometry>
+          <LineString>
+            <coordinates>
+              -0.7000,51.2000,100
+              -0.6000,51.3000,1.25e2
+            </coordinates>
+          </LineString>
+          <Polygon>
+            <outerBoundaryIs><LinearRing><coordinates>-1,50,0 -1,51,0 -2,50,0 -1,50,0</coordinates></LinearRing></outerBoundaryIs>
+          </Polygon>
+        </MultiGeometry>
+      </Placemark>
+    </Folder>
+  </Document>
+</kml>

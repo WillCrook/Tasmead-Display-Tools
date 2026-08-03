@@ -10,39 +10,57 @@ from PyQt6.QtWidgets import (
 
 from resource_paths import app_data_path, resource_path
 from services import (
-    DebrisTrajectoryCalculator, PresetType, load_last_two_points_from_kml,
+    DebrisTrajectoryCalculator, PresetType, parse_kml_track,
 )
 from pages.preset_ui import PresetUiMixin
 
 
 class DebrisPage(PresetUiMixin, QWidget):
+    def clear_kml_metadata(self):
+        """Invalidate extracted values when the selected KML changes or fails."""
+        self.kml_values = None
+        if hasattr(self, "kml_meta_pen_lat"):
+            self.kml_meta_pen_lat.setText("Penultimate latitude: —")
+            self.kml_meta_pen_lon.setText("Penultimate longitude: —")
+            self.kml_meta_fin_lat.setText("Final latitude: —")
+            self.kml_meta_fin_lon.setText("Final longitude: —")
+
     def load_kml_metadata(self):
         if not hasattr(self, "kml_input_path") or not self.kml_input_path:
             QMessageBox.warning(self, "Missing file", "Please drop or select a KML file first.")
             return
 
+        self.clear_kml_metadata()
         try:
-            (
-                penultimate_lat,
-                penultimate_lon,
-                final_lat,
-                final_lon,
-                alt_m
-            ) = load_last_two_points_from_kml(self.kml_input_path)
+            track = parse_kml_track(self.kml_input_path)
         except Exception as e:
             QMessageBox.critical(self, "KML Error", str(e))
             return
 
-        self.kml_meta_pen_lat.setText(f"Penultimate latitude: {penultimate_lat}")
-        self.kml_meta_pen_lon.setText(f"Penultimate longitude: {penultimate_lon}")
-        self.kml_meta_fin_lat.setText(f"Final latitude: {final_lat}")
-        self.kml_meta_fin_lon.setText(f"Final longitude: {final_lon}")
+        penultimate, final = track.points[-2:]
+
+        self.kml_meta_pen_lat.setText(f"Penultimate latitude: {penultimate.latitude}")
+        self.kml_meta_pen_lon.setText(f"Penultimate longitude: {penultimate.longitude}")
+        self.kml_meta_fin_lat.setText(f"Final latitude: {final.latitude}")
+        self.kml_meta_fin_lon.setText(f"Final longitude: {final.longitude}")
 
         #package up for hooking into DebrisTrajectoryCalculator
-        self.kml_values = (penultimate_lat, penultimate_lon, final_lat, final_lon)
+        self.kml_values = (
+            penultimate.latitude,
+            penultimate.longitude,
+            final.latitude,
+            final.longitude,
+        )
 
-        # Populate the shared altitude field from KML
-        self.alt_m.setText(f"{alt_m}")
+        if final.altitude_m is None:
+            self.alt_m.clear()
+            QMessageBox.warning(
+                self,
+                "KML altitude missing",
+                "The final KML coordinate has no altitude. Enter the altitude in metres before running the simulation.",
+            )
+        else:
+            self.alt_m.setText(f"{final.altitude_m}")
 
     def __init__(self):
         super().__init__()
@@ -209,6 +227,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         if self.flight_mode == "kml":
             kml_data = flight_inputs.get("kml", {})
             self.kml_input_path = kml_data.get("kml_path", "")
+            self.clear_kml_metadata()
             if self.kml_input_path:
                 self.file_label.setText(self.kml_input_path)
 
@@ -290,6 +309,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         layout.addLayout(hbox_modes)
 
         self.flight_mode = "kml"
+        self.kml_values = None
 
         self.rb_kml.toggled.connect(lambda checked: self.set_flight_mode("kml") if checked else None)
         self.rb_coords.toggled.connect(lambda checked: self.set_flight_mode("coords") if checked else None)
@@ -596,6 +616,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         if file:
             self.kml_input_path = file
             self.file_label.setText(file)
+            self.clear_kml_metadata()
 
     def drag_enter(self, event):
         if event.mimeData().hasUrls():
@@ -606,6 +627,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         if urls:
             self.kml_input_path = urls[0].toLocalFile()
             self.file_label.setText(self.kml_input_path)
+            self.clear_kml_metadata()
 
     def run_simulation(self):
         # Validate altitude input
@@ -636,6 +658,14 @@ class DebrisPage(PresetUiMixin, QWidget):
         if self.flight_mode == "kml":
             if not hasattr(self, "kml_input_path") or not self.kml_input_path:
                 QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
+                return
+
+            if not self.kml_values:
+                QMessageBox.warning(
+                    self,
+                    "Missing input",
+                    "Please extract values from the selected KML file first.",
+                )
                 return
 
             input_coords = self.kml_values

@@ -1,7 +1,7 @@
 import os
 import math
 import sys
-from .kml_file_handling import parse_kml
+from .kml_file_handling import KmlTrack, parse_kml_track
 
 # def fetch_single_elevation(coordinate):
 #     """
@@ -121,6 +121,24 @@ def read_config(config_file):
                     continue
         return config
 
+
+def _waypoints_for_transposition(
+    track: KmlTrack,
+    ground_reference_elevation: float,
+) -> list[tuple[float, float, float]]:
+    """Convert the shared KML model to the existing rotation tuple contract."""
+    return [
+        (
+            point.latitude,
+            point.longitude,
+            point.altitude_m
+            if point.altitude_m is not None
+            else ground_reference_elevation,
+        )
+        for point in track.points
+    ]
+
+
 def run_transposition(input_files, output_file, target_lat, target_lon, target_heading, ground_reference_elevation=0):
     try:
         output_dir = os.path.dirname(output_file)
@@ -135,10 +153,8 @@ def run_transposition(input_files, output_file, target_lat, target_lon, target_h
                 kml_file_name = os.path.basename(kml_file_path)
                 print(f"Processing file: {kml_file_name}")
 
-                waypoints = parse_kml(kml_file_path)
-                if not waypoints:
-                    print(f"Skipping file due to missing coordinates: {kml_file_name}")
-                    continue            
+                track = parse_kml_track(kml_file_path)
+                waypoints = _waypoints_for_transposition(track, ground_reference_elevation)
 
                 rotated_waypoints = rotate_route(waypoints, target_lat, target_lon, target_heading)
                 adjusted_waypoints = [(lat, lon, ele - ground_reference_elevation) for lat, lon, ele in rotated_waypoints]
@@ -178,11 +194,6 @@ if __name__ == "__main__":
                 kml_file_path = os.path.join(input_dir, kml_file_name)
                 print(f"Processing file: {kml_file_name}")
 
-                waypoints = parse_kml(kml_file_path)
-                if not waypoints:
-                    print(f"Skipping file due to missing coordinates: {kml_file_name}")
-                    continue
-
                 #first_coordinate = waypoints[0]
                 # try:
                 #     ground_reference_elevation = fetch_single_elevation(first_coordinate)
@@ -190,7 +201,10 @@ if __name__ == "__main__":
                 #     print(f"Failed to fetch elevation for {kml_file_name}: {e}")
                 #     continue
                 ground_reference_elevation = 0  # Assuming sea level if elevation fetching is disabled
-                
+
+                track = parse_kml_track(kml_file_path)
+                waypoints = _waypoints_for_transposition(track, ground_reference_elevation)
+
                 rotated_waypoints = rotate_route(waypoints, target_lat, target_lon, target_heading)
                 adjusted_waypoints = [(lat, lon, ele - ground_reference_elevation) for lat, lon, ele in rotated_waypoints]
                 output_kml_file = os.path.join(output_dir, f"Farnborough_{kml_file_name}")

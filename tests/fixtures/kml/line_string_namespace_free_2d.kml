@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml>
+  <Document>
+    <Placemark>
+      <name>Two dimensional route</name>
+      <LineString>
+        <coordinates>-0.7,51.2	-0.6,51.3</coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>
