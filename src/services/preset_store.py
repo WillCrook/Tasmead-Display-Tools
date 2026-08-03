@@ -6,13 +6,56 @@ from pathlib import Path
 
 
 class PresetStore:
-    def __init__(self, directory):
+    def __init__(self, directory, legacy_directory=None):
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Keep the app usable. A later save will retry and surface its
+            # failure through the page's existing error dialog.
+            return
+
+        if legacy_directory is not None:
+            self.migrate_legacy(legacy_directory)
+
+    def migrate_legacy(self, legacy_directory):
+        """Copy valid legacy JSON presets without changing their sources."""
+        legacy_directory = Path(legacy_directory)
+        if legacy_directory == self.directory:
+            return
+
+        try:
+            legacy_paths = list(legacy_directory.glob("*.json"))
+        except OSError:
+            return
+
+        for source in legacy_paths:
+            destination = self.directory / source.name
+            if destination.exists():
+                continue
+
+            created = False
+            try:
+                contents = source.read_bytes()
+                json.loads(contents)
+                with destination.open("xb") as file:
+                    created = True
+                    file.write(contents)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                if created:
+                    try:
+                        destination.unlink()
+                    except OSError:
+                        pass
 
     def load_all(self):
         presets = {}
-        for path in self.directory.glob("*.json"):
+        try:
+            paths = list(self.directory.glob("*.json"))
+        except OSError:
+            return presets
+
+        for path in paths:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -21,6 +64,7 @@ class PresetStore:
         return presets
 
     def save(self, name, data):
+        self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / f"{name}.json"
         self.write_file(path, data)
         return {"data": data, "path": str(path)}

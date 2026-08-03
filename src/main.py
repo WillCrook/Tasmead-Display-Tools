@@ -11,6 +11,8 @@ from resource_paths import find_icon_path
 
 def main():
     app = QApplication(sys.argv)
+    app.setOrganizationName("Tasmead")
+    app.setApplicationName("Tasmead Display Tools")
     app_icon = find_icon_path()
     if app_icon:
         app.setWindowIcon(QIcon(app_icon))

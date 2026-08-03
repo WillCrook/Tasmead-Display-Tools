@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
-from resource_paths import resource_path
+from resource_paths import app_data_path, resource_path
 from services import PresetStore, run_transposition
 
 class TransposePage(QWidget):
@@ -40,8 +40,9 @@ class TransposePage(QWidget):
         splitter.setStretchFactor(2, 2)
 
         # Presets
-        self.presets_dir = resource_path("data/airfields")
-        self.preset_store = PresetStore(self.presets_dir)
+        self.presets_dir = app_data_path("airfields")
+        legacy_presets_dir = resource_path("data/airfields")
+        self.preset_store = PresetStore(self.presets_dir, legacy_presets_dir)
         self.presets = {}
         self.build_presets_panel(presets_layout)
         self.load_presets_from_disk()

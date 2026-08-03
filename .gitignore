@@ -24,7 +24,6 @@ Thumbs.db
 #Data files
 data/
 presets/
-tests/
 
 #pyinstaller files
 app.icns

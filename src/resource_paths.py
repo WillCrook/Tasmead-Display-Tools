@@ -3,9 +3,21 @@
 import os
 import sys
 
+from PyQt6.QtCore import QStandardPaths
+
 
 def resource_path(relative_path):
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def app_data_path(relative_path):
+    """Return a writable, per-user path for application-managed data."""
+    base_path = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppDataLocation
+    )
+    if not base_path:
+        raise OSError("No writable application data location is available")
     return os.path.join(base_path, relative_path)
 
 

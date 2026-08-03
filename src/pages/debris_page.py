@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
-from resource_paths import resource_path
+from resource_paths import app_data_path, resource_path
 from services import DebrisTrajectoryCalculator, PresetStore, load_last_two_points_from_kml
 
 class DebrisPage(QWidget):
@@ -71,9 +71,9 @@ class DebrisPage(QWidget):
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
 
-        # self.presets_path = "data/presets.json"
-        self.presets_dir = resource_path("data/presets")
-        self.preset_store = PresetStore(self.presets_dir)
+        self.presets_dir = app_data_path("debris-presets")
+        legacy_presets_dir = resource_path("data/presets")
+        self.preset_store = PresetStore(self.presets_dir, legacy_presets_dir)
         # Entries are keyed by an internal id, not their display name.  An
         # external import can therefore safely coexist with a saved preset of
         # the same name.
