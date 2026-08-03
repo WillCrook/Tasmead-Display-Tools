@@ -10,7 +10,9 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+KML_FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "kml"
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
@@ -388,6 +390,22 @@ class DebrisPagePresetTests(PresetPageTestCase):
     def data(mass="10"):
         return {"config": {"Mass (kg)": mass}, "flight_mode": "kml"}
 
+    @staticmethod
+    def kml_data(path, altitude=""):
+        return {
+            "config": {"Mass (kg)": "10"},
+            "altitude_m": altitude,
+            "flight_mode": "kml",
+            "flight_inputs": {"kml": {"kml_path": str(path)}},
+        }
+
+    def restore(self, name, data):
+        record = self.page.preset_repository.create(name, data)
+        self.page.load_presets_from_disk()
+        item = self.select(self.page, record.preset.id)
+        self.page.load_selected_preset(item)
+        return record
+
     def test_uses_new_managed_root_and_uuid_item_data(self):
         record = self.page.preset_repository.create("Managed", self.data())
         self.page.load_presets_from_disk()
@@ -397,6 +415,54 @@ class DebrisPagePresetTests(PresetPageTestCase):
         self.assertEqual(UUID(item.data(Qt.ItemDataRole.UserRole)), record.preset.id)
         self.assertTrue(self.page.rename_preset_btn.isEnabled())
         self.assertTrue(self.page.export_preset_btn.isEnabled())
+
+    def test_restoring_kml_preset_parses_immediately_and_kml_altitude_wins(self):
+        path = KML_FIXTURES / "line_string_namespaced.kml"
+
+        self.restore("Three dimensional", self.kml_data(path, altitude="999"))
+
+        self.assertTrue(self.page._kml_state.ready)
+        self.assertEqual(self.page.kml_input_path, str(path))
+        self.assertEqual(self.page._kml_state.coordinates, (51.2, -0.7, 51.3, -0.6))
+        self.assertEqual(self.page.alt_m.text(), "125.0")
+        self.assertEqual(self.page.kml_status_label.text(), "KML ready.")
+
+    def test_restoring_two_dimensional_kml_uses_saved_manual_altitude(self):
+        path = KML_FIXTURES / "line_string_namespace_free_2d.kml"
+        with patch.object(QMessageBox, "warning") as warning:
+            self.restore("Two dimensional", self.kml_data(path, altitude="350"))
+
+        self.assertTrue(self.page._kml_state.ready)
+        self.assertIsNone(self.page._kml_state.final_altitude_m)
+        self.assertEqual(self.page.alt_m.text(), "350")
+        self.assertIn("using entered altitude", self.page.kml_status_label.text())
+        warning.assert_not_called()
+
+    def test_restoring_empty_kml_path_clears_previous_selection(self):
+        self.page.select_and_parse_kml(KML_FIXTURES / "line_string_namespaced.kml")
+
+        self.restore("No KML", self.kml_data("", altitude="410"))
+
+        self.assertFalse(self.page._kml_state.ready)
+        self.assertEqual(self.page.kml_input_path, "")
+        self.assertIsNone(self.page._kml_state.coordinates)
+        self.assertEqual(self.page.file_label.text(), "Drop KML file here")
+        self.assertEqual(self.page.alt_m.text(), "410")
+        self.assertFalse(self.page.load_kml_btn.isEnabled())
+
+    def test_restoring_invalid_kml_keeps_path_and_error_without_stale_coordinates(self):
+        self.page.select_and_parse_kml(KML_FIXTURES / "line_string_namespaced.kml")
+        invalid = KML_FIXTURES / "not-present.kml"
+        with patch.object(QMessageBox, "critical") as critical:
+            self.restore("Missing KML", self.kml_data(invalid, altitude="410"))
+
+        self.assertFalse(self.page._kml_state.ready)
+        self.assertEqual(self.page.kml_input_path, str(invalid))
+        self.assertIsNone(self.page._kml_state.coordinates)
+        self.assertTrue(self.page._kml_state.error)
+        self.assertEqual(self.page.alt_m.text(), "410")
+        self.assertIn("KML error:", self.page.kml_status_label.text())
+        critical.assert_called_once()
 
     def test_duplicate_uuid_cancel_does_not_import_or_change_source(self):
         existing = self.page.preset_repository.create("Existing", self.data("1"))

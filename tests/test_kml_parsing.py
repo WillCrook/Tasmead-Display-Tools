@@ -3,8 +3,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "kml"
 
 from pages.debris_page import DebrisPage
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from services import (
     KmlCoordinateError,
     KmlPoint,
@@ -200,68 +201,177 @@ class TranspositionKmlTests(unittest.TestCase):
 
 
 class DebrisKmlTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.app_patch = patch(
+            "pages.debris_page.app_data_path",
+            side_effect=lambda relative: str(root / "app-data" / relative),
+        )
+        self.resource_patch = patch(
+            "pages.debris_page.resource_path",
+            side_effect=lambda relative: str(root / "bundle" / relative),
+        )
+        self.app_patch.start()
+        self.resource_patch.start()
+        self.page = DebrisPage()
+
+    def tearDown(self):
+        self.page.close()
+        self.resource_patch.stop()
+        self.app_patch.stop()
+        self.temp_dir.cleanup()
+
     def fixture(self, name):
         return FIXTURES / name
 
-    def page_stub(self, filename):
-        stub = SimpleNamespace(
-            kml_input_path=str(self.fixture(filename)),
-            kml_values=(1.0, 2.0, 3.0, 4.0),
-            kml_meta_pen_lat=MagicMock(),
-            kml_meta_pen_lon=MagicMock(),
-            kml_meta_fin_lat=MagicMock(),
-            kml_meta_fin_lon=MagicMock(),
-            alt_m=MagicMock(),
-            file_label=MagicMock(),
-        )
-        stub.clear_kml_metadata = MethodType(DebrisPage.clear_kml_metadata, stub)
-        return stub
-
-    def test_both_geometry_types_populate_last_two_points_and_altitude(self):
+    def test_browse_automatically_parses_both_geometry_types(self):
         for filename in ("line_string_namespaced.kml", "gx_track.kml"):
             with self.subTest(filename=filename):
-                stub = self.page_stub(filename)
-                with patch("pages.debris_page.QMessageBox.warning") as warning:
-                    DebrisPage.load_kml_metadata(stub)
+                path = str(self.fixture(filename))
+                with patch.object(QFileDialog, "getOpenFileName", return_value=(path, "")):
+                    self.page.browse_file(None)
 
-                self.assertEqual(stub.kml_values, (51.2, -0.7, 51.3, -0.6))
-                stub.alt_m.setText.assert_called_once_with("125.0")
-                warning.assert_not_called()
+                self.assertTrue(self.page._kml_state.ready)
+                self.assertEqual(
+                    self.page._kml_state.coordinates,
+                    (51.2, -0.7, 51.3, -0.6),
+                )
+                self.assertEqual(self.page.alt_m.text(), "125.0")
+                self.assertEqual(self.page.kml_status_label.text(), "KML ready.")
+                self.assertEqual(self.page.load_kml_btn.text(), "Reload selected KML")
+                self.assertTrue(self.page.load_kml_btn.isEnabled())
 
     def test_missing_final_altitude_clears_stale_value_and_warns_for_manual_entry(self):
-        stub = self.page_stub("line_string_namespace_free_2d.kml")
-        with patch("pages.debris_page.QMessageBox.warning") as warning:
-            DebrisPage.load_kml_metadata(stub)
+        self.page.alt_m.setText("999")
+        path = self.fixture("line_string_namespace_free_2d.kml")
+        with patch.object(QMessageBox, "warning") as warning:
+            ready = self.page.select_and_parse_kml(path)
 
-        self.assertEqual(stub.kml_values, (51.2, -0.7, 51.3, -0.6))
-        stub.alt_m.clear.assert_called_once_with()
+        self.assertTrue(ready)
+        self.assertEqual(self.page._kml_state.coordinates, (51.2, -0.7, 51.3, -0.6))
+        self.assertEqual(self.page.alt_m.text(), "")
+        self.assertIn("enter altitude", self.page.kml_status_label.text())
         self.assertIn("has no altitude", warning.call_args.args[2])
 
     def test_parser_failure_invalidates_previous_extraction_and_shows_error(self):
-        stub = self.page_stub("wrong_arity.kml")
-        with patch("pages.debris_page.QMessageBox.critical") as critical:
-            DebrisPage.load_kml_metadata(stub)
+        self.page.select_and_parse_kml(self.fixture("line_string_namespaced.kml"))
+        invalid = str(self.fixture("wrong_arity.kml"))
+        with patch.object(QMessageBox, "critical") as critical:
+            ready = self.page.select_and_parse_kml(invalid)
 
-        self.assertIsNone(stub.kml_values)
+        self.assertFalse(ready)
+        self.assertEqual(self.page.kml_input_path, invalid)
+        self.assertIsNone(self.page._kml_state.coordinates)
+        self.assertIsNotNone(self.page._kml_state.error)
+        self.assertEqual(self.page.kml_meta_pen_lat.text(), "Penultimate latitude: —")
+        self.assertEqual(self.page.alt_m.text(), "")
         self.assertIn("coordinate 1", critical.call_args.args[2])
-        stub.kml_meta_pen_lat.setText.assert_called_with("Penultimate latitude: —")
 
-    def test_selecting_another_file_invalidates_previous_extraction(self):
-        stub = self.page_stub("gx_track.kml")
-        replacement = str(self.fixture("line_string_namespaced.kml"))
-        with patch("pages.debris_page.QFileDialog.getOpenFileName", return_value=(replacement, "")):
-            DebrisPage.browse_file(stub, None)
+    def test_browse_cancel_preserves_ready_selection(self):
+        self.page.select_and_parse_kml(self.fixture("line_string_namespaced.kml"))
+        original = self.page._kml_state
+        with patch.object(QFileDialog, "getOpenFileName", return_value=("", "")):
+            self.page.browse_file(None)
 
-        self.assertEqual(stub.kml_input_path, replacement)
-        self.assertIsNone(stub.kml_values)
+        self.assertIs(self.page._kml_state, original)
 
-    def test_empty_altitude_blocks_simulation_before_other_inputs_are_used(self):
-        stub = SimpleNamespace(alt_m=MagicMock())
-        stub.alt_m.text.return_value = ""
-        with patch("pages.debris_page.QMessageBox.warning") as warning:
-            DebrisPage.run_simulation(stub)
+    def test_drop_uses_the_same_automatic_parse_flow(self):
+        path = str(self.fixture("gx_track.kml"))
+        url = SimpleNamespace(toLocalFile=lambda: path)
+        mime_data = SimpleNamespace(urls=lambda: [url])
+        event = SimpleNamespace(mimeData=lambda: mime_data)
 
-        self.assertIn("valid altitude", warning.call_args.args[2])
+        self.page.drop_event(event)
+
+        self.assertEqual(self.page.kml_input_path, path)
+        self.assertTrue(self.page._kml_state.ready)
+        self.assertEqual(self.page.alt_m.text(), "125.0")
+
+    def test_reselecting_same_path_reparses_instead_of_reusing_coordinates(self):
+        path = str(self.fixture("line_string_namespaced.kml"))
+        first = KmlTrack(
+            points=(KmlPoint(1.0, 2.0, 3.0), KmlPoint(4.0, 5.0, 6.0)),
+            geometry_kind="line_string",
+            placemark_name=None,
+        )
+        second = KmlTrack(
+            points=(KmlPoint(7.0, 8.0, 9.0), KmlPoint(10.0, 11.0, 12.0)),
+            geometry_kind="line_string",
+            placemark_name=None,
+        )
+        with patch("pages.debris_page.parse_kml_track", side_effect=[first, second]) as parser:
+            self.page.select_and_parse_kml(path)
+            self.page.select_and_parse_kml(path)
+
+        self.assertEqual(parser.call_count, 2)
+        self.assertEqual(self.page._kml_state.coordinates, (7.0, 8.0, 10.0, 11.0))
+        self.assertEqual(self.page.alt_m.text(), "12.0")
+
+    def test_reload_preserves_manual_altitude_for_two_dimensional_kml(self):
+        path = self.fixture("line_string_namespace_free_2d.kml")
+        with patch.object(QMessageBox, "warning"):
+            self.page.select_and_parse_kml(path)
+        self.page.alt_m.setText("350")
+
+        with patch.object(QMessageBox, "warning") as warning:
+            ready = self.page.reload_selected_kml()
+
+        self.assertTrue(ready)
+        self.assertEqual(self.page.alt_m.text(), "350")
+        self.assertIn("using entered altitude", self.page.kml_status_label.text())
+        warning.assert_not_called()
+
+    def test_missing_malformed_and_unsupported_files_are_retryable_errors(self):
+        cases = [
+            FIXTURES / "not-present.kml",
+            self.fixture("malformed_xml.kml"),
+            self.fixture("no_path.kml"),
+        ]
+        for path in cases:
+            with self.subTest(path=path):
+                ready = self.page.select_and_parse_kml(path, notify=False)
+                self.assertFalse(ready)
+                self.assertEqual(self.page.kml_input_path, str(path))
+                self.assertIsNone(self.page._kml_state.coordinates)
+                self.assertTrue(self.page._kml_state.error)
+                self.assertTrue(self.page.load_kml_btn.isEnabled())
+
+    def test_invalid_selection_blocks_before_output_picker_and_calculator(self):
+        self.page.select_and_parse_kml(self.fixture("wrong_arity.kml"), notify=False)
+        with (
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QFileDialog, "getSaveFileName") as save_dialog,
+            patch.object(self.page, "run_debris_calculator") as calculator,
+        ):
+            self.page.run_simulation()
+
+        self.assertIn("could not be loaded", warning.call_args.args[2])
+        save_dialog.assert_not_called()
+        calculator.assert_not_called()
+
+    def test_run_parses_legacy_path_without_manual_extraction(self):
+        path = str(self.fixture("line_string_namespaced.kml"))
+        self.page.kml_input_path = path
+        self.page.alt_m.setText("999")
+        self.page.terrain_m.setText("0")
+        output = str(Path(self.temp_dir.name) / "debris.kml")
+        with (
+            patch.object(QFileDialog, "getSaveFileName", return_value=(output, "")),
+            patch.object(self.page, "run_debris_calculator") as calculator,
+        ):
+            self.page.run_simulation()
+
+        self.assertTrue(self.page._kml_state.ready)
+        self.assertEqual(self.page.alt_m.text(), "125.0")
+        self.assertEqual(
+            calculator.call_args.kwargs["input_coords_hook"],
+            (51.2, -0.7, 51.3, -0.6),
+        )
 
 
 if __name__ == "__main__":

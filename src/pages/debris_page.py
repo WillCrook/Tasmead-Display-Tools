@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from uuid import UUID
 
 from PyQt6.QtCore import Qt
@@ -15,52 +16,130 @@ from services import (
 from pages.preset_ui import PresetUiMixin
 
 
+@dataclass(frozen=True, slots=True)
+class DebrisKmlState:
+    """The selected debris KML and the parse result belonging to that path."""
+
+    path: str = ""
+    coordinates: tuple[float, float, float, float] | None = None
+    final_altitude_m: float | None = None
+    error: str | None = None
+
+    @property
+    def ready(self):
+        return self.coordinates is not None and self.error is None
+
+
 class DebrisPage(PresetUiMixin, QWidget):
-    def clear_kml_metadata(self):
-        """Invalidate extracted values when the selected KML changes or fails."""
-        self.kml_values = None
-        if hasattr(self, "kml_meta_pen_lat"):
-            self.kml_meta_pen_lat.setText("Penultimate latitude: —")
-            self.kml_meta_pen_lon.setText("Penultimate longitude: —")
-            self.kml_meta_fin_lat.setText("Final latitude: —")
-            self.kml_meta_fin_lon.setText("Final longitude: —")
+    @property
+    def kml_input_path(self):
+        """Compatibility view of the path stored in the authoritative KML state."""
+        return self._kml_state.path
 
-    def load_kml_metadata(self):
-        if not hasattr(self, "kml_input_path") or not self.kml_input_path:
-            QMessageBox.warning(self, "Missing file", "Please drop or select a KML file first.")
+    @kml_input_path.setter
+    def kml_input_path(self, path):
+        """Legacy path assignment invalidates any parse result until Run reparses it."""
+        self._kml_state = DebrisKmlState(path=os.fspath(path) if path else "")
+
+    def render_kml_state(self):
+        """Render the complete KML state without retaining metadata from another path."""
+        if not hasattr(self, "kml_meta_pen_lat"):
             return
 
-        self.clear_kml_metadata()
+        state = self._kml_state
+        self.kml_meta_pen_lat.setText("Penultimate latitude: —")
+        self.kml_meta_pen_lon.setText("Penultimate longitude: —")
+        self.kml_meta_fin_lat.setText("Final latitude: —")
+        self.kml_meta_fin_lon.setText("Final longitude: —")
+        self.load_kml_btn.setEnabled(bool(state.path))
+        self.file_label.setText(state.path or "Drop KML file here")
+
+        if not state.path:
+            self.kml_status_label.setText("No KML selected.")
+            self.kml_status_label.setStyleSheet("")
+            return
+
+        if state.error:
+            self.kml_status_label.setText(f"KML error: {state.error}")
+            self.kml_status_label.setStyleSheet("color: #b00020;")
+            return
+
+        if not state.ready:
+            self.kml_status_label.setText("Loading KML…")
+            self.kml_status_label.setStyleSheet("")
+            return
+
+        penultimate_lat, penultimate_lon, final_lat, final_lon = state.coordinates
+        self.kml_meta_pen_lat.setText(f"Penultimate latitude: {penultimate_lat}")
+        self.kml_meta_pen_lon.setText(f"Penultimate longitude: {penultimate_lon}")
+        self.kml_meta_fin_lat.setText(f"Final latitude: {final_lat}")
+        self.kml_meta_fin_lon.setText(f"Final longitude: {final_lon}")
+        self.kml_status_label.setStyleSheet("")
+        if state.final_altitude_m is not None:
+            self.kml_status_label.setText("KML ready.")
+        elif self.alt_m.text():
+            self.kml_status_label.setText("KML ready — using entered altitude.")
+        else:
+            self.kml_status_label.setText("KML ready — enter altitude in metres.")
+
+    def select_and_parse_kml(self, path, *, altitude_fallback=None, notify=True):
+        """Select and synchronously parse one path, committing a complete result."""
+        selected_path = os.fspath(path) if path else ""
+        self._kml_state = DebrisKmlState(path=selected_path)
+        if altitude_fallback is None:
+            self.alt_m.clear()
+        else:
+            self.alt_m.setText(altitude_fallback)
+        self.render_kml_state()
+
+        if not selected_path:
+            return False
+
         try:
-            track = parse_kml_track(self.kml_input_path)
-        except Exception as e:
-            QMessageBox.critical(self, "KML Error", str(e))
-            return
+            track = parse_kml_track(selected_path)
+        except Exception as error:
+            message = str(error) or error.__class__.__name__
+            self._kml_state = DebrisKmlState(path=selected_path, error=message)
+            self.render_kml_state()
+            if notify:
+                QMessageBox.critical(self, "KML Error", message)
+            return False
 
         penultimate, final = track.points[-2:]
-
-        self.kml_meta_pen_lat.setText(f"Penultimate latitude: {penultimate.latitude}")
-        self.kml_meta_pen_lon.setText(f"Penultimate longitude: {penultimate.longitude}")
-        self.kml_meta_fin_lat.setText(f"Final latitude: {final.latitude}")
-        self.kml_meta_fin_lon.setText(f"Final longitude: {final.longitude}")
-
-        #package up for hooking into DebrisTrajectoryCalculator
-        self.kml_values = (
+        coordinates = (
             penultimate.latitude,
             penultimate.longitude,
             final.latitude,
             final.longitude,
         )
+        self._kml_state = DebrisKmlState(
+            path=selected_path,
+            coordinates=coordinates,
+            final_altitude_m=final.altitude_m,
+        )
 
-        if final.altitude_m is None:
+        if final.altitude_m is not None:
+            self.alt_m.setText(f"{final.altitude_m}")
+        elif altitude_fallback is None:
             self.alt_m.clear()
+
+        self.render_kml_state()
+        if final.altitude_m is None and not altitude_fallback and notify:
             QMessageBox.warning(
                 self,
                 "KML altitude missing",
                 "The final KML coordinate has no altitude. Enter the altitude in metres before running the simulation.",
             )
-        else:
-            self.alt_m.setText(f"{final.altitude_m}")
+        return True
+
+    def reload_selected_kml(self):
+        if not self.kml_input_path:
+            QMessageBox.warning(self, "Missing file", "Please drop or select a KML file first.")
+            return False
+        return self.select_and_parse_kml(
+            self.kml_input_path,
+            altitude_fallback=self.alt_m.text(),
+        )
 
     def __init__(self):
         super().__init__()
@@ -150,7 +229,7 @@ class DebrisPage(PresetUiMixin, QWidget):
             "flight_mode": self.flight_mode,
             "flight_inputs": {
                 "kml": {
-                    "kml_path": getattr(self, "kml_input_path", "")
+                    "kml_path": self._kml_state.path
                 },
                 "coords": {
                     "lat1": self.lat1_input.text(),
@@ -209,7 +288,8 @@ class DebrisPage(PresetUiMixin, QWidget):
                 self.surface_combo.setCurrentIndex(index)
 
         self.include_ground_drag.setChecked(data.get("include_ground_drag", True))
-        self.alt_m.setText(data.get("altitude_m", ""))
+        saved_altitude = data.get("altitude_m", "")
+        self.alt_m.setText(saved_altitude)
         self.terrain_m.setText(data.get("terrain_m", ""))
         self.height_m.setText(data.get("height_m", ""))
 
@@ -226,10 +306,10 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         if self.flight_mode == "kml":
             kml_data = flight_inputs.get("kml", {})
-            self.kml_input_path = kml_data.get("kml_path", "")
-            self.clear_kml_metadata()
-            if self.kml_input_path:
-                self.file_label.setText(self.kml_input_path)
+            self.select_and_parse_kml(
+                kml_data.get("kml_path", ""),
+                altitude_fallback=saved_altitude,
+            )
 
         elif self.flight_mode == "coords":
             coords = flight_inputs.get("coords", {})
@@ -309,7 +389,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         layout.addLayout(hbox_modes)
 
         self.flight_mode = "kml"
-        self.kml_values = None
+        self._kml_state = DebrisKmlState()
 
         self.rb_kml.toggled.connect(lambda checked: self.set_flight_mode("kml") if checked else None)
         self.rb_coords.toggled.connect(lambda checked: self.set_flight_mode("coords") if checked else None)
@@ -336,10 +416,13 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         kml_layout.addWidget(self.file_label)
 
-        #Load KML button
-        self.load_kml_btn = QPushButton("Extract Values from KML")
-        self.load_kml_btn.clicked.connect(self.load_kml_metadata)
+        self.load_kml_btn = QPushButton("Reload selected KML")
+        self.load_kml_btn.clicked.connect(self.reload_selected_kml)
         kml_layout.addWidget(self.load_kml_btn)
+
+        self.kml_status_label = QLabel("No KML selected.")
+        self.kml_status_label.setWordWrap(True)
+        kml_layout.addWidget(self.kml_status_label)
 
         # Metadata display labels
         self.kml_meta_pen_lat = QLabel("Penultimate latitude: —")
@@ -451,6 +534,7 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         # Connect signals
         self.alt_m.textChanged.connect(self.alt_m_changed)
+        self.alt_m.textChanged.connect(lambda _: self.render_kml_state())
         self.alt_ft.textChanged.connect(self.alt_ft_changed)
         self.terrain_m.textChanged.connect(self.terrain_m_changed)
         self.terrain_ft.textChanged.connect(self.terrain_ft_changed)
@@ -480,6 +564,7 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         layout.addStretch()
 
+        self.render_kml_state()
         self.update_flight_mode_ui()
 
     def set_flight_mode(self, mode):
@@ -614,9 +699,7 @@ class DebrisPage(PresetUiMixin, QWidget):
             self, "Open KML", "", "KML Files (*.kml)"
         )
         if file:
-            self.kml_input_path = file
-            self.file_label.setText(file)
-            self.clear_kml_metadata()
+            self.select_and_parse_kml(file)
 
     def drag_enter(self, event):
         if event.mimeData().hasUrls():
@@ -625,11 +708,28 @@ class DebrisPage(PresetUiMixin, QWidget):
     def drop_event(self, event):
         urls = event.mimeData().urls()
         if urls:
-            self.kml_input_path = urls[0].toLocalFile()
-            self.file_label.setText(self.kml_input_path)
-            self.clear_kml_metadata()
+            self.select_and_parse_kml(urls[0].toLocalFile())
 
     def run_simulation(self):
+        if self.flight_mode == "kml":
+            if not self.kml_input_path:
+                QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
+                return
+
+            if not self._kml_state.ready:
+                if self._kml_state.error:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid KML",
+                        "The selected KML could not be loaded. Choose another file or reload it after correcting the error.",
+                    )
+                    return
+                if not self.select_and_parse_kml(
+                    self.kml_input_path,
+                    altitude_fallback=self.alt_m.text(),
+                ):
+                    return
+
         # Validate altitude input
         try:
             altitude_m = float(self.alt_m.text())
@@ -656,19 +756,7 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         # Prepare input params based on flight mode
         if self.flight_mode == "kml":
-            if not hasattr(self, "kml_input_path") or not self.kml_input_path:
-                QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
-                return
-
-            if not self.kml_values:
-                QMessageBox.warning(
-                    self,
-                    "Missing input",
-                    "Please extract values from the selected KML file first.",
-                )
-                return
-
-            input_coords = self.kml_values
+            input_coords = self._kml_state.coordinates
             input_bearing = None
 
         elif self.flight_mode == "coords":
