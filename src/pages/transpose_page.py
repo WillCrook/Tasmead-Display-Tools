@@ -1,4 +1,5 @@
 import os
+from uuid import UUID
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -7,9 +8,11 @@ from PyQt6.QtWidgets import (
 )
 
 from resource_paths import app_data_path, resource_path
-from services import PresetStore, run_transposition
+from services import PresetType, run_transposition
+from pages.preset_ui import PresetUiMixin
 
-class TransposePage(QWidget):
+
+class TransposePage(PresetUiMixin, QWidget):
     def __init__(self):
         super().__init__()
         layout = QHBoxLayout(self)
@@ -40,10 +43,13 @@ class TransposePage(QWidget):
         splitter.setStretchFactor(2, 2)
 
         # Presets
-        self.presets_dir = app_data_path("airfields")
-        legacy_presets_dir = resource_path("data/airfields")
-        self.preset_store = PresetStore(self.presets_dir, legacy_presets_dir)
-        self.presets = {}
+        self.initialize_preset_management(
+            preset_type=PresetType.AIRFIELD,
+            managed_directory=app_data_path("presets/airfield"),
+            legacy_managed_directory=app_data_path("airfields"),
+            legacy_readonly_directory=resource_path("data/airfields"),
+            backup_directory=app_data_path("presets/legacy-backup/airfield"),
+        )
         self.build_presets_panel(presets_layout)
         self.load_presets_from_disk()
 
@@ -65,19 +71,24 @@ class TransposePage(QWidget):
         layout.addWidget(self.preset_list)
 
         save_btn = QPushButton("Save Preset")
-        load_btn = QPushButton("Load Preset from File")
-        delete_btn = QPushButton("Delete Preset")
+        load_btn = QPushButton("Load Preset")
+        self.rename_preset_btn = QPushButton("Rename Preset")
+        self.delete_preset_btn = QPushButton("Delete Preset")
         self.export_preset_btn = QPushButton("Export Preset")
+        self.rename_preset_btn.setEnabled(False)
+        self.delete_preset_btn.setEnabled(False)
         self.export_preset_btn.setEnabled(False)
 
         save_btn.clicked.connect(self.save_preset)
         load_btn.clicked.connect(self.load_preset_from_file)
-        delete_btn.clicked.connect(self.delete_preset)
+        self.rename_preset_btn.clicked.connect(self.rename_preset)
+        self.delete_preset_btn.clicked.connect(self.delete_preset)
         self.export_preset_btn.clicked.connect(self.export_preset)
 
         layout.addWidget(save_btn)
         layout.addWidget(load_btn)
-        layout.addWidget(delete_btn)
+        layout.addWidget(self.rename_preset_btn)
+        layout.addWidget(self.delete_preset_btn)
         layout.addWidget(self.export_preset_btn)
         layout.addStretch()
 
@@ -90,7 +101,7 @@ class TransposePage(QWidget):
         self.orig_height_input = QLineEdit()
         self.orig_height_input.setPlaceholderText("Elevation (m)")
         self.orig_height_input.textChanged.connect(self.orig_height_m_changed)
-        
+
         m_layout = QVBoxLayout()
         m_layout.addWidget(QLabel("Original Elevation (m)"))
         m_layout.addWidget(self.orig_height_input)
@@ -215,19 +226,6 @@ class TransposePage(QWidget):
         # Deprecated, logic moved to list widget
         pass
 
-    def load_presets_from_disk(self):
-        self.presets = self.preset_store.load_all()
-        self.refresh_preset_list()
-
-    def refresh_preset_list(self):
-        self.preset_list.clear()
-        for name in sorted(self.presets.keys()):
-            self.preset_list.addItem(name)
-        self.update_preset_actions()
-
-    def update_preset_actions(self, *_):
-        self.export_preset_btn.setEnabled(self.preset_list.currentItem() is not None)
-
     def save_preset(self):
         default_name = self.airfield_name_input.text()
         name, ok = QInputDialog.getText(self, "Save Preset", "Enter preset name:", text=default_name)
@@ -242,80 +240,38 @@ class TransposePage(QWidget):
             "original_elevation_m": self.orig_height_input.text()
         }
 
-        try:
-            self.presets[name] = self.preset_store.save(name, data)
-            self.refresh_preset_list()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save preset: {e}")
+        self.save_preset_data(name, data, error_title="Error")
 
     def load_preset_from_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load Preset", self.presets_dir, "JSON Files (*.json)")
-        if not path:
-            return
-        
-        try:
-            data = self.preset_store.load_file(path)
-            
-            self.airfield_name_input.setText(data.get("name", ""))
-            self.lat_input.setText(data.get("latitude", ""))
-            self.lon_input.setText(data.get("longitude", ""))
-            self.heading_input.setText(data.get("heading", ""))
-            self.orig_height_input.setText(data.get("original_elevation_m", ""))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load preset: {e}")
-
-    def load_selected_preset(self, item):
-        name = item.text()
-        entry = self.presets.get(name)
-        if entry:
-            data = entry["data"]
-            self.airfield_name_input.setText(data.get("name", ""))
-            self.lat_input.setText(data.get("latitude", ""))
-            self.lon_input.setText(data.get("longitude", ""))
-            self.heading_input.setText(data.get("heading", ""))
-            self.orig_height_input.setText(data.get("original_elevation_m", ""))
-
-    def delete_preset(self):
-        item = self.preset_list.currentItem()
-        if not item:
-            return
-        
-        name = item.text()
-        entry = self.presets.get(name)
-        if entry:
-            path = entry["path"]
-            try:
-                self.preset_store.delete(entry)
-                del self.presets[name]
-                self.refresh_preset_list()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete preset: {e}")
-
-    def export_preset(self):
-        item = self.preset_list.currentItem()
-        if not item:
-            return
-
-        name = item.text()
-        entry = self.presets.get(name)
-        if not entry:
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = QFileDialog.getOpenFileName(
             self,
-            "Export Preset",
-            f"{name}.json",
-            "JSON Files (*.json)",
+            "Load Preset",
+            self.presets_dir,
+            "JSON Files (*.json);;All Files (*)",
         )
         if not path:
             return
-        if not path.lower().endswith(".json"):
-            path = f"{path}.json"
 
+        record = self.import_preset_path(path, error_title="Error")
+        if record is not None:
+            self._apply_preset_data(record.preset.data)
+
+    def load_selected_preset(self, item):
         try:
-            self.preset_store.write_file(path, entry["data"])
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export preset: {e}")
+            preset_id = UUID(str(item.data(Qt.ItemDataRole.UserRole)))
+        except (TypeError, ValueError):
+            return
+        record = self.presets.get(preset_id)
+        if record is not None:
+            self._apply_preset_data(record.preset.data)
+
+    def _apply_preset_data(self, data):
+        """Apply tolerant airfield settings from a validated preset envelope."""
+        self.airfield_name_input.setText(data.get("name", ""))
+        self.lat_input.setText(data.get("latitude", ""))
+        self.lon_input.setText(data.get("longitude", ""))
+        self.heading_input.setText(data.get("heading", ""))
+        self.orig_height_input.setText(data.get("original_elevation_m", ""))
 
     def run_transposition_ui(self):
         if not self.input_files:

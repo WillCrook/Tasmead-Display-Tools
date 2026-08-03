@@ -1,3 +1,5 @@
+import base64
+import errno
 import json
 import os
 import sys
@@ -5,278 +7,538 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import UUID, uuid4
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+
 from pages.debris_page import DebrisPage
 from pages.transpose_page import TransposePage
-from services.preset_store import PresetStore
 import resource_paths
+from services import (
+    CURRENT_FORMAT_VERSION,
+    Preset,
+    PresetDestinationExistsError,
+    PresetImportExportService,
+    PresetIOError,
+    PresetMalformedJsonError,
+    PresetNameConflictError,
+    PresetNameError,
+    PresetRepository,
+    PresetType,
+    PresetTypeMismatchError,
+    PresetValidationError,
+    UnsupportedPresetVersionError,
+    canonical_filename,
+    canonical_stem,
+    readable_export_filename,
+)
 
 
-class DebrisPresetOwnershipTests(unittest.TestCase):
+def write_preset(path: Path, preset: Preset) -> None:
+    path.write_text(json.dumps(preset.to_dict()), encoding="utf-8")
+
+
+class PresetFilenameTests(unittest.TestCase):
+    def test_readable_canonical_filename_and_numbered_collisions(self):
+        self.assertEqual(canonical_stem("Farnborough Runway 24"), "farnborough-runway-24")
+        self.assertEqual(
+            canonical_filename("Farnborough Runway 24"),
+            "farnborough-runway-24.json",
+        )
+        self.assertEqual(
+            canonical_filename(
+                "Farnborough Runway 24",
+                {"FARNBOROUGH-RUNWAY-24.JSON", "farnborough-runway-24-2.json"},
+            ),
+            "farnborough-runway-24-3.json",
+        )
+
+    def test_unicode_reserved_and_empty_ascii_names_are_safe(self):
+        self.assertEqual(canonical_stem("Café"), "cafe")
+        self.assertEqual(canonical_stem("CON"), "preset-con")
+        self.assertEqual(canonical_stem("東京"), "preset")
+        self.assertNotIn("/", readable_export_filename("Readable Name"))
+
+    def test_path_like_and_control_names_are_rejected(self):
+        for name in ("../preset", "folder/preset", "folder\\preset", "bad\x00name"):
+            with self.subTest(name=repr(name)), self.assertRaises(PresetNameError):
+                Preset.create(PresetType.DEBRIS, name, {})
+
+
+class PresetLocationTests(unittest.TestCase):
+    def test_app_data_path_uses_qt_writable_location(self):
+        root = Path("/application-data")
+        with patch.object(
+            resource_paths.QStandardPaths,
+            "writableLocation",
+            return_value=str(root),
+        ):
+            resolved = resource_paths.app_data_path("presets/debris")
+
+        self.assertEqual(Path(resolved), root / "presets" / "debris")
+
+
+class PresetModelTests(unittest.TestCase):
+    def test_complete_envelope_round_trips_and_rename_keeps_uuid(self):
+        preset = Preset.create(PresetType.AIRFIELD, "Field", {"latitude": "51"})
+        restored = Preset.from_dict(preset.to_dict(), expected_type=PresetType.AIRFIELD)
+        renamed = restored.renamed("New Field")
+
+        self.assertEqual(restored, preset)
+        self.assertEqual(renamed.id, preset.id)
+        self.assertEqual(renamed.name, "New Field")
+        self.assertEqual(set(preset.to_dict()), {"formatVersion", "presetType", "id", "name", "data"})
+
+    def test_schema_version_type_uuid_and_extra_fields_are_validated(self):
+        document = Preset.create(PresetType.AIRFIELD, "Field", {}).to_dict()
+        bad_documents = []
+        for key in document:
+            bad_documents.append({k: v for k, v in document.items() if k != key})
+        for bad in bad_documents:
+            with self.subTest(fields=bad.keys()), self.assertRaises(PresetValidationError):
+                Preset.from_dict(bad)
+
+        with self.assertRaises(UnsupportedPresetVersionError):
+            Preset.from_dict({**document, "formatVersion": 2})
+        with self.assertRaises(PresetTypeMismatchError):
+            Preset.from_dict(document, expected_type=PresetType.DEBRIS)
+        with self.assertRaises(PresetValidationError):
+            Preset.from_dict({**document, "id": "not-a-uuid"})
+        with self.assertRaises(PresetValidationError):
+            Preset.from_dict({**document, "extra": True})
+        with self.assertRaises(PresetValidationError):
+            Preset.create(PresetType.AIRFIELD, "Invalid Data", {"value": float("nan")})
+
+
+class PresetRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.repository = PresetRepository(self.root / "presets", PresetType.AIRFIELD)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_create_uses_uuid_identity_and_complete_managed_document(self):
+        record = self.repository.create("Farnborough Runway 24", {"heading": "24"})
+        document = json.loads(record.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record.filename, "farnborough-runway-24.json")
+        self.assertEqual(UUID(document["id"]), record.preset.id)
+        self.assertEqual(document["formatVersion"], CURRENT_FORMAT_VERSION)
+        self.assertEqual(document["name"], "Farnborough Runway 24")
+        self.assertEqual(document["data"], {"heading": "24"})
+        self.assertEqual(set(self.repository.load_all()), {record.preset.id})
+
+    def test_filename_slug_collisions_are_numbered_without_name_identity(self):
+        first = self.repository.create("Café", {"value": 1})
+        second = self.repository.create("Cafe", {"value": 2})
+
+        self.assertEqual(first.filename, "cafe.json")
+        self.assertEqual(second.filename, "cafe-2.json")
+        self.assertNotEqual(first.preset.id, second.preset.id)
+
+        updated = self.repository.update_data(second.preset.id, {"value": 3})
+        self.assertEqual(updated.filename, "cafe-2.json")
+        self.assertEqual(updated.preset.data, {"value": 3})
+
+    def test_names_are_unique_but_update_preserves_uuid(self):
+        record = self.repository.create("Saved", {"value": 1})
+        with self.assertRaises(PresetNameConflictError):
+            self.repository.create("saved", {"value": 2})
+
+        updated = self.repository.update_data(record.preset.id, {"value": 3})
+        self.assertEqual(updated.preset.id, record.preset.id)
+        self.assertEqual(updated.preset.data, {"value": 3})
+
+    def test_rename_moves_file_and_preserves_uuid_and_data(self):
+        record = self.repository.create("Old Name", {"value": 1})
+        renamed = self.repository.rename(record.preset.id, "New Name")
+
+        self.assertEqual(renamed.preset.id, record.preset.id)
+        self.assertEqual(renamed.preset.data, record.preset.data)
+        self.assertEqual(renamed.filename, "new-name.json")
+        self.assertFalse(record.path.exists())
+        self.assertTrue(renamed.path.exists())
+
+    def test_delete_resolves_by_uuid_and_never_uses_external_paths(self):
+        record = self.repository.create("Delete Me", {})
+        external = self.root / "external.json"
+        external.write_text("{}", encoding="utf-8")
+
+        self.repository.delete(record.preset.id)
+
+        self.assertFalse(record.path.exists())
+        self.assertTrue(external.exists())
+
+    def test_create_only_write_falls_back_when_hardlinks_are_unsupported(self):
+        with patch("services.preset_store.os.link", side_effect=OSError(errno.ENOTSUP, "no links")):
+            record = self.repository.create("Portable", {"value": 1})
+
+        self.assertEqual(json.loads(record.path.read_text())["name"], "Portable")
+        self.assertEqual(list(record.path.parent.glob(".preset-*.tmp")), [])
+
+    def test_unwritable_repository_does_not_crash_construction(self):
+        with patch.object(Path, "mkdir", side_effect=PermissionError("denied")):
+            repository = PresetRepository(self.root / "unwritable", PresetType.AIRFIELD)
+
+        self.assertEqual(repository.load_all(), {})
+        self.assertTrue(any("Cannot create preset directory" in issue for issue in repository.issues))
+        with self.assertRaises(PresetIOError):
+            repository.create("Cannot Save", {})
+
+
+class PresetMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.managed = self.root / "old-managed"
+        self.bundled = self.root / "bundled"
+        self.destination = self.root / "presets" / "airfield"
+        self.backup = self.root / "presets" / "legacy-backup" / "airfield"
+        self.managed.mkdir(parents=True)
+        self.bundled.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def repository(self):
+        return PresetRepository(
+            self.destination,
+            PresetType.AIRFIELD,
+            legacy_managed_directories=(self.managed,),
+            legacy_readonly_directories=(self.bundled,),
+            backup_directory=self.backup,
+        )
+
+    def test_plain_and_base64_legacy_files_are_wrapped_and_backed_up(self):
+        (self.managed / "Farnborough.json").write_text(
+            json.dumps({"heading": "24"}), encoding="utf-8"
+        )
+        encoded = base64.urlsafe_b64encode("Café".encode()).decode().rstrip("=")
+        (self.managed / f"preset-v1-{encoded}.json").write_text(
+            json.dumps({"heading": "06"}), encoding="utf-8"
+        )
+
+        repository = self.repository()
+        records = repository.load_all()
+
+        self.assertEqual({record.preset.name for record in records.values()}, {"Farnborough", "Café"})
+        self.assertTrue(all(record.preset.format_version == 1 for record in records.values()))
+        self.assertEqual(len(list(self.backup.glob("*.json"))), 2)
+        self.assertEqual(list(self.managed.glob("*.json")), [])
+
+    def test_bundled_migration_is_idempotent_and_preserves_source(self):
+        source = self.bundled / "Bundled Field.json"
+        source.write_text(json.dumps({"heading": "18"}), encoding="utf-8")
+
+        first = self.repository()
+        first_ids = set(first.load_all())
+        second = self.repository()
+
+        self.assertEqual(set(second.load_all()), first_ids)
+        self.assertTrue(source.exists())
+        self.assertEqual(len(first_ids), 1)
+
+    def test_malformed_legacy_file_is_reported_and_left_untouched(self):
+        source = self.managed / "broken.json"
+        source.write_text("not json", encoding="utf-8")
+
+        repository = self.repository()
+
+        self.assertTrue(source.exists())
+        self.assertTrue(any("Malformed legacy preset" in issue for issue in repository.issues))
+        self.assertEqual(repository.load_all(), {})
+
+
+class PresetTransferTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.repository = PresetRepository(self.root / "managed", PresetType.DEBRIS)
+        self.transfer = PresetImportExportService(self.repository)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_import_uses_metadata_not_arbitrary_filename_and_copies_source(self):
+        source = self.root / "anything at all.preset"
+        preset = Preset.create(PresetType.DEBRIS, "Metadata Name", {"mass": 10})
+        write_preset(source, preset)
+        original = source.read_bytes()
+
+        inspection = self.transfer.inspect_import(source)
+        record = self.transfer.import_new(inspection.preset)
+
+        self.assertEqual(record.preset.name, "Metadata Name")
+        self.assertEqual(record.filename, "metadata-name.json")
+        self.assertEqual(source.read_bytes(), original)
+        self.assertNotEqual(record.path, source)
+
+    def test_duplicate_uuid_replace_copy_and_cancel_outcomes(self):
+        existing = self.repository.create("Original", {"value": 1})
+        imported = Preset.create(
+            PresetType.DEBRIS,
+            "Imported",
+            {"value": 2},
+            preset_id=existing.preset.id,
+        )
+        source = self.root / "duplicate.weird.json"
+        write_preset(source, imported)
+        inspection = self.transfer.inspect_import(source)
+        self.assertEqual(inspection.existing.preset.id, existing.preset.id)
+
+        # Cancel is represented by not committing the inspected candidate.
+        self.assertEqual(self.repository.get(existing.preset.id).preset.data, {"value": 1})
+        replaced = self.transfer.replace(imported)
+        self.assertEqual(replaced.preset.id, existing.preset.id)
+        self.assertEqual(replaced.preset.name, "Imported")
+        copied = self.transfer.import_copy(imported, name="Imported Copy")
+        self.assertNotEqual(copied.preset.id, imported.id)
+        self.assertEqual(copied.preset.data, imported.data)
+
+    def test_malformed_missing_unsupported_and_wrong_type_imports_fail_cleanly(self):
+        malformed = self.root / "malformed.json"
+        malformed.write_text("not json", encoding="utf-8")
+        with self.assertRaises(PresetMalformedJsonError):
+            self.transfer.inspect_import(malformed)
+        nonstandard = self.root / "nan.json"
+        nonstandard.write_text('{"value": NaN}', encoding="utf-8")
+        with self.assertRaises(PresetMalformedJsonError):
+            self.transfer.inspect_import(nonstandard)
+
+        valid = Preset.create(PresetType.DEBRIS, "Valid", {}).to_dict()
+        cases = [
+            ({"name": "raw legacy"}, PresetValidationError),
+            ({**valid, "formatVersion": 99}, UnsupportedPresetVersionError),
+            (Preset.create(PresetType.AIRFIELD, "Wrong", {}).to_dict(), PresetTypeMismatchError),
+        ]
+        for index, (document, exception) in enumerate(cases):
+            path = self.root / f"invalid-{index}.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.subTest(index=index), self.assertRaises(exception):
+                self.transfer.inspect_import(path)
+
+    def test_export_uses_full_envelope_arbitrary_name_and_explicit_overwrite(self):
+        record = self.repository.create("Readable Name", {"value": 7})
+        destination = self.root / "my chosen filename.data.json"
+        self.transfer.export(record.preset, destination)
+
+        self.assertEqual(json.loads(destination.read_text()), record.preset.to_dict())
+        self.assertEqual(
+            self.transfer.suggested_export_filename(record.preset),
+            "Readable Name.json",
+        )
+        with self.assertRaises(PresetDestinationExistsError):
+            self.transfer.export(record.preset, destination)
+        self.transfer.export(record.preset.with_data({"value": 8}), destination, overwrite=True)
+        self.assertEqual(json.loads(destination.read_text())["data"], {"value": 8})
+
+
+class PresetPageTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.user_data_root = Path(self.temp_dir.name) / "user-data"
-        self.legacy_root = Path(self.temp_dir.name) / "legacy-resources"
-        self.resource_path = lambda relative: str(self.legacy_root / relative)
-        self.app_data_path = lambda relative: str(self.user_data_root / relative)
+        self.root = Path(self.temp_dir.name)
+        self.app_root = self.root / "app-data"
+        self.bundle_root = self.root / "bundle"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def app_data_path(self, relative):
+        return str(self.app_root / relative)
+
+    def resource_path(self, relative):
+        return str(self.bundle_root / relative)
+
+    @staticmethod
+    def select(page, preset_id):
+        for row in range(page.preset_list.count()):
+            item = page.preset_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == str(preset_id):
+                page.preset_list.setCurrentItem(item)
+                return item
+        raise AssertionError(f"Preset {preset_id} was not listed")
+
+
+class DebrisPagePresetTests(PresetPageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.app_patch = patch("pages.debris_page.app_data_path", self.app_data_path)
         self.resource_patch = patch("pages.debris_page.resource_path", self.resource_path)
-        self.app_data_patch = patch("pages.debris_page.app_data_path", self.app_data_path)
+        self.app_patch.start()
         self.resource_patch.start()
-        self.app_data_patch.start()
         self.page = DebrisPage()
 
     def tearDown(self):
         self.page.close()
-        self.app_data_patch.stop()
         self.resource_patch.stop()
-        self.temp_dir.cleanup()
+        self.app_patch.stop()
+        super().tearDown()
 
     @staticmethod
-    def preset_data(mass="10"):
+    def data(mass="10"):
         return {"config": {"Mass (kg)": mass}, "flight_mode": "kml"}
 
-    def import_file(self, path):
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(path), "JSON Files (*.json)")):
-            self.page.load_preset_from_file()
-
-    def select_entry(self, preset_id):
-        for row in range(self.page.preset_list.count()):
-            item = self.page.preset_list.item(row)
-            if item.data(Qt.ItemDataRole.UserRole) == preset_id:
-                self.page.preset_list.setCurrentItem(item)
-                self.page.load_selected_preset(item)
-                return
-        self.fail(f"Preset {preset_id} was not listed")
-
-    def test_imported_preset_removal_never_deletes_source(self):
-        source = Path(self.temp_dir.name) / "external.json"
-        source.write_text(json.dumps(self.preset_data()), encoding="utf-8")
-        original = source.read_text(encoding="utf-8")
-
-        self.import_file(source)
-        preset_id = next(iter(self.page.presets))
-        self.select_entry(preset_id)
-        self.assertEqual(self.page.inputs["Mass (kg)"].text(), "10")
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
-            self.page.delete_preset()
-
-        self.assertTrue(source.exists())
-        self.assertEqual(source.read_text(encoding="utf-8"), original)
-        self.assertNotIn(preset_id, self.page.presets)
-
-    def test_app_managed_preset_deletion_still_deletes_its_file(self):
-        self.assertEqual(Path(self.page.presets_dir), self.user_data_root / "debris-presets")
-        self.assertNotEqual(Path(self.page.presets_dir), self.legacy_root / "data" / "presets")
-        entry = self.page.preset_store.save("saved", self.preset_data())
+    def test_uses_new_managed_root_and_uuid_item_data(self):
+        record = self.page.preset_repository.create("Managed", self.data())
         self.page.load_presets_from_disk()
-        preset_id = self.page.managed_preset_id("saved")
-        self.select_entry(preset_id)
+        item = self.select(self.page, record.preset.id)
 
-        self.page.delete_preset()
-
-        self.assertFalse(Path(entry["path"]).exists())
-        self.assertNotIn(preset_id, self.page.presets)
-
-    def test_collision_replaces_only_app_managed_copy(self):
-        managed = self.page.preset_store.save("shared", self.preset_data("1"))
-        source = Path(self.temp_dir.name) / "shared.json"
-        source.write_text(json.dumps(self.preset_data("2")), encoding="utf-8")
-        original = source.read_text(encoding="utf-8")
-        self.page.load_presets_from_disk()
-
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
-            self.import_file(source)
-
-        self.assertEqual(json.loads(Path(managed["path"]).read_text())["config"]["Mass (kg)"], "2")
-        self.assertEqual(source.read_text(encoding="utf-8"), original)
-        self.assertEqual(self.page.presets[self.page.managed_preset_id("shared")]["ownership"], "app_managed")
-
-    def test_collision_cancel_leaves_app_and_external_files_unchanged(self):
-        managed = self.page.preset_store.save("shared", self.preset_data("1"))
-        source = Path(self.temp_dir.name) / "shared.json"
-        source.write_text(json.dumps(self.preset_data("2")), encoding="utf-8")
-        self.page.load_presets_from_disk()
-
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Cancel):
-            self.import_file(source)
-
-        self.assertEqual(json.loads(Path(managed["path"]).read_text())["config"]["Mass (kg)"], "1")
-        self.assertEqual(len(self.page.presets), 1)
-
-    def test_external_preset_exports_exact_loaded_json(self):
-        source = Path(self.temp_dir.name) / "external.json"
-        data = self.preset_data("42")
-        source.write_text(json.dumps(data), encoding="utf-8")
-        destination = Path(self.temp_dir.name) / "exports" / "copy.json"
-        destination.parent.mkdir()
-
-        self.import_file(source)
-        preset_id = next(iter(self.page.presets))
-        self.select_entry(preset_id)
-        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(destination), "JSON Files (*.json)")):
-            self.page.export_preset()
-
-        self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), data)
-        self.assertEqual(json.loads(source.read_text(encoding="utf-8")), data)
-
-    def test_invalid_import_and_export_failure_preserve_state(self):
-        invalid = Path(self.temp_dir.name) / "invalid.json"
-        invalid.write_text("not json", encoding="utf-8")
-        with patch.object(QMessageBox, "critical"):
-            self.import_file(invalid)
-        self.assertEqual(self.page.presets, {})
-
-        with patch.object(QMessageBox, "critical"):
-            self.import_file(Path(self.temp_dir.name) / "missing.json")
-        self.assertEqual(self.page.presets, {})
-
-        source = Path(self.temp_dir.name) / "external.json"
-        source.write_text(json.dumps(self.preset_data()), encoding="utf-8")
-        self.import_file(source)
-        preset_id = next(iter(self.page.presets))
-        self.select_entry(preset_id)
-        with patch.object(QFileDialog, "getSaveFileName", return_value=("/unwritable/copy.json", "JSON Files (*.json)")), \
-             patch.object(QMessageBox, "critical") as error:
-            self.page.export_preset()
-        error.assert_called_once()
-        self.assertIn(preset_id, self.page.presets)
-
-    def test_export_requires_selection_and_cancel_does_not_write(self):
-        self.assertFalse(self.page.export_preset_btn.isEnabled())
-        source = Path(self.temp_dir.name) / "external.json"
-        source.write_text(json.dumps(self.preset_data()), encoding="utf-8")
-        self.import_file(source)
-        self.select_entry(next(iter(self.page.presets)))
+        self.assertEqual(Path(self.page.presets_dir), self.app_root / "presets" / "debris")
+        self.assertEqual(UUID(item.data(Qt.ItemDataRole.UserRole)), record.preset.id)
+        self.assertTrue(self.page.rename_preset_btn.isEnabled())
         self.assertTrue(self.page.export_preset_btn.isEnabled())
 
-        with patch.object(QFileDialog, "getSaveFileName", return_value=("", "")):
+    def test_duplicate_uuid_cancel_does_not_import_or_change_source(self):
+        existing = self.page.preset_repository.create("Existing", self.data("1"))
+        imported = Preset.create(
+            PresetType.DEBRIS,
+            "Imported",
+            self.data("2"),
+            preset_id=existing.preset.id,
+        )
+        source = self.root / "external-name.json"
+        write_preset(source, imported)
+        original = source.read_bytes()
+
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")), \
+             patch.object(self.page, "choose_duplicate_uuid_action", return_value="cancel"):
+            self.page.load_preset_from_file()
+
+        stored = self.page.preset_repository.get(existing.preset.id)
+        self.assertEqual(stored.preset.data, self.data("1"))
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_duplicate_uuid_copy_gets_new_id_and_unique_name(self):
+        existing = self.page.preset_repository.create("Shared", self.data("1"))
+        imported = Preset.create(
+            PresetType.DEBRIS,
+            "Shared",
+            self.data("2"),
+            preset_id=existing.preset.id,
+        )
+        source = self.root / "copy-me.json"
+        write_preset(source, imported)
+
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")), \
+             patch.object(self.page, "choose_duplicate_uuid_action", return_value="copy"), \
+             patch.object(QInputDialog, "getText", return_value=("Shared (2)", True)):
+            self.page.load_preset_from_file()
+
+        records = self.page.preset_repository.load_all()
+        self.assertEqual(len(records), 2)
+        copy_record = next(record for record in records.values() if record.preset.id != existing.preset.id)
+        self.assertEqual(copy_record.preset.name, "Shared (2)")
+        self.assertEqual(copy_record.preset.data, self.data("2"))
+
+    def test_different_uuid_same_name_prompts_for_unique_managed_name(self):
+        self.page.preset_repository.create("Shared", self.data("1"))
+        imported = Preset.create(PresetType.DEBRIS, "Shared", self.data("2"))
+        source = self.root / "same-name.preset"
+        write_preset(source, imported)
+
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")), \
+             patch.object(QInputDialog, "getText", return_value=("Shared (2)", True)):
+            self.page.load_preset_from_file()
+
+        imported_record = self.page.preset_repository.get(imported.id)
+        self.assertIsNotNone(imported_record)
+        self.assertEqual(imported_record.preset.name, "Shared (2)")
+        self.assertEqual(imported_record.filename, "shared-2.json")
+
+    def test_rename_and_export_keep_uuid_and_emit_full_metadata(self):
+        record = self.page.preset_repository.create("Before", self.data())
+        self.page.load_presets_from_disk()
+        self.select(self.page, record.preset.id)
+        with patch.object(QInputDialog, "getText", return_value=("After", True)):
+            self.page.rename_preset()
+        renamed = self.page.preset_repository.get(record.preset.id)
+
+        destination = self.root / "Friendly export.json"
+        self.select(self.page, record.preset.id)
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(destination), "")):
             self.page.export_preset()
-        self.assertEqual(list(Path(self.temp_dir.name).glob("*.json")), [source])
+
+        document = json.loads(destination.read_text())
+        self.assertEqual(renamed.preset.id, record.preset.id)
+        self.assertEqual(renamed.filename, "after.json")
+        self.assertEqual(document["id"], str(record.preset.id))
+        self.assertEqual(document["name"], "After")
+        self.assertEqual(document["presetType"], "debris")
 
 
-class TransposePresetExportTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
-
+class TransposePagePresetTests(PresetPageTestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.user_data_root = Path(self.temp_dir.name) / "user-data"
-        self.legacy_root = Path(self.temp_dir.name) / "legacy-resources"
-        self.resource_patch = patch(
-            "pages.transpose_page.resource_path",
-            lambda relative: str(self.legacy_root / relative),
-        )
-        self.app_data_patch = patch(
-            "pages.transpose_page.app_data_path",
-            lambda relative: str(self.user_data_root / relative),
-        )
+        super().setUp()
+        self.app_patch = patch("pages.transpose_page.app_data_path", self.app_data_path)
+        self.resource_patch = patch("pages.transpose_page.resource_path", self.resource_path)
+        self.app_patch.start()
         self.resource_patch.start()
-        self.app_data_patch.start()
         self.page = TransposePage()
 
     def tearDown(self):
         self.page.close()
-        self.app_data_patch.stop()
         self.resource_patch.stop()
-        self.temp_dir.cleanup()
+        self.app_patch.stop()
+        super().tearDown()
 
-    def test_selected_airfield_preset_exports_without_changing_source(self):
-        self.assertEqual(Path(self.page.presets_dir), self.user_data_root / "airfields")
-        self.assertNotEqual(Path(self.page.presets_dir), self.legacy_root / "data" / "airfields")
-        data = {
-            "name": "Export Field",
-            "latitude": "51.0",
-            "longitude": "-1.0",
-            "heading": "90",
-            "original_elevation_m": "120",
+    @staticmethod
+    def data(name="Farnborough"):
+        return {
+            "name": name,
+            "latitude": "51.272833",
+            "longitude": "-0.792044",
+            "heading": "126",
+            "original_elevation_m": "38",
         }
-        entry = self.page.preset_store.save("export-field", data)
-        self.page.load_presets_from_disk()
-        self.assertFalse(self.page.export_preset_btn.isEnabled())
-        self.page.preset_list.setCurrentRow(0)
-        self.assertTrue(self.page.export_preset_btn.isEnabled())
-        destination = Path(self.temp_dir.name) / "airfield-copy.json"
 
-        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(destination), "JSON Files (*.json)")):
-            self.page.export_preset()
+    def test_import_is_persisted_selected_and_applied(self):
+        preset = Preset.create(PresetType.AIRFIELD, "Imported Field", self.data())
+        source = self.root / "not-the-preset-name.json"
+        write_preset(source, preset)
 
-        self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), data)
-        self.assertEqual(json.loads(Path(entry["path"]).read_text(encoding="utf-8")), data)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+            self.page.load_preset_from_file()
 
+        self.assertIsNotNone(self.page.preset_repository.get(preset.id))
+        self.assertEqual(self.page.airfield_name_input.text(), "Farnborough")
+        self.assertEqual(self.page.heading_input.text(), "126")
+        self.assertEqual(self.page.preset_list.currentItem().text(), "Imported Field")
 
-class PresetStorageMigrationTests(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
+    def test_wrong_type_and_raw_legacy_external_imports_show_errors_without_writes(self):
+        wrong = self.root / "wrong.json"
+        raw = self.root / "raw.json"
+        write_preset(wrong, Preset.create(PresetType.DEBRIS, "Wrong", {}))
+        raw.write_text(json.dumps(self.data()), encoding="utf-8")
 
-    def tearDown(self):
-        self.temp_dir.cleanup()
+        for source in (wrong, raw):
+            with self.subTest(source=source.name), \
+                 patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")), \
+                 patch.object(QMessageBox, "critical") as error:
+                self.page.load_preset_from_file()
+                error.assert_called_once()
+        self.assertEqual(self.page.preset_repository.load_all(), {})
 
-    def test_app_data_path_uses_qt_location_not_bundle_resources(self):
-        app_data = self.root / "application-data"
-        with patch.object(resource_paths.QStandardPaths, "writableLocation", return_value=str(app_data)):
-            resolved = resource_paths.app_data_path("debris-presets")
+    def test_same_name_save_requires_confirmation_and_preserves_uuid(self):
+        existing = self.page.preset_repository.create("Shared", self.data("Original"))
+        self.page.airfield_name_input.setText("Updated")
+        with patch.object(QInputDialog, "getText", return_value=("Shared", True)), \
+             patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            self.page.save_preset()
 
-        self.assertEqual(Path(resolved), app_data / "debris-presets")
-        self.assertNotIn("_MEIPASS", resolved)
-
-    def test_migration_copies_valid_files_and_preserves_existing_destination(self):
-        legacy = self.root / "legacy"
-        destination = self.root / "user-data"
-        legacy.mkdir()
-        destination.mkdir()
-        copied_bytes = b'{\n  "name": "Legacy"\n}\n'
-        existing_bytes = b'{"name": "User version"}'
-        (legacy / "copied.json").write_bytes(copied_bytes)
-        (legacy / "existing.json").write_text('{"name": "Legacy version"}', encoding="utf-8")
-        (legacy / "invalid.json").write_text("not json", encoding="utf-8")
-        (destination / "existing.json").write_bytes(existing_bytes)
-
-        PresetStore(destination, legacy)
-        PresetStore(destination, legacy)
-
-        self.assertEqual((destination / "copied.json").read_bytes(), copied_bytes)
-        self.assertEqual((legacy / "copied.json").read_bytes(), copied_bytes)
-        self.assertEqual((destination / "existing.json").read_bytes(), existing_bytes)
-        self.assertFalse((destination / "invalid.json").exists())
-
-    def test_migration_read_failure_is_silent(self):
-        legacy = self.root / "legacy"
-        destination = self.root / "user-data"
-        legacy.mkdir()
-        source = legacy / "unreadable.json"
-        source.write_text('{"name": "Unreadable"}', encoding="utf-8")
-
-        original_read_bytes = Path.read_bytes
-
-        def fail_for_source(path):
-            if path == source:
-                raise OSError("cannot read")
-            return original_read_bytes(path)
-
-        with patch.object(Path, "read_bytes", fail_for_source):
-            PresetStore(destination, legacy)
-
-        self.assertFalse((destination / source.name).exists())
-
-    def test_user_preset_survives_store_restart(self):
-        destination = self.root / "user-data"
-        data = {"name": "Persistent"}
-        PresetStore(destination).save("persistent", data)
-
-        restarted_store = PresetStore(destination)
-
-        self.assertEqual(restarted_store.load_all()["persistent"]["data"], data)
+        updated = self.page.preset_repository.get(existing.preset.id)
+        self.assertEqual(updated.preset.id, existing.preset.id)
+        self.assertEqual(updated.preset.data["name"], "Updated")
+        self.assertEqual(len(self.page.preset_repository.load_all()), 1)
 
 
 if __name__ == "__main__":
