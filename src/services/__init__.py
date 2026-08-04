@@ -38,7 +38,18 @@ from .preset_store import (
     PresetRepository,
     PresetStore,
 )
-from .transpose_coordinates import run_transposition
+from .transpose_coordinates import (
+    TranspositionBatchResult,
+    TranspositionError,
+    TranspositionErrorCode,
+    TranspositionFileOutcome,
+    TranspositionFileStatus,
+    TranspositionJob,
+    TranspositionOutput,
+    TranspositionPlan,
+    create_transposition_plan,
+    run_transposition,
+)
 
 __all__ = [
     "CURRENT_FORMAT_VERSION",
@@ -67,10 +78,19 @@ __all__ = [
     "PresetType",
     "PresetTypeMismatchError",
     "PresetValidationError",
+    "TranspositionBatchResult",
+    "TranspositionError",
+    "TranspositionErrorCode",
+    "TranspositionFileOutcome",
+    "TranspositionFileStatus",
+    "TranspositionJob",
+    "TranspositionOutput",
+    "TranspositionPlan",
     "UnsupportedPresetVersionError",
     "UnsafePresetPathError",
     "canonical_filename",
     "canonical_stem",
+    "create_transposition_plan",
     "load_last_two_points_from_kml",
     "parse_kml",
     "parse_kml_track",

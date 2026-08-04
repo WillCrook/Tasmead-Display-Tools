@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,7 +25,12 @@ from services import (
     parse_kml,
     parse_kml_track,
 )
-from services.transpose_coordinates import run_transposition
+from services.transpose_coordinates import (
+    TranspositionErrorCode,
+    create_transposition_plan,
+    run_transposition,
+    write_kml,
+)
 
 
 class KmlParserTests(unittest.TestCase):
@@ -143,14 +149,23 @@ class TranspositionKmlTests(unittest.TestCase):
                     ) as rotate,
                     patch("services.transpose_coordinates.write_kml") as write,
                 ):
-                    run_transposition(
-                        [str(self.fixture(filename))],
-                        str(Path(temp_dir) / "output.kml"),
-                        51.0,
-                        -1.0,
-                        90.0,
+                    plan = create_transposition_plan(
+                        [self.fixture(filename)],
+                        temp_dir,
+                        "RAF Fairford",
+                    )
+                    result = run_transposition(
+                        plan,
+                        target_lat=51.0,
+                        target_lon=-1.0,
+                        target_heading=90.0,
                     )
 
+                self.assertTrue(result.succeeded)
+                self.assertEqual(
+                    plan.jobs[0].output_path.name,
+                    f"{Path(filename).stem.replace('_', '-')}-at-raf-fairford.kml",
+                )
                 self.assertEqual(rotate.call_args.args[0], expected)
                 self.assertEqual(write.call_args.args[1], expected)
 
@@ -163,15 +178,20 @@ class TranspositionKmlTests(unittest.TestCase):
                 ) as rotate,
                 patch("services.transpose_coordinates.write_kml") as write,
             ):
-                run_transposition(
-                    [str(self.fixture("line_string_namespace_free_2d.kml"))],
-                    str(Path(temp_dir) / "output.kml"),
-                    51.0,
-                    -1.0,
-                    90.0,
+                plan = create_transposition_plan(
+                    [self.fixture("line_string_namespace_free_2d.kml")],
+                    temp_dir,
+                    "Field",
+                )
+                result = run_transposition(
+                    plan,
+                    target_lat=51.0,
+                    target_lon=-1.0,
+                    target_heading=90.0,
                     ground_reference_elevation=125.0,
                 )
 
+        self.assertTrue(result.succeeded)
         self.assertEqual(
             rotate.call_args.args[0],
             [(51.2, -0.7, 125.0), (51.3, -0.6, 125.0)],
@@ -181,23 +201,272 @@ class TranspositionKmlTests(unittest.TestCase):
             [(51.2, -0.7, 0.0), (51.3, -0.6, 0.0)],
         )
 
-    def test_parse_error_propagates_before_rotation_or_write(self):
+    def test_parse_error_is_a_failed_outcome_without_rotation_or_write(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch("services.transpose_coordinates.rotate_route") as rotate,
                 patch("services.transpose_coordinates.write_kml") as write,
-                self.assertRaises(KmlCoordinateError),
             ):
+                plan = create_transposition_plan(
+                    [self.fixture("wrong_arity.kml")],
+                    temp_dir,
+                    "Field",
+                )
+                result = run_transposition(
+                    plan,
+                    target_lat=51.0,
+                    target_lon=-1.0,
+                    target_heading=90.0,
+                )
+
+        self.assertTrue(result.failed)
+        self.assertEqual(result.failure_count, 1)
+        self.assertEqual(result.failed_outcomes[0].error.code, TranspositionErrorCode.INPUT_KML)
+        self.assertIn("must contain longitude,latitude", result.failed_outcomes[0].error.message)
+        rotate.assert_not_called()
+        write.assert_not_called()
+
+    def test_naming_normalizes_components_fallbacks_extensions_and_length(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [
+                    Path(temp_dir) / "Red Arrows.Display.KML",
+                    Path(temp_dir) / "Café & Jet.kml",
+                    Path(temp_dir) / "東京.kml",
+                    Path(temp_dir) / ("A" * 180 + ".kml"),
+                ],
+                temp_dir,
+                "RAF Fairford!",
+            )
+            blank_target = create_transposition_plan(
+                [Path(temp_dir) / "---.kml"],
+                temp_dir,
+                "東京",
+            )
+
+        names = [job.output_path.name for job in plan.jobs]
+        self.assertEqual(names[0], "red-arrows-display-at-raf-fairford.kml")
+        self.assertEqual(names[1], "cafe-jet-at-raf-fairford.kml")
+        self.assertEqual(names[2], "aircraft-at-raf-fairford.kml")
+        self.assertLessEqual(len(Path(names[3]).stem), 200)
+        self.assertEqual(
+            blank_target.jobs[0].output_path.name,
+            "aircraft-at-airfield.kml",
+        )
+
+    def test_existing_and_within_batch_collisions_are_numbered_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "DISPLAY-AT-FIELD.KML").write_text("existing", encoding="utf-8")
+            plan = create_transposition_plan(
+                [root / "one" / "Display.kml", root / "two" / "Display.kml"],
+                root,
+                "Field",
+            )
+
+        self.assertEqual(
+            [job.output_path.name for job in plan.jobs],
+            ["display-at-field-2.kml", "display-at-field-3.kml"],
+        )
+
+    def test_runtime_collision_is_renumbered_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = create_transposition_plan(
+                [self.fixture("line_string_namespaced.kml")],
+                root,
+                "Field",
+            )
+            plan.jobs[0].output_path.write_text("appeared later", encoding="utf-8")
+
+            with patch(
+                "services.transpose_coordinates.rotate_route",
+                side_effect=lambda waypoints, *_: waypoints,
+            ):
+                result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+            self.assertTrue(result.succeeded)
+            self.assertEqual(
+                result.successful[0].output_path.name,
+                "line-string-namespaced-at-field-2.kml",
+            )
+            self.assertEqual(
+                plan.jobs[0].output_path.read_text(encoding="utf-8"),
+                "appeared later",
+            )
+            self.assertTrue(result.successful[0].output_path.is_file())
+
+    def test_multiple_inputs_write_multiple_distinct_parseable_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [
+                    self.fixture("line_string_namespaced.kml"),
+                    self.fixture("gx_track.kml"),
+                ],
+                temp_dir,
+                "RAF Fairford",
+            )
+            with patch(
+                "services.transpose_coordinates.rotate_route",
+                side_effect=lambda waypoints, *_: waypoints,
+            ):
+                result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+            self.assertTrue(result.succeeded)
+            self.assertEqual(
+                [output.output_path.name for output in result.successful],
+                [
+                    "line-string-namespaced-at-raf-fairford.kml",
+                    "gx-track-at-raf-fairford.kml",
+                ],
+            )
+            for output in result.successful:
+                self.assertTrue(output.output_path.is_file())
+                self.assertEqual(len(parse_kml_track(output.output_path).points), 2)
+
+    def test_failures_do_not_stop_later_jobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [
+                    self.fixture("line_string_namespaced.kml"),
+                    self.fixture("wrong_arity.kml"),
+                    self.fixture("gx_track.kml"),
+                ],
+                temp_dir,
+                "Field",
+            )
+            with patch(
+                "services.transpose_coordinates.rotate_route",
+                side_effect=lambda waypoints, *_: waypoints,
+            ):
+                result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+            self.assertTrue(result.partially_succeeded)
+            self.assertEqual(result.success_count, 2)
+            self.assertEqual(result.failure_count, 1)
+            self.assertTrue(result.successful[0].output_path.is_file())
+            self.assertTrue(result.successful[1].output_path.is_file())
+            self.assertEqual(result.failed_outcomes[0].input_path.name, "wrong_arity.kml")
+            self.assertFalse(result.failed_outcomes[0].planned_output_path.exists())
+            self.assertEqual(
+                [outcome.input_path.name for outcome in result.outcomes],
+                ["line_string_namespaced.kml", "wrong_arity.kml", "gx_track.kml"],
+            )
+            self.assertTrue(plan.jobs[2].output_path.exists())
+
+    def test_all_failed_batch_never_reports_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [self.fixture("wrong_arity.kml"), self.fixture("one_point.kml")],
+                temp_dir,
+                "Field",
+            )
+            result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+        self.assertTrue(result.failed)
+        self.assertFalse(result.succeeded)
+        self.assertFalse(result.partially_succeeded)
+        self.assertEqual(result.success_count, 0)
+        self.assertEqual(result.failure_count, 2)
+
+    def test_write_failure_is_recorded_and_later_jobs_still_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [
+                    self.fixture("line_string_namespaced.kml"),
+                    self.fixture("gx_track.kml"),
+                ],
+                temp_dir,
+                "Field",
+            )
+
+            def fail_first_write(path, *args):
+                if Path(path) == plan.jobs[0].output_path:
+                    raise OSError("disk full")
+                return write_kml(path, *args)
+
+            with (
+                patch(
+                    "services.transpose_coordinates.rotate_route",
+                    side_effect=lambda waypoints, *_: waypoints,
+                ),
+                patch(
+                    "services.transpose_coordinates.write_kml",
+                    side_effect=fail_first_write,
+                ),
+            ):
+                result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+            self.assertTrue(result.partially_succeeded)
+            self.assertEqual(result.failed_outcomes[0].error.code, TranspositionErrorCode.FILESYSTEM_WRITE)
+            self.assertTrue(result.successful[0].output_path.is_file())
+
+    def test_unexpected_error_is_safe_for_ui_and_keeps_diagnostic_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [self.fixture("line_string_namespaced.kml")], temp_dir, "Field"
+            )
+            with patch(
+                "services.transpose_coordinates.parse_kml_track",
+                side_effect=RuntimeError("internal details"),
+            ):
+                result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+        error = result.failed_outcomes[0].error
+        self.assertEqual(error.exception_type, "RuntimeError")
+        self.assertEqual(error.message, "An unexpected error occurred while processing this file.")
+
+    def test_legacy_single_input_returns_result_and_multiple_inputs_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "legacy.kml"
+            with patch(
+                "services.transpose_coordinates.rotate_route",
+                side_effect=lambda waypoints, *_: waypoints,
+            ), self.assertWarns(DeprecationWarning):
+                result = run_transposition(
+                    [self.fixture("line_string_namespaced.kml")],
+                    output,
+                    51.0,
+                    -1.0,
+                    90.0,
+                )
+            self.assertTrue(result.succeeded)
+            self.assertTrue(output.is_file())
+
+            with self.assertRaisesRegex(ValueError, "exactly one"):
                 run_transposition(
-                    [str(self.fixture("wrong_arity.kml"))],
-                    str(Path(temp_dir) / "output.kml"),
+                    [self.fixture("line_string_namespaced.kml"), self.fixture("gx_track.kml")],
+                    output,
                     51.0,
                     -1.0,
                     90.0,
                 )
 
-        rotate.assert_not_called()
-        write.assert_not_called()
+    def test_failed_write_removes_the_incomplete_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.kml"
+            with (
+                patch(
+                    "services.transpose_coordinates._render_kml",
+                    side_effect=OSError("render failed"),
+                ),
+                self.assertRaisesRegex(OSError, "render failed"),
+            ):
+                write_kml(output_path, [(1.0, 2.0, 3.0)], "Aircraft")
+
+            self.assertFalse(output_path.exists())
+
+    def test_kml_document_name_is_xml_escaped_and_utf8_parseable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.kml"
+            write_kml(output_path, [(1.0, 2.0, 3.0)], "A&B <Display>")
+
+            root = ET.parse(output_path).getroot()
+            namespace = {"kml": "http://www.opengis.net/kml/2.2"}
+            self.assertEqual(
+                root.find("kml:Document/kml:name", namespace).text,
+                "A&B <Display> Adjusted Coordinates",
+            )
 
 
 class DebrisKmlTests(unittest.TestCase):

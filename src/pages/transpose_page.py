@@ -1,18 +1,20 @@
 import os
 from uuid import UUID
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSettings, QStandardPaths, Qt
 from PyQt6.QtWidgets import (
     QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from resource_paths import app_data_path, resource_path
-from services import PresetType, run_transposition
+from services import PresetType, create_transposition_plan, run_transposition
 from pages.preset_ui import PresetUiMixin
 
 
 class TransposePage(PresetUiMixin, QWidget):
+    LAST_OUTPUT_DIRECTORY_KEY = "transpose/last-output-directory"
+
     def __init__(self):
         super().__init__()
         layout = QHBoxLayout(self)
@@ -200,7 +202,11 @@ class TransposePage(PresetUiMixin, QWidget):
     def drop_event(self, event):
         urls = event.mimeData().urls()
         if urls:
-            new_files = [u.toLocalFile() for u in urls if u.toLocalFile().endswith('.kml')]
+            new_files = [
+                url.toLocalFile()
+                for url in urls
+                if url.toLocalFile().lower().endswith(".kml")
+            ]
             self.add_files_to_list(new_files)
 
     def browse_files(self, event=None):
@@ -297,44 +303,109 @@ class TransposePage(PresetUiMixin, QWidget):
             QMessageBox.warning(self, "Invalid Input", "Please enter a valid numeric value for Original Height.")
             return
 
-        output_path, _ = QFileDialog.getSaveFileName(
+        output_dir = QFileDialog.getExistingDirectory(
             self,
-            "Save Output",
-            "transposed_output.kml",
-            "KML Files (*.kml)"
+            "Select Output Folder",
+            self._initial_output_directory(),
         )
-        if not output_path:
+        if not output_dir:
             return
 
-        # If user selected a directory instead of a filename, append default filename
-        if os.path.isdir(output_path):
-            output_path = os.path.join(output_path, "transposed_output.kml")
+        try:
+            plan = create_transposition_plan(
+                input_files=self.input_files,
+                output_directory=output_dir,
+                target_airfield=self.airfield_name_input.text(),
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"Could not plan outputs: {error}")
+            return
 
-        # Ensure directory exists
-        output_dir = os.path.dirname(output_path)
-        os.makedirs(output_dir, exist_ok=True)
+        if not self._confirm_output_plan(plan):
+            return
 
-        # Use the entered airfield name, or fallback to preset name, or "Airfield"
-        airfield_name_hook = self.airfield_name_input.text()
-        if not airfield_name_hook:
-            item = self.preset_list.currentItem()
-            if item:
-                airfield_name_hook = item.text()
-            else:
-                airfield_name_hook = "Airfield"
+        settings = QSettings()
+        settings.setValue(self.LAST_OUTPUT_DIRECTORY_KEY, output_dir)
+        settings.sync()
 
         try:
-            run_transposition(
-                input_files=self.input_files,
-                output_file=output_path,
+            result = run_transposition(
+                plan=plan,
                 target_lat=lat,
                 target_lon=lon,
                 target_heading=heading,
-                ground_reference_elevation=orig_height
+                ground_reference_elevation=orig_height,
             )
-            QMessageBox.information(self, "Success", f"Transposition complete!\nSaved to {output_dir}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Transposition failed: {e}")
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"Transposition failed: {error}")
+            return
+
+        if result.succeeded:
+            successful_paths = "\n".join(
+                str(output.output_path) for output in result.successful
+            )
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Transposition complete!\n"
+                f"Saved {len(result.successful)} KML file(s) to:\n{output_dir}\n\n"
+                f"Outputs:\n{successful_paths}",
+            )
+            return
+
+        failed_paths = "\n".join(
+            f"{outcome.input_path}: {outcome.error.message}"
+            for outcome in result.failed_outcomes
+        )
+        successful_paths = "\n".join(
+            str(output.output_path) for output in result.successful
+        ) or "None"
+        if result.failed:
+            QMessageBox.critical(
+                self,
+                "Transposition failed",
+                f"No KML files were produced.\n\n"
+                f"Failed inputs:\n{failed_paths}",
+            )
+            return
+        QMessageBox.warning(
+            self,
+            "Transposition partially complete",
+            f"Saved {result.success_count} of {result.total_count} KML file(s).\n\n"
+            f"Successful outputs:\n{successful_paths}\n\n"
+            f"Failed inputs:\n{failed_paths}",
+        )
+
+    def _initial_output_directory(self):
+        saved_directory = QSettings().value(
+            self.LAST_OUTPUT_DIRECTORY_KEY,
+            "",
+            type=str,
+        )
+        if saved_directory and os.path.isdir(saved_directory):
+            return saved_directory
+
+        documents_directory = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        )
+        if documents_directory and os.path.isdir(documents_directory):
+            return documents_directory
+        return os.getcwd()
+
+    def _confirm_output_plan(self, plan):
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Confirm Transposition Outputs")
+        dialog.setText(f"Save {len(plan.jobs)} KML file(s) to this folder?")
+        dialog.setInformativeText(str(plan.output_directory))
+        dialog.setDetailedText(
+            "\n".join(job.output_path.name for job in plan.jobs)
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.Save)
+        return dialog.exec() == QMessageBox.StandardButton.Save
 
     def orig_height_m_changed(self, text):
         if self._orig_height_updating:

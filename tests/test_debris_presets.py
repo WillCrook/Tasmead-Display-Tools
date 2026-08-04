@@ -33,9 +33,15 @@ from services import (
     PresetType,
     PresetTypeMismatchError,
     PresetValidationError,
+    TranspositionBatchResult,
+    TranspositionError,
+    TranspositionErrorCode,
+    TranspositionFileOutcome,
+    TranspositionFileStatus,
     UnsupportedPresetVersionError,
     canonical_filename,
     canonical_stem,
+    create_transposition_plan,
     readable_export_filename,
 )
 
@@ -605,6 +611,218 @@ class TransposePagePresetTests(PresetPageTestCase):
         self.assertEqual(updated.preset.id, existing.preset.id)
         self.assertEqual(updated.preset.data["name"], "Updated")
         self.assertEqual(len(self.page.preset_repository.load_all()), 1)
+
+    def configure_transposition(self, *input_paths, airfield_name="RAF Fairford"):
+        self.page.input_files = [str(path) for path in input_paths]
+        self.page.airfield_name_input.setText(airfield_name)
+        self.page.lat_input.setText("51.0")
+        self.page.lon_input.setText("-1.0")
+        self.page.heading_input.setText("90")
+        self.page.orig_height_input.setText("38")
+
+    def test_transposition_uses_folder_preview_persists_location_and_runs_plan(self):
+        source = KML_FIXTURES / "line_string_namespaced.kml"
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        self.configure_transposition(source, airfield_name="")
+        successful_output = TranspositionFileOutcome(
+            input_path=source,
+            planned_output_path=output_dir / "line-string-namespaced-at-airfield.kml",
+            final_output_path=output_dir / "line-string-namespaced-at-airfield.kml",
+            status=TranspositionFileStatus.SUCCEEDED,
+        )
+        result = TranspositionBatchResult(
+            outcomes=(successful_output,),
+        )
+
+        with (
+            patch.object(
+                QFileDialog,
+                "getExistingDirectory",
+                return_value=str(output_dir),
+            ) as folder_dialog,
+            patch.object(self.page, "_initial_output_directory", return_value=str(self.root)),
+            patch.object(self.page, "_confirm_output_plan", return_value=True) as confirm,
+            patch("pages.transpose_page.run_transposition", return_value=result) as run,
+            patch("pages.transpose_page.QSettings") as settings_class,
+            patch.object(QMessageBox, "information") as information,
+        ):
+            self.page.run_transposition_ui()
+
+        folder_dialog.assert_called_once_with(
+            self.page,
+            "Select Output Folder",
+            str(self.root),
+        )
+        plan = confirm.call_args.args[0]
+        self.assertEqual(
+            plan.jobs[0].output_path.name,
+            "line-string-namespaced-at-airfield.kml",
+        )
+        self.assertIs(run.call_args.kwargs["plan"], plan)
+        settings_class.return_value.setValue.assert_called_once_with(
+            self.page.LAST_OUTPUT_DIRECTORY_KEY,
+            str(output_dir),
+        )
+        settings_class.return_value.sync.assert_called_once_with()
+        information.assert_called_once()
+        self.assertIn(
+            str(successful_output.output_path),
+            information.call_args.args[2],
+        )
+
+    def test_cancelled_preview_writes_nothing_and_does_not_persist_folder(self):
+        source = KML_FIXTURES / "line_string_namespaced.kml"
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        self.configure_transposition(source)
+
+        with (
+            patch.object(
+                QFileDialog,
+                "getExistingDirectory",
+                return_value=str(output_dir),
+            ),
+            patch.object(self.page, "_confirm_output_plan", return_value=False),
+            patch("pages.transpose_page.run_transposition") as run,
+            patch("pages.transpose_page.QSettings") as settings_class,
+        ):
+            self.page.run_transposition_ui()
+
+        run.assert_not_called()
+        settings_class.return_value.setValue.assert_not_called()
+        self.assertEqual(list(output_dir.iterdir()), [])
+
+    def test_partial_failure_dialog_reports_every_success_and_failure(self):
+        first = KML_FIXTURES / "line_string_namespaced.kml"
+        failed = KML_FIXTURES / "wrong_arity.kml"
+        last = KML_FIXTURES / "gx_track.kml"
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        self.configure_transposition(first, failed, last)
+        successful_output = TranspositionFileOutcome(
+            input_path=first,
+            planned_output_path=output_dir / "line-string-namespaced-at-raf-fairford.kml",
+            final_output_path=output_dir / "line-string-namespaced-at-raf-fairford.kml",
+            status=TranspositionFileStatus.SUCCEEDED,
+        )
+        last_output = TranspositionFileOutcome(
+            input_path=last,
+            planned_output_path=output_dir / "gx-track-at-raf-fairford.kml",
+            final_output_path=output_dir / "gx-track-at-raf-fairford.kml",
+            status=TranspositionFileStatus.SUCCEEDED,
+        )
+        failed_outcome = TranspositionFileOutcome(
+            input_path=failed,
+            planned_output_path=output_dir / "wrong-arity-at-raf-fairford.kml",
+            final_output_path=None,
+            status=TranspositionFileStatus.FAILED,
+            error=TranspositionError(
+                code=TranspositionErrorCode.INPUT_KML,
+                message="invalid coordinate",
+                input_path=failed,
+                intended_output_path=output_dir / "wrong-arity-at-raf-fairford.kml",
+                exception_type="KmlCoordinateError",
+            ),
+        )
+        result = TranspositionBatchResult(
+            outcomes=(successful_output, failed_outcome, last_output),
+        )
+
+        with (
+            patch.object(
+                QFileDialog,
+                "getExistingDirectory",
+                return_value=str(output_dir),
+            ),
+            patch.object(self.page, "_confirm_output_plan", return_value=True),
+            patch("pages.transpose_page.run_transposition", return_value=result),
+            patch("pages.transpose_page.QSettings"),
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.run_transposition_ui()
+
+        message = warning.call_args.args[2]
+        self.assertIn("Saved 2 of 3", message)
+        self.assertIn(str(successful_output.output_path), message)
+        self.assertIn(str(failed), message)
+        self.assertIn("invalid coordinate", message)
+
+    def test_all_failed_result_uses_critical_dialog_not_success(self):
+        source = KML_FIXTURES / "wrong_arity.kml"
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        self.configure_transposition(source)
+        failure = TranspositionFileOutcome(
+            input_path=source,
+            planned_output_path=output_dir / "wrong-arity-at-raf-fairford.kml",
+            final_output_path=None,
+            status=TranspositionFileStatus.FAILED,
+            error=TranspositionError(
+                code=TranspositionErrorCode.INPUT_KML,
+                message="invalid coordinate",
+                input_path=source,
+                intended_output_path=output_dir / "wrong-arity-at-raf-fairford.kml",
+                exception_type="KmlCoordinateError",
+            ),
+        )
+        result = TranspositionBatchResult(outcomes=(failure,))
+
+        with (
+            patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
+            patch.object(self.page, "_confirm_output_plan", return_value=True),
+            patch("pages.transpose_page.run_transposition", return_value=result),
+            patch("pages.transpose_page.QSettings"),
+            patch.object(QMessageBox, "critical") as critical,
+            patch.object(QMessageBox, "information") as information,
+        ):
+            self.page.run_transposition_ui()
+
+        critical.assert_called_once()
+        self.assertIn("No KML files were produced", critical.call_args.args[2])
+        information.assert_not_called()
+
+    def test_initial_output_directory_uses_existing_saved_location(self):
+        output_dir = self.root / "remembered"
+        output_dir.mkdir()
+
+        with patch("pages.transpose_page.QSettings") as settings_class:
+            settings_class.return_value.value.return_value = str(output_dir)
+            initial = self.page._initial_output_directory()
+
+        self.assertEqual(initial, str(output_dir))
+        settings_class.return_value.value.assert_called_once_with(
+            self.page.LAST_OUTPUT_DIRECTORY_KEY,
+            "",
+            type=str,
+        )
+
+    def test_confirmation_preview_lists_every_planned_filename(self):
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        plan = create_transposition_plan(
+            [
+                KML_FIXTURES / "line_string_namespaced.kml",
+                KML_FIXTURES / "gx_track.kml",
+            ],
+            output_dir,
+            "RAF Fairford",
+        )
+
+        with (
+            patch.object(
+                QMessageBox,
+                "exec",
+                return_value=QMessageBox.StandardButton.Save,
+            ),
+            patch.object(QMessageBox, "setDetailedText") as detailed_text,
+        ):
+            accepted = self.page._confirm_output_plan(plan)
+
+        self.assertTrue(accepted)
+        preview = detailed_text.call_args.args[0]
+        self.assertIn("line-string-namespaced-at-raf-fairford.kml", preview)
+        self.assertIn("gx-track-at-raf-fairford.kml", preview)
 
 
 if __name__ == "__main__":
