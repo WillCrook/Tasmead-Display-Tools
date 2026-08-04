@@ -20,6 +20,17 @@ from .kml_file_handling import (
     parse_kml,
     parse_kml_track,
 )
+from .kml_export import (
+    ATR_MAGENTA_TRACK_STYLE,
+    KmlCoordinate,
+    KmlDocument,
+    KmlLineString,
+    KmlPlacemark,
+    KmlPolygon,
+    KmlStyle,
+    export_kml,
+    render_kml,
+)
 from .preset_filenames import canonical_filename, canonical_stem, readable_export_filename
 from .preset_model import (
     CURRENT_FORMAT_VERSION,
@@ -61,13 +72,20 @@ from .transpose_coordinates import (
 
 __all__ = [
     "CURRENT_FORMAT_VERSION",
+    "ATR_MAGENTA_TRACK_STYLE",
     "DebrisSimulationRequest",
     "DebrisSimulationResult",
     "DebrisTrajectoryCalculator",
     "ImportInspection",
     "KmlCoordinateError",
+    "KmlCoordinate",
+    "KmlDocument",
+    "KmlLineString",
     "KmlParseError",
+    "KmlPlacemark",
     "KmlPoint",
+    "KmlPolygon",
+    "KmlStyle",
     "KmlStructureError",
     "KmlTrack",
     "KmlXmlError",
@@ -104,10 +122,12 @@ __all__ = [
     "canonical_filename",
     "canonical_stem",
     "create_transposition_plan",
+    "export_kml",
     "load_last_two_points_from_kml",
     "parse_kml",
     "parse_kml_track",
     "readable_export_filename",
+    "render_kml",
     "run_debris_simulation_request",
     "run_transposition",
 ]

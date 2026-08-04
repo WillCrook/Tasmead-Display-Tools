@@ -1,13 +1,21 @@
 import math
 import os
-import tempfile
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Callable
 
 import pandas as pd
+
+from .kml_export import (
+    ATR_MAGENTA_TRACK_STYLE,
+    KmlCoordinate,
+    KmlDocument,
+    KmlLineString,
+    KmlPlacemark,
+    KmlPolygon,
+    KmlStyle,
+    export_kml,
+)
 
 
 CANCELLATION_CHECK_INTERVAL = 256
@@ -99,28 +107,6 @@ class _ProgressReporter:
 def _raise_if_cancelled(cancellation_check):
     if cancellation_check is not None and cancellation_check():
         raise SimulationCancelled("Simulation cancelled.")
-
-
-@contextmanager
-def _atomic_text_output(destination, cancellation_check):
-    destination = Path(destination)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=destination.parent,
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            yield output
-        _raise_if_cancelled(cancellation_check)
-        os.replace(temporary_path, destination)
-    except BaseException:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
 
 
 class DebrisTrajectoryCalculator:
@@ -464,8 +450,121 @@ class DebrisTrajectoryCalculator:
             force=True,
         )
 
+        teardrop_points = []
+        if coords_ground:
+            n_points = 120  # increase resolution for smoother curve
+            teardrop_outer = []
+            teardrop_inner = []
+
+            d_imp = summary['air_dist_xy_m']
+            L = summary['total_dist_xy_m']
+            if L <= 0: L = 1.0
+
+            half_width_max = 0.06 * L  # Max width is 0.12 * L, so half-width is 0.06 * L
+
+            for i in range(n_points + 1):
+                frac = i / n_points
+                current_dist = frac * L
+                    
+                # Width calculation
+                if current_dist < d_imp:
+                        # Elliptical nose from start to impact
+                    if d_imp > 1e-6:
+                        ratio = (current_dist - d_imp) / d_imp
+                            # ratio goes from -1 (at start) to 0 (at impact)
+                            # 1 - ratio^2 goes from 0 to 1
+                        width = half_width_max * math.sqrt(max(0.0, 1.0 - ratio*ratio))
+                    else:
+                        width = 0.0
+                else:
+                        # Elliptical tail from impact to end (rounded tip)
+                    tail_len = L - d_imp
+                    if tail_len > 1e-6:
+                        ratio = (current_dist - d_imp) / tail_len
+                            # ratio goes from 0 (at impact) to 1 (at end)
+                        width = half_width_max * math.sqrt(max(0.0, 1.0 - ratio*ratio))
+                    else:
+                            # If no ground slide, width remains max at the very end
+                        width = half_width_max
+
+                # Coordinate transformation
+                # x_local is along track (current_dist)
+                # y_local is cross track (width)
+                    
+                # Transform for +width (Outer/Right)
+                x_local = current_dist
+                y_local = width
+                    
+                east_outer = x_local * math.sin(self.az_rad) + y_local * math.cos(self.az_rad)
+                north_outer = x_local * math.cos(self.az_rad) - y_local * math.sin(self.az_rad)
+                    
+                # Transform for -width (Inner/Left)
+                y_local_inner = -width
+                east_inner = x_local * math.sin(self.az_rad) + y_local_inner * math.cos(self.az_rad)
+                north_inner = x_local * math.cos(self.az_rad) - y_local_inner * math.sin(self.az_rad)
+
+                # Convert to Lat/Lon
+                dlat_outer = (north_outer / R) * 180.0 / math.pi
+                dlon_outer = (east_outer / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
+                    
+                dlat_inner = (north_inner / R) * 180.0 / math.pi
+                dlon_inner = (east_inner / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
+
+                teardrop_outer.append((self.final_lon + dlon_outer, self.final_lat + dlat_outer, self.terrain_m))
+                teardrop_inner.insert(0, (self.final_lon + dlon_inner, self.final_lat + dlat_inner, self.terrain_m))
+
+            teardrop_points = teardrop_outer + teardrop_inner
+
+        styles = [
+            ATR_MAGENTA_TRACK_STYLE,
+            KmlStyle(
+                style_id="debrisZone",
+                line_colour="aaff00ff",
+                line_width=6,
+                poly_colour="7f0000ff",
+            ),
+        ]
+        placemarks = []
+        if len(coords_air) >= 2:
+            placemarks.append(
+                KmlPlacemark(
+                    name="Airborne",
+                    style_url="#magentaTrackLine",
+                    geometry=KmlLineString(
+                        coordinates=tuple(KmlCoordinate(lon, lat, alt) for lon, lat, alt in coords_air),
+                        altitude_mode="absolute",
+                        extrude_to_ground=True,
+                        tessellate=False,
+                    ),
+                )
+            )
+        if len(coords_ground) >= 2:
+            placemarks.append(
+                KmlPlacemark(
+                    name="Ground run",
+                    style_url="#magentaTrackLine",
+                    geometry=KmlLineString(
+                        coordinates=tuple(KmlCoordinate(lon, lat, alt) for lon, lat, alt in coords_ground),
+                        altitude_mode="clampToGround",
+                        tessellate=True,
+                    ),
+                )
+            )
+            placemarks.append(
+                KmlPlacemark(
+                    name="Debris zone",
+                    style_url="#debrisZone",
+                    geometry=KmlPolygon(
+                        outer_ring=tuple(KmlCoordinate(lon, lat, alt) for lon, lat, alt in teardrop_points),
+                        altitude_mode="clampToGround",
+                    ),
+                )
+            )
+        document = KmlDocument(name=None, styles=tuple(styles), placemarks=tuple(placemarks))
+        written_air_points = len(coords_air) if len(coords_air) >= 2 else 0
+        written_ground_points = len(coords_ground) if len(coords_ground) >= 2 else 0
         write_total = max(
-            len(coords_air) + len(coords_ground) + (242 if coords_ground else 0),
+            written_air_points + written_ground_points + (len(teardrop_points) if written_ground_points else 0),
             1,
         )
         write_completed = 0
@@ -476,127 +575,29 @@ class DebrisTrajectoryCalculator:
             "Writing output KML…",
             force=True,
         )
-        _raise_if_cancelled(cancellation_check)
-        with _atomic_text_output(self.output_file, cancellation_check) as f:
-            f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-            f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n')
-            f.write('<Document>\n')
-            f.write('<Style id="air_blue"><LineStyle><color>ffff0000</color><width>4</width></LineStyle></Style>\n')
-            f.write('<Style id="ground_red"><LineStyle><color>ff0000ff</color><width>4</width></LineStyle></Style>\n')
 
-            f.write('<Placemark><name>Airborne</name><styleUrl>#air_blue</styleUrl>\n')
-            f.write('<LineString><altitudeMode>absolute</altitudeMode><coordinates>\n')
-            for lon, lat, alt in coords_air:
-                f.write(f"{lon:.7f},{lat:.7f},{alt:.3f}\n")
-                write_completed += 1
-                if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
-                    _raise_if_cancelled(cancellation_check)
-                    reporter.report(
-                        SimulationPhase.WRITING,
-                        write_completed,
-                        write_total,
-                        "Writing output KML…",
-                    )
-            f.write('</coordinates></LineString></Placemark>\n')
+        def coordinate_written():
+            nonlocal write_completed
+            write_completed += 1
+            if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
+                reporter.report(
+                    SimulationPhase.WRITING,
+                    write_completed,
+                    write_total,
+                    "Writing output KML…",
+                )
 
-            if coords_ground:
-                f.write('<Placemark><name>Ground run</name><styleUrl>#ground_red</styleUrl>\n')
-                f.write('<LineString><altitudeMode>clampToGround</altitudeMode><coordinates>\n')
-                for lon, lat, alt in coords_ground:
-                    f.write(f"{lon:.7f},{lat:.7f},{alt:.3f}\n")
-                    write_completed += 1
-                    if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
-                        _raise_if_cancelled(cancellation_check)
-                        reporter.report(
-                            SimulationPhase.WRITING,
-                            write_completed,
-                            write_total,
-                            "Writing output KML…",
-                        )
-                f.write('</coordinates></LineString></Placemark>\n')
+        def export_cancellation_check():
+            _raise_if_cancelled(cancellation_check)
+            return False
 
-            # Teardrop debris zone
-            if coords_ground:
-                n_points = 120  # increase resolution for smoother curve
-                teardrop_outer = []
-                teardrop_inner = []
-
-                d_imp = summary['air_dist_xy_m']
-                L = summary['total_dist_xy_m']
-                if L <= 0: L = 1.0
-
-                half_width_max = 0.06 * L  # Max width is 0.12 * L, so half-width is 0.06 * L
-
-                for i in range(n_points + 1):
-                    frac = i / n_points
-                    current_dist = frac * L
-                    
-                    # Width calculation
-                    if current_dist < d_imp:
-                        # Elliptical nose from start to impact
-                        if d_imp > 1e-6:
-                            ratio = (current_dist - d_imp) / d_imp
-                            # ratio goes from -1 (at start) to 0 (at impact)
-                            # 1 - ratio^2 goes from 0 to 1
-                            width = half_width_max * math.sqrt(max(0.0, 1.0 - ratio*ratio))
-                        else:
-                            width = 0.0
-                    else:
-                        # Elliptical tail from impact to end (rounded tip)
-                        tail_len = L - d_imp
-                        if tail_len > 1e-6:
-                            ratio = (current_dist - d_imp) / tail_len
-                            # ratio goes from 0 (at impact) to 1 (at end)
-                            width = half_width_max * math.sqrt(max(0.0, 1.0 - ratio*ratio))
-                        else:
-                            # If no ground slide, width remains max at the very end
-                            width = half_width_max
-
-                    # Coordinate transformation
-                    # x_local is along track (current_dist)
-                    # y_local is cross track (width)
-                    
-                    # Transform for +width (Outer/Right)
-                    x_local = current_dist
-                    y_local = width
-                    
-                    east_outer = x_local * math.sin(self.az_rad) + y_local * math.cos(self.az_rad)
-                    north_outer = x_local * math.cos(self.az_rad) - y_local * math.sin(self.az_rad)
-                    
-                    # Transform for -width (Inner/Left)
-                    y_local_inner = -width
-                    east_inner = x_local * math.sin(self.az_rad) + y_local_inner * math.cos(self.az_rad)
-                    north_inner = x_local * math.cos(self.az_rad) - y_local_inner * math.sin(self.az_rad)
-
-                    # Convert to Lat/Lon
-                    dlat_outer = (north_outer / R) * 180.0 / math.pi
-                    dlon_outer = (east_outer / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
-                    
-                    dlat_inner = (north_inner / R) * 180.0 / math.pi
-                    dlon_inner = (east_inner / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
-
-                    teardrop_outer.append((self.final_lon + dlon_outer, self.final_lat + dlat_outer, self.terrain_m))
-                    teardrop_inner.insert(0, (self.final_lon + dlon_inner, self.final_lat + dlat_inner, self.terrain_m))
-
-                teardrop_points = teardrop_outer + teardrop_inner
-
-                f.write('<Placemark><name>Debris zone</name><styleUrl>#red_zone</styleUrl>\n')
-                f.write('<Style id="red_zone"><LineStyle><color>ff0000ff</color><width>2</width></LineStyle><PolyStyle><color>7f0000ff</color></PolyStyle></Style>\n')
-                f.write('<Polygon><altitudeMode>clampToGround</altitudeMode><outerBoundaryIs><LinearRing><coordinates>\n')
-                for lon, lat, alt in teardrop_points:
-                    f.write(f"{lon:.7f},{lat:.7f},{alt:.3f}\n")
-                    write_completed += 1
-                    if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
-                        _raise_if_cancelled(cancellation_check)
-                        reporter.report(
-                            SimulationPhase.WRITING,
-                            write_completed,
-                            write_total,
-                            "Writing output KML…",
-                        )
-                f.write('</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>\n')
-
-            f.write('</Document>\n</kml>\n')
+        export_kml(
+            self.output_file,
+            document,
+            overwrite=True,
+            cancellation_check=export_cancellation_check,
+            coordinate_callback=coordinate_written,
+        )
 
         reporter.report(
             SimulationPhase.WRITING,

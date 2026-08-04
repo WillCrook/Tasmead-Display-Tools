@@ -3,6 +3,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
@@ -124,6 +125,48 @@ class DebrisSimulationServiceTests(unittest.TestCase):
 
             self.assertEqual(output.read_text(encoding="utf-8"), "existing")
             self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp")), [])
+
+    def test_debris_output_uses_atr_magenta_style_and_google_earth_geometry_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "trajectory.kml"
+            run_debris_simulation_request(make_request(output))
+
+            namespace = {"kml": "http://www.opengis.net/kml/2.2"}
+            root = ET.parse(output).getroot()
+            styles = {
+                style.get("id"): style
+                for style in root.findall("kml:Document/kml:Style", namespace)
+            }
+            track_style = styles["magentaTrackLine"]
+            self.assertEqual(
+                track_style.find("kml:LineStyle/kml:color", namespace).text,
+                "aaff00ff",
+            )
+            self.assertEqual(
+                track_style.find("kml:LineStyle/kml:width", namespace).text,
+                "6",
+            )
+            self.assertEqual(
+                track_style.find("kml:PolyStyle/kml:color", namespace).text,
+                "33ff00ff",
+            )
+            self.assertEqual(
+                styles["debrisZone"].find("kml:PolyStyle/kml:color", namespace).text,
+                "7f0000ff",
+            )
+
+            paths = {
+                placemark.find("kml:name", namespace).text: placemark
+                for placemark in root.findall("kml:Document/kml:Placemark", namespace)
+            }
+            airborne = paths["Airborne"].find("kml:LineString", namespace)
+            ground_run = paths["Ground run"].find("kml:LineString", namespace)
+            self.assertEqual(airborne.find("kml:extrude", namespace).text, "1")
+            self.assertEqual(airborne.find("kml:tessellate", namespace).text, "0")
+            self.assertEqual(airborne.find("kml:altitudeMode", namespace).text, "absolute")
+            self.assertIsNone(ground_run.find("kml:extrude", namespace))
+            self.assertEqual(ground_run.find("kml:tessellate", namespace).text, "1")
+            self.assertEqual(ground_run.find("kml:altitudeMode", namespace).text, "clampToGround")
 
 
 class DebrisSimulationWorkerTests(unittest.TestCase):

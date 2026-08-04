@@ -447,7 +447,7 @@ class TranspositionKmlTests(unittest.TestCase):
             output_path = Path(temp_dir) / "output.kml"
             with (
                 patch(
-                    "services.transpose_coordinates._render_kml",
+                    "services.kml_export.render_kml",
                     side_effect=OSError("render failed"),
                 ),
                 self.assertRaisesRegex(OSError, "render failed"),
@@ -459,7 +459,11 @@ class TranspositionKmlTests(unittest.TestCase):
     def test_kml_document_name_is_xml_escaped_and_utf8_parseable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "output.kml"
-            write_kml(output_path, [(1.0, 2.0, 3.0)], "A&B <Display>")
+            write_kml(
+                output_path,
+                [(1.0, 2.0, 3.0), (1.1, 2.1, 3.1)],
+                "A&B <Display>",
+            )
 
             root = ET.parse(output_path).getroot()
             namespace = {"kml": "http://www.opengis.net/kml/2.2"}
@@ -467,6 +471,18 @@ class TranspositionKmlTests(unittest.TestCase):
                 root.find("kml:Document/kml:name", namespace).text,
                 "A&B <Display> Adjusted Coordinates",
             )
+            line = root.find("kml:Document/kml:Placemark/kml:LineString", namespace)
+            self.assertEqual(
+                root.find("kml:Document/kml:Style/kml:LineStyle/kml:color", namespace).text,
+                "aaff00ff",
+            )
+            self.assertEqual(
+                root.find("kml:Document/kml:Style/kml:LineStyle/kml:width", namespace).text,
+                "6",
+            )
+            self.assertEqual(line.find("kml:extrude", namespace).text, "1")
+            self.assertEqual(line.find("kml:tessellate", namespace).text, "0")
+            self.assertEqual(line.find("kml:altitudeMode", namespace).text, "relativeToGround")
 
 
 class DebrisKmlTests(unittest.TestCase):

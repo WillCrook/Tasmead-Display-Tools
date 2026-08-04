@@ -11,8 +11,15 @@ import logging
 from pathlib import Path
 from typing import Sequence
 import warnings
-from xml.sax.saxutils import escape
 
+from .kml_export import (
+    ATR_MAGENTA_TRACK_STYLE,
+    KmlCoordinate,
+    KmlDocument,
+    KmlLineString,
+    KmlPlacemark,
+    export_kml,
+)
 from .kml_file_handling import KmlTrack, parse_kml_track
 
 
@@ -291,49 +298,28 @@ def rotate_route(waypoints, target_lat, target_lon, target_heading):
     return rotated_waypoints
 
 
-def _render_kml(coordinates, name_of_aircraft):
-    safe_aircraft_name = escape(name_of_aircraft)
-    coordinate_lines = "".join(
-        f"                {lon},{lat},{ele}\n" for lat, lon, ele in coordinates
-    )
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>
-    <name>{safe_aircraft_name} Adjusted Coordinates</name>
-    <Style id="cyanLine">
-        <LineStyle>
-            <color>ff00ffff</color>
-            <width>2</width>
-        </LineStyle>
-    </Style>
-    <Placemark>
-        <name>Path</name>
-        <styleUrl>#cyanLine</styleUrl>
-        <LineString>
-            <altitudeMode>relativeToGround</altitudeMode>
-            <coordinates>
-{coordinate_lines}            </coordinates>
-        </LineString>
-    </Placemark>
-</Document>
-</kml>"""
-
-
 def write_kml(file_path, coordinates, name_of_aircraft):
-    """Create a KML output exclusively and remove it if its write fails."""
-    path = Path(file_path)
-    created = False
-    try:
-        with path.open("x", encoding="utf-8", newline="\n") as output:
-            created = True
-            output.write(_render_kml(coordinates, name_of_aircraft))
-    except Exception:
-        if created:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise
+    """Create a collision-safe, Google Earth-ready transposed KML output."""
+    document = KmlDocument(
+        name=f"{name_of_aircraft} Adjusted Coordinates",
+        styles=(ATR_MAGENTA_TRACK_STYLE,),
+        placemarks=(
+            KmlPlacemark(
+                name="Path",
+                style_url="#magentaTrackLine",
+                geometry=KmlLineString(
+                    coordinates=tuple(
+                        KmlCoordinate(longitude=lon, latitude=lat, altitude_m=alt)
+                        for lat, lon, alt in coordinates
+                    ),
+                    altitude_mode="relativeToGround",
+                    extrude_to_ground=True,
+                    tessellate=False,
+                ),
+            ),
+        ),
+    )
+    export_kml(file_path, document, overwrite=False)
 
 
 def read_config(config_file):
