@@ -1,12 +1,24 @@
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QButtonGroup, QFrame, QHBoxLayout, QMainWindow, QMessageBox, QPushButton,
-    QRadioButton, QVBoxLayout, QWidget,
+    QRadioButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from pages import DebrisPage, TransposePage
 from resource_paths import find_icon_path
+
+
+class PageScrollArea(QScrollArea):
+    """Keep keyboard-focused page controls visible in a scrollable mode page."""
+
+    def focusNextPrevChild(self, next):
+        moved = super().focusNextPrevChild(next)
+        focused = self.focusWidget()
+        page = self.widget()
+        if moved and focused is not None and page is not None and page.isAncestorOf(focused):
+            self.ensureWidgetVisible(focused, 8, 8)
+        return moved
 
 
 class App(QMainWindow):
@@ -26,6 +38,7 @@ class App(QMainWindow):
 
         self.setWindowTitle("Tasmead Display Tools")
         self.resize(900, 500)
+        self.setMinimumSize(900, 500)
         central = QWidget()
         self.setCentralWidget(central)
 
@@ -35,6 +48,8 @@ class App(QMainWindow):
 
         self.container = QFrame()
         self.container_layout = QVBoxLayout(self.container)
+        self.page_stack = QStackedWidget()
+        self.container_layout.addWidget(self.page_stack)
         self.root_layout.addWidget(self.container)
 
         self.transpose_page = TransposePage()
@@ -43,7 +58,22 @@ class App(QMainWindow):
             self._on_debris_simulation_busy_changed
         )
 
+        self.page_scrolls = {
+            self.transpose_page: self._create_page_scroll(self.transpose_page),
+            self.debris_page: self._create_page_scroll(self.debris_page),
+        }
+
         self.set_page(self.transpose_page)
+
+    def _create_page_scroll(self, page):
+        scroll = PageScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        self.page_stack.addWidget(scroll)
+        return scroll
 
     # ---------- MODE SELECTOR ----------
     def build_mode_selector(self):
@@ -91,12 +121,7 @@ class App(QMainWindow):
         )
 
     def set_page(self, widget):
-        while self.container_layout.count():
-            item = self.container_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.setParent(None)
-        self.container_layout.addWidget(widget)
+        self.page_stack.setCurrentWidget(self.page_scrolls[widget])
 
     def switch_mode(self):
         if self.rb_transpose.isChecked():

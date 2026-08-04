@@ -13,9 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from PyQt6.QtCore import QThread, QTimer
+from PyQt6.QtCore import QPoint, QRect, QThread, QTimer, Qt
 from PyQt6.QtGui import QCloseEvent
-from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app_window import App
@@ -449,6 +449,89 @@ class AppCloseLifecycleTests(unittest.TestCase):
         with patch("app_window.QTimer.singleShot") as single_shot:
             self.window._on_debris_simulation_busy_changed(False)
         single_shot.assert_called_once_with(0, self.window.close)
+
+
+class ResponsivePageLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        fixture_root = str(PROJECT_ROOT / "tests" / "fixtures")
+        self.app_data_patches = [
+            patch("pages.debris_page.app_data_path", return_value=fixture_root),
+            patch("pages.transpose_page.app_data_path", return_value=fixture_root),
+            patch("pages.debris_page.resource_path", return_value=fixture_root),
+            patch("pages.transpose_page.resource_path", return_value=fixture_root),
+        ]
+        for path_patch in self.app_data_patches:
+            path_patch.start()
+        self.window = App()
+        self.window.show()
+        self.app.processEvents()
+
+    def tearDown(self):
+        self.window.close()
+        for path_patch in reversed(self.app_data_patches):
+            path_patch.stop()
+
+    def _switch_to_debris(self):
+        self.window.rb_debris.click()
+        self.app.processEvents()
+
+    def _assert_visible_in_scroll(self, scroll, widget):
+        widget_rect = QRect(widget.mapTo(scroll.viewport(), QPoint()), widget.size())
+        self.assertTrue(scroll.viewport().rect().contains(widget_rect))
+
+    def test_default_minimum_size_and_scrollable_debris_page(self):
+        self.assertEqual(self.window.minimumSize().width(), 900)
+        self.assertEqual(self.window.minimumSize().height(), 500)
+        self.assertEqual(self.window.size().width(), 900)
+        self.assertEqual(self.window.size().height(), 500)
+
+        self._switch_to_debris()
+        scroll = self.window.page_scrolls[self.window.debris_page]
+        self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+        self.assertLessEqual(self.window.debris_page.width(), scroll.viewport().width())
+
+    def test_keyboard_navigation_reveals_offscreen_debris_control(self):
+        self._switch_to_debris()
+        scroll = self.window.page_scrolls[self.window.debris_page]
+        scroll.setFocus()
+        self.app.processEvents()
+
+        for _ in range(40):
+            QTest.keyClick(scroll, Qt.Key.Key_Tab)
+            self.app.processEvents()
+            if self.window.debris_page.run_btn.hasFocus():
+                break
+
+        self.assertTrue(self.window.debris_page.run_btn.hasFocus())
+        self.assertGreater(scroll.verticalScrollBar().value(), 0)
+        self._assert_visible_in_scroll(scroll, self.window.debris_page.run_btn)
+
+        QTest.keyClick(scroll, Qt.Key.Key_Backtab)
+        self.app.processEvents()
+        self.assertFalse(self.window.debris_page.run_btn.hasFocus())
+        self._assert_visible_in_scroll(scroll, self.app.focusWidget())
+
+    def test_both_pages_survive_mode_switching_and_desktop_resizes(self):
+        transpose_scroll = self.window.page_scrolls[self.window.transpose_page]
+        debris_scroll = self.window.page_scrolls[self.window.debris_page]
+
+        for width, height in ((900, 500), (1024, 768), (1440, 900)):
+            self.window.resize(width, height)
+            self.app.processEvents()
+            self.assertLessEqual(self.window.transpose_page.width(), transpose_scroll.viewport().width())
+
+            self._switch_to_debris()
+            self.assertIs(self.window.page_stack.currentWidget(), debris_scroll)
+            self.assertLessEqual(self.window.debris_page.width(), debris_scroll.viewport().width())
+            self.window.rb_transpose.click()
+            self.app.processEvents()
+            self.assertIs(self.window.page_stack.currentWidget(), transpose_scroll)
+            self.assertIs(transpose_scroll.widget(), self.window.transpose_page)
+            self.assertIs(debris_scroll.widget(), self.window.debris_page)
 
 
 if __name__ == "__main__":
