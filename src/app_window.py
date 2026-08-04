@@ -1,3 +1,4 @@
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QButtonGroup, QFrame, QHBoxLayout, QMainWindow, QMessageBox, QPushButton,
@@ -7,9 +8,11 @@ from PyQt6.QtWidgets import (
 from pages import DebrisPage, TransposePage
 from resource_paths import find_icon_path
 
+
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._close_pending = False
         # Choose an OS-appropriate icon (app.icns on macOS, app.ico on
         # Windows, app.png as a fallback). The helper resolves the path
         # from the bundle or source directory.
@@ -36,6 +39,9 @@ class App(QMainWindow):
 
         self.transpose_page = TransposePage()
         self.debris_page = DebrisPage()
+        self.debris_page.simulation_busy_changed.connect(
+            self._on_debris_simulation_busy_changed
+        )
 
         self.set_page(self.transpose_page)
 
@@ -97,3 +103,33 @@ class App(QMainWindow):
             self.set_page(self.transpose_page)
         else:
             self.set_page(self.debris_page)
+
+    def _on_debris_simulation_busy_changed(self, busy):
+        for button in self.mode_group.buttons():
+            button.setEnabled(not busy)
+        if not busy and self._close_pending:
+            QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event):
+        if not self.debris_page.has_active_simulation():
+            event.accept()
+            return
+
+        if self._close_pending:
+            event.ignore()
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "Simulation in progress",
+            "Cancel the running debris simulation and close the application?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
+        self._close_pending = True
+        self.debris_page.cancel_simulation(silent=True)
+        event.ignore()

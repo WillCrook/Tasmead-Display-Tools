@@ -1,6 +1,14 @@
 """Reusable application services."""
 
-from .debris_trajectory_calculator import DebrisTrajectoryCalculator
+from .debris_trajectory_calculator import (
+    DebrisSimulationRequest,
+    DebrisSimulationResult,
+    DebrisTrajectoryCalculator,
+    SimulationCancelled,
+    SimulationPhase,
+    SimulationProgress,
+    run_debris_simulation_request,
+)
 from .kml_file_handling import (
     KmlCoordinateError,
     KmlParseError,
@@ -53,6 +61,8 @@ from .transpose_coordinates import (
 
 __all__ = [
     "CURRENT_FORMAT_VERSION",
+    "DebrisSimulationRequest",
+    "DebrisSimulationResult",
     "DebrisTrajectoryCalculator",
     "ImportInspection",
     "KmlCoordinateError",
@@ -78,6 +88,9 @@ __all__ = [
     "PresetType",
     "PresetTypeMismatchError",
     "PresetValidationError",
+    "SimulationCancelled",
+    "SimulationPhase",
+    "SimulationProgress",
     "TranspositionBatchResult",
     "TranspositionError",
     "TranspositionErrorCode",
@@ -95,5 +108,6 @@ __all__ = [
     "parse_kml",
     "parse_kml_track",
     "readable_export_filename",
+    "run_debris_simulation_request",
     "run_transposition",
 ]

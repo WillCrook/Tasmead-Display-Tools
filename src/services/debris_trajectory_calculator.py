@@ -1,5 +1,127 @@
 import math
+import os
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Callable
+
 import pandas as pd
+
+
+CANCELLATION_CHECK_INTERVAL = 256
+
+
+class SimulationPhase(str, Enum):
+    SIMULATING = "simulating"
+    PROJECTING = "projecting"
+    WRITING = "writing"
+
+
+@dataclass(frozen=True, slots=True)
+class DebrisSimulationRequest:
+    mass_kg: float
+    area_m2: float
+    Cd: float
+    rho: float
+    g: float
+    dt: float
+    ktas: float
+    surface: str
+    slide_physics: float
+    include_ground_drag: bool
+    terrain_m: float
+    altitude_m: float
+    input_coords: tuple[float, float, float, float] | None
+    input_bearing: tuple[float, float, float] | None
+    output_file: str
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationProgress:
+    phase: SimulationPhase
+    completed: int
+    total: int
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class DebrisSimulationResult:
+    heading: float
+    air_distance_m: float
+    ground_distance_m: float
+    total_distance_m: float
+    impacts: int
+    output_file: str
+
+    @classmethod
+    def from_summary(cls, summary, output_file):
+        return cls(
+            heading=float(summary["heading"]),
+            air_distance_m=float(summary["air_dist_xy_m"]),
+            ground_distance_m=float(summary["ground_dist_xy_m"]),
+            total_distance_m=float(summary["total_dist_xy_m"]),
+            impacts=int(summary["impacts"]),
+            output_file=os.fspath(output_file),
+        )
+
+
+class SimulationCancelled(Exception):
+    """Raised cooperatively before a simulation commits its output."""
+
+
+class _ProgressReporter:
+    def __init__(self, callback):
+        self._callback = callback
+        self._phase = None
+        self._percentage = None
+
+    def report(self, phase, completed, total, message, *, force=False):
+        if self._callback is None:
+            return
+        safe_total = max(int(total), 1)
+        safe_completed = max(0, min(int(completed), safe_total))
+        percentage = (safe_completed * 100) // safe_total
+        if force or phase != self._phase or percentage != self._percentage:
+            self._phase = phase
+            self._percentage = percentage
+            self._callback(
+                SimulationProgress(
+                    phase=phase,
+                    completed=safe_completed,
+                    total=safe_total,
+                    message=message,
+                )
+            )
+
+
+def _raise_if_cancelled(cancellation_check):
+    if cancellation_check is not None and cancellation_check():
+        raise SimulationCancelled("Simulation cancelled.")
+
+
+@contextmanager
+def _atomic_text_output(destination, cancellation_check):
+    destination = Path(destination)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            yield output
+        _raise_if_cancelled(cancellation_check)
+        os.replace(temporary_path, destination)
+    except BaseException:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
 
 class DebrisTrajectoryCalculator:
     def __init__(self,
@@ -93,7 +215,8 @@ class DebrisTrajectoryCalculator:
     m, A, Cd, rho, g, dt,
     alt_m, ktas, angle_deg, surface="grass",
     vz0=0.0, include_ground_drag=True,
-    vz_bounce_min=0.5, max_steps=300000
+    vz_bounce_min=0.5, max_steps=300000,
+    *, progress_callback=None, cancellation_check=None
     ):
         """
         3D point-mass with quadratic drag, wind = 0.
@@ -126,8 +249,24 @@ class DebrisTrajectoryCalculator:
         impact_recorded = False
         x_imp = y_imp = None
         impacts = 0
+        reporter = _ProgressReporter(progress_callback)
+        reporter.report(
+            SimulationPhase.SIMULATING,
+            0,
+            max_steps,
+            "Simulating trajectory…",
+            force=True,
+        )
 
-        for _ in range(max_steps):
+        for step in range(max_steps):
+            if step % CANCELLATION_CHECK_INTERVAL == 0:
+                _raise_if_cancelled(cancellation_check)
+                reporter.report(
+                    SimulationPhase.SIMULATING,
+                    step,
+                    max_steps,
+                    "Simulating trajectory…",
+                )
             if airborne:
                 # Relative velocity (wind = 0)
                 vrelx, vrely, vrelz = vx, vy, vz
@@ -227,6 +366,15 @@ class DebrisTrajectoryCalculator:
             if t > 3600.0:  # hard stop (1 hour)
                 break
 
+        _raise_if_cancelled(cancellation_check)
+        reporter.report(
+            SimulationPhase.SIMULATING,
+            max_steps,
+            max_steps,
+            "Trajectory simulation complete.",
+            force=True,
+        )
+
         df = pd.DataFrame(rows)
 
         # Distances in ground plane
@@ -253,27 +401,43 @@ class DebrisTrajectoryCalculator:
         )
         return summary, df
 
-    def run_debris_trajectory_simulation(self):
+    def run_debris_trajectory_simulation(
+        self, *, progress_callback=None, cancellation_check=None
+    ):
+        reporter = _ProgressReporter(progress_callback)
         
         summary, df = self.simulate_3d(
             m=self.mass_kg, A=self.area_m2, Cd=self.Cd, rho=self.rho, g=self.g, dt=self.dt,
             alt_m=self.alt_m_relative, ktas=self.ktas, angle_deg=0.0, surface=self.surface,
-            vz0=0.0, include_ground_drag=self.include_ground_drag, vz_bounce_min=self.vz_bounce_min
+            vz0=0.0, include_ground_drag=self.include_ground_drag, vz_bounce_min=self.vz_bounce_min,
+            progress_callback=progress_callback, cancellation_check=cancellation_check,
         )
 
         R = 6371000.0
         coords_air = [(self.final_lon, self.final_lat, self.altitude_m)]
         coords_ground = []
 
-        first = True
-        for _, row in df.iterrows():
-            if first:
-                first = False
-                continue
+        projection_total = max(len(df) - 1, 1)
+        reporter.report(
+            SimulationPhase.PROJECTING,
+            0,
+            projection_total,
+            "Projecting trajectory into KML coordinates…",
+            force=True,
+        )
+        for index, row in enumerate(df.iloc[1:].itertuples(index=False), start=1):
+            if index % CANCELLATION_CHECK_INTERVAL == 0:
+                _raise_if_cancelled(cancellation_check)
+                reporter.report(
+                    SimulationPhase.PROJECTING,
+                    index,
+                    projection_total,
+                    "Projecting trajectory into KML coordinates…",
+                )
 
-            x = float(row["x"])
-            y = float(row["y"])
-            z = float(row["z"])
+            x = float(row.x)
+            y = float(row.y)
+            z = float(row.z)
             east = x * math.sin(self.az_rad) + y * math.sin(self.az_rad + math.pi/2.0)
             north = x * math.cos(self.az_rad) + y * math.cos(self.az_rad + math.pi/2.0)
 
@@ -286,12 +450,34 @@ class DebrisTrajectoryCalculator:
             #add terrain elevation back in for google earth
             alt_real = z + self.terrain_m
 
-            if row["phase"] == "air":
+            if row.phase == "air":
                 coords_air.append((lon, lat, alt_real))
             else:
                 coords_ground.append((lon, lat, alt_real))
 
-        with open(self.output_file, "w", encoding="utf-8") as f:
+        _raise_if_cancelled(cancellation_check)
+        reporter.report(
+            SimulationPhase.PROJECTING,
+            projection_total,
+            projection_total,
+            "KML coordinate projection complete.",
+            force=True,
+        )
+
+        write_total = max(
+            len(coords_air) + len(coords_ground) + (242 if coords_ground else 0),
+            1,
+        )
+        write_completed = 0
+        reporter.report(
+            SimulationPhase.WRITING,
+            0,
+            write_total,
+            "Writing output KML…",
+            force=True,
+        )
+        _raise_if_cancelled(cancellation_check)
+        with _atomic_text_output(self.output_file, cancellation_check) as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
             f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n')
             f.write('<Document>\n')
@@ -302,6 +488,15 @@ class DebrisTrajectoryCalculator:
             f.write('<LineString><altitudeMode>absolute</altitudeMode><coordinates>\n')
             for lon, lat, alt in coords_air:
                 f.write(f"{lon:.7f},{lat:.7f},{alt:.3f}\n")
+                write_completed += 1
+                if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
+                    _raise_if_cancelled(cancellation_check)
+                    reporter.report(
+                        SimulationPhase.WRITING,
+                        write_completed,
+                        write_total,
+                        "Writing output KML…",
+                    )
             f.write('</coordinates></LineString></Placemark>\n')
 
             if coords_ground:
@@ -309,6 +504,15 @@ class DebrisTrajectoryCalculator:
                 f.write('<LineString><altitudeMode>clampToGround</altitudeMode><coordinates>\n')
                 for lon, lat, alt in coords_ground:
                     f.write(f"{lon:.7f},{lat:.7f},{alt:.3f}\n")
+                    write_completed += 1
+                    if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
+                        _raise_if_cancelled(cancellation_check)
+                        reporter.report(
+                            SimulationPhase.WRITING,
+                            write_completed,
+                            write_total,
+                            "Writing output KML…",
+                        )
                 f.write('</coordinates></LineString></Placemark>\n')
 
             # Teardrop debris zone
@@ -381,12 +585,61 @@ class DebrisTrajectoryCalculator:
                 f.write('<Polygon><altitudeMode>clampToGround</altitudeMode><outerBoundaryIs><LinearRing><coordinates>\n')
                 for lon, lat, alt in teardrop_points:
                     f.write(f"{lon:.7f},{lat:.7f},{alt:.3f}\n")
+                    write_completed += 1
+                    if write_completed % CANCELLATION_CHECK_INTERVAL == 0:
+                        _raise_if_cancelled(cancellation_check)
+                        reporter.report(
+                            SimulationPhase.WRITING,
+                            write_completed,
+                            write_total,
+                            "Writing output KML…",
+                        )
                 f.write('</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>\n')
 
             f.write('</Document>\n</kml>\n')
+
+        reporter.report(
+            SimulationPhase.WRITING,
+            write_total,
+            write_total,
+            "Output KML committed.",
+            force=True,
+        )
         
         return summary
-    
+
+
+def run_debris_simulation_request(
+    request: DebrisSimulationRequest,
+    *,
+    progress_callback: Callable[[SimulationProgress], None] | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> DebrisSimulationResult:
+    """Run one immutable request through the compatibility calculator."""
+    simulation = DebrisTrajectoryCalculator(
+        mass_kg=request.mass_kg,
+        area_m2=request.area_m2,
+        Cd=request.Cd,
+        rho=request.rho,
+        g=request.g,
+        dt=request.dt,
+        ktas=request.ktas,
+        surface=request.surface,
+        slide_physics=request.slide_physics,
+        include_ground_drag=request.include_ground_drag,
+        terrain_m=request.terrain_m,
+        altitude_m=request.altitude_m,
+        input_coords=request.input_coords,
+        input_bearing=request.input_bearing,
+        output_file=request.output_file,
+    )
+    summary = simulation.run_debris_trajectory_simulation(
+        progress_callback=progress_callback,
+        cancellation_check=cancellation_check,
+    )
+    return DebrisSimulationResult.from_summary(summary, request.output_file)
+
+
 if __name__ == "__main__":
         # Example usage
         f16 = DebrisTrajectoryCalculator(

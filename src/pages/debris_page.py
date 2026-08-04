@@ -1,18 +1,21 @@
 import os
 from dataclasses import dataclass
+from enum import Enum
 from uuid import UUID
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton,
-    QRadioButton, QSplitter, QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QProgressBar,
+    QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from resource_paths import app_data_path, resource_path
 from services import (
-    DebrisTrajectoryCalculator, PresetType, parse_kml_track,
+    DebrisSimulationRequest, DebrisSimulationResult, PresetType,
+    SimulationProgress, parse_kml_track,
 )
+from workers import CancellationToken, DebrisSimulationWorker, SimulationFailure
 from pages.preset_ui import PresetUiMixin
 
 
@@ -30,7 +33,16 @@ class DebrisKmlState:
         return self.coordinates is not None and self.error is None
 
 
+class SimulationUiState(str, Enum):
+    IDLE = "idle"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+
+
 class DebrisPage(PresetUiMixin, QWidget):
+    simulation_busy_changed = pyqtSignal(bool)
+    worker_class = DebrisSimulationWorker
+
     @property
     def kml_input_path(self):
         """Compatibility view of the path stored in the authoritative KML state."""
@@ -40,6 +52,13 @@ class DebrisPage(PresetUiMixin, QWidget):
     def kml_input_path(self, path):
         """Legacy path assignment invalidates any parse result until Run reparses it."""
         self._kml_state = DebrisKmlState(path=os.fspath(path) if path else "")
+
+    def update_preset_actions(self, *args):
+        super().update_preset_actions(*args)
+        if self.has_active_simulation():
+            self.rename_preset_btn.setEnabled(False)
+            self.delete_preset_btn.setEnabled(False)
+            self.export_preset_btn.setEnabled(False)
 
     def render_kml_state(self):
         """Render the complete KML state without retaining metadata from another path."""
@@ -51,7 +70,9 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.kml_meta_pen_lon.setText("Penultimate longitude: —")
         self.kml_meta_fin_lat.setText("Final latitude: —")
         self.kml_meta_fin_lon.setText("Final longitude: —")
-        self.load_kml_btn.setEnabled(bool(state.path))
+        self.load_kml_btn.setEnabled(
+            bool(state.path) and not self.has_active_simulation()
+        )
         self.file_label.setText(state.path or "Drop KML file here")
 
         if not state.path:
@@ -144,6 +165,13 @@ class DebrisPage(PresetUiMixin, QWidget):
     def __init__(self):
         super().__init__()
 
+        self._simulation_state = SimulationUiState.IDLE
+        self._simulation_thread = None
+        self._simulation_worker = None
+        self._cancellation_token = None
+        self._terminal_outcome = None
+        self._suppress_terminal_dialogs = False
+
         layout = QHBoxLayout(self)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -155,17 +183,17 @@ class DebrisPage(PresetUiMixin, QWidget):
         """)
         layout.addWidget(splitter)
 
-        presets_widget = QWidget()
-        config_widget = QWidget()
-        file_widget = QWidget()
+        self.presets_widget = QWidget()
+        self.config_widget = QWidget()
+        self.file_widget = QWidget()
 
-        presets = QVBoxLayout(presets_widget)
-        config = QVBoxLayout(config_widget)
-        file_panel = QVBoxLayout(file_widget)
+        presets = QVBoxLayout(self.presets_widget)
+        config = QVBoxLayout(self.config_widget)
+        file_panel = QVBoxLayout(self.file_widget)
 
-        splitter.addWidget(presets_widget)
-        splitter.addWidget(config_widget)
-        splitter.addWidget(file_widget)
+        splitter.addWidget(self.presets_widget)
+        splitter.addWidget(self.config_widget)
+        splitter.addWidget(self.file_widget)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
@@ -545,6 +573,23 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.run_btn.clicked.connect(self.run_simulation)
         layout.addWidget(self.run_btn)
 
+        self.cancel_simulation_btn = QPushButton("Cancel Simulation")
+        self.cancel_simulation_btn.clicked.connect(
+            lambda: self.cancel_simulation()
+        )
+        self.cancel_simulation_btn.hide()
+        layout.addWidget(self.cancel_simulation_btn)
+
+        self.simulation_progress_bar = QProgressBar()
+        self.simulation_progress_bar.setRange(0, 100)
+        self.simulation_progress_bar.setValue(0)
+        self.simulation_progress_bar.hide()
+        layout.addWidget(self.simulation_progress_bar)
+
+        self.simulation_status_label = QLabel("Ready.")
+        self.simulation_status_label.setWordWrap(True)
+        layout.addWidget(self.simulation_status_label)
+
         # --- Simulation summary UI elements ---
         summary_title = QLabel("Simulation Summary")
         summary_title.setStyleSheet("font-weight: bold;")
@@ -711,6 +756,9 @@ class DebrisPage(PresetUiMixin, QWidget):
             self.select_and_parse_kml(urls[0].toLocalFile())
 
     def run_simulation(self):
+        if self.has_active_simulation():
+            return
+
         if self.flight_mode == "kml":
             if not self.kml_input_path:
                 QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
@@ -806,11 +854,9 @@ class DebrisPage(PresetUiMixin, QWidget):
         )
 
     def run_debris_calculator(self, input_coords_hook, input_bearing_hook, output_kml, config, altitude_m_hook, terrain_m_hook):
-        """
-        Hook point for debris_trajectory_calculator.py.
-        """
+        """Capture an immutable request and start its one-shot worker."""
         try:
-            simulation = DebrisTrajectoryCalculator(
+            request = DebrisSimulationRequest(
                 mass_kg=config["Mass (kg)"],
                 area_m2=config["Frontal area A (m²)"],
                 Cd=config["Drag Coefficient Cd"],
@@ -827,16 +873,199 @@ class DebrisPage(PresetUiMixin, QWidget):
                 input_bearing=input_bearing_hook,
                 output_file=output_kml
             )
+        except (KeyError, TypeError, ValueError) as error:
+            QMessageBox.warning(
+                self,
+                "Invalid input",
+                f"The simulation request is incomplete: {error}",
+            )
+            return
 
-            summary = simulation.run_debris_trajectory_simulation()
+        self._start_simulation(request)
 
-            if summary:
-                self.summary_heading.setText(f"Track used (deg): {summary['heading']:.1f}")
-                self.summary_air.setText(f"Air distance to first impact (m): {summary['air_dist_xy_m']:.1f}")
-                self.summary_ground.setText(f"Ground distance to rest (m): {summary['ground_dist_xy_m']:.1f}")
-                self.summary_total.setText(f"Total ground‑planar distance (m): {summary['total_dist_xy_m']:.1f}")
-                self.summary_impacts.setText(f"Impacts (incl. first): {summary['impacts']}")
-        except Exception as e:
-            QMessageBox.critical(self, "Simulation Error", str(e))
+    def has_active_simulation(self):
+        return self._simulation_state is not SimulationUiState.IDLE
+
+    def _start_simulation(self, request):
+        if self.has_active_simulation():
+            return False
+
+        token = CancellationToken()
+        thread = QThread(self)
+        worker = self.worker_class(request, token)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(
+            self._on_simulation_progress,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.succeeded.connect(
+            self._on_simulation_succeeded,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.cancelled.connect(
+            self._on_simulation_cancelled,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.failed.connect(
+            self._on_simulation_failed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_simulation_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+
+        self._simulation_thread = thread
+        self._simulation_worker = worker
+        self._cancellation_token = token
+        self._terminal_outcome = None
+        self._suppress_terminal_dialogs = False
+        self._set_simulation_state(SimulationUiState.RUNNING)
+        thread.start()
+        return True
+
+    def cancel_simulation(self, *, silent=False):
+        if not self.has_active_simulation():
+            return False
+        if silent:
+            self._suppress_terminal_dialogs = True
+        if self._simulation_state is SimulationUiState.RUNNING:
+            self._set_simulation_state(SimulationUiState.CANCELLING)
+            self._cancellation_token.cancel()
+        return True
+
+    def _set_simulation_state(self, state):
+        previous_busy = self.has_active_simulation()
+        self._simulation_state = state
+        busy = self.has_active_simulation()
+
+        inputs_enabled = not busy
+        self.presets_widget.setEnabled(inputs_enabled)
+        self.config_widget.setEnabled(inputs_enabled)
+        for button in self.mode_group.buttons():
+            button.setEnabled(inputs_enabled)
+        for widget in (
+            self.kml_container,
+            self.coords_container,
+            self.bearing_container,
+            self.alt_m,
+            self.alt_ft,
+            self.terrain_m,
+            self.terrain_ft,
+            self.height_m,
+            self.height_ft,
+        ):
+            widget.setEnabled(inputs_enabled)
+        self.file_label.setAcceptDrops(inputs_enabled)
+        self.run_btn.setEnabled(inputs_enabled)
+
+        self.cancel_simulation_btn.setVisible(busy)
+        self.cancel_simulation_btn.setEnabled(
+            state is SimulationUiState.RUNNING
+        )
+        self.simulation_progress_bar.setVisible(busy)
+        if state is SimulationUiState.RUNNING:
+            self.simulation_progress_bar.setValue(0)
+            self.simulation_status_label.setText("Starting simulation…")
+        elif state is SimulationUiState.CANCELLING:
+            self.simulation_status_label.setText("Cancelling simulation…")
+
+        if not busy:
+            self.render_kml_state()
+            self.update_preset_actions()
+        if previous_busy != busy:
+            self.simulation_busy_changed.emit(busy)
+
+    def _on_simulation_progress(self, progress):
+        if not isinstance(progress, SimulationProgress):
+            return
+        percentage = int(progress.completed * 100 / max(progress.total, 1))
+        self.simulation_progress_bar.setValue(percentage)
+        if self._simulation_state is SimulationUiState.RUNNING:
+            self.simulation_status_label.setText(progress.message)
+
+    def _record_terminal_outcome(self, kind, payload=None):
+        if self._terminal_outcome is None:
+            self._terminal_outcome = (kind, payload)
+
+    def _on_simulation_succeeded(self, result):
+        self._record_terminal_outcome("success", result)
+
+    def _on_simulation_cancelled(self):
+        self._record_terminal_outcome("cancelled")
+
+    def _on_simulation_failed(self, failure):
+        self._record_terminal_outcome("failure", failure)
+
+    def _on_simulation_thread_finished(self):
+        outcome = self._terminal_outcome
+        if outcome is None:
+            outcome = (
+                "failure",
+                SimulationFailure(
+                    exception_type="WorkerTerminalError",
+                    message="The simulation thread ended without a terminal result.",
+                    traceback="",
+                ),
+            )
+
+        self._simulation_thread = None
+        self._simulation_worker = None
+        self._cancellation_token = None
+        self._terminal_outcome = None
+        self._set_simulation_state(SimulationUiState.IDLE)
+
+        kind, payload = outcome
+        if kind == "success" and isinstance(payload, DebrisSimulationResult):
+            self.summary_heading.setText(f"Track used (deg): {payload.heading:.1f}")
+            self.summary_air.setText(
+                f"Air distance to first impact (m): {payload.air_distance_m:.1f}"
+            )
+            self.summary_ground.setText(
+                f"Ground distance to rest (m): {payload.ground_distance_m:.1f}"
+            )
+            self.summary_total.setText(
+                f"Total ground‑planar distance (m): {payload.total_distance_m:.1f}"
+            )
+            self.summary_impacts.setText(
+                f"Impacts (incl. first): {payload.impacts}"
+            )
+            self.simulation_progress_bar.setValue(100)
+            self.simulation_status_label.setText("Simulation complete.")
+            if not self._suppress_terminal_dialogs:
+                QMessageBox.information(
+                    self,
+                    "Simulation Complete",
+                    "Debris trajectory simulation completed successfully.",
+                )
+        elif kind == "cancelled":
+            self.simulation_status_label.setText(
+                "Simulation cancelled; the output file was not changed."
+            )
+            if not self._suppress_terminal_dialogs:
+                QMessageBox.information(
+                    self,
+                    "Simulation Cancelled",
+                    "The simulation was cancelled and the output file was not changed.",
+                )
         else:
-            QMessageBox.information(self, "Simulation Complete", "Debris trajectory simulation completed successfully.")
+            failure = payload
+            if not isinstance(failure, SimulationFailure):
+                failure = SimulationFailure(
+                    exception_type="WorkerTerminalError",
+                    message="The simulation returned an invalid failure result.",
+                    traceback="",
+                )
+            self.simulation_status_label.setText("Simulation failed.")
+            if not self._suppress_terminal_dialogs:
+                dialog = QMessageBox(self)
+                dialog.setIcon(QMessageBox.Icon.Critical)
+                dialog.setWindowTitle("Simulation Error")
+                dialog.setText(failure.message)
+                if failure.traceback:
+                    dialog.setDetailedText(failure.traceback)
+                dialog.exec()
+
+        self._suppress_terminal_dialogs = False
