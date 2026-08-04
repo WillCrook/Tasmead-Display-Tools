@@ -1,5 +1,12 @@
 """Reusable application services."""
 
+from .coordinate_input import (
+    CoordinateInputError,
+    CoordinatePair,
+    format_coordinate_pair,
+    format_coordinate_value,
+    parse_coordinate_pair,
+)
 from .debris_trajectory_calculator import (
     DebrisSimulationRequest,
     DebrisSimulationResult,
@@ -74,6 +81,8 @@ from .transpose_coordinates import (
 __all__ = [
     "CURRENT_FORMAT_VERSION",
     "ATR_MAGENTA_TRACK_STYLE",
+    "CoordinateInputError",
+    "CoordinatePair",
     "DebrisSimulationRequest",
     "DebrisSimulationResult",
     "DebrisTrajectoryCalculator",
@@ -125,9 +134,12 @@ __all__ = [
     "create_transposition_plan",
     "customize_transposition_plan",
     "export_kml",
+    "format_coordinate_pair",
+    "format_coordinate_value",
     "load_last_two_points_from_kml",
     "parse_kml",
     "parse_kml_track",
+    "parse_coordinate_pair",
     "readable_export_filename",
     "render_kml",
     "run_debris_simulation_request",

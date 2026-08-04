@@ -13,9 +13,10 @@ from file_dialog_state import (
 )
 from resource_paths import app_data_path, resource_path
 from services import (
-    PresetType, create_transposition_plan, customize_transposition_plan,
-    run_transposition,
+    CoordinateInputError, PresetType, create_transposition_plan,
+    customize_transposition_plan, run_transposition,
 )
+from pages.coordinate_input import CoordinatePairInput
 from pages.preset_ui import PresetPanelLabels, PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
 
@@ -198,15 +199,9 @@ class TransposePage(PresetUiMixin, QWidget):
         layout.addWidget(QLabel("Airfield Name"))
         layout.addWidget(self.airfield_name_input)
 
-        self.lat_input = QLineEdit()
-        self.lat_input.setPlaceholderText("Latitude")
-        layout.addWidget(QLabel("Latitude"))
-        layout.addWidget(self.lat_input)
-
-        self.lon_input = QLineEdit()
-        self.lon_input.setPlaceholderText("Longitude")
-        layout.addWidget(QLabel("Longitude"))
-        layout.addWidget(self.lon_input)
+        self.coordinate_input = CoordinatePairInput("Target airfield coordinates")
+        layout.addWidget(QLabel("Coordinates (Latitude, Longitude)"))
+        layout.addWidget(self.coordinate_input)
 
         self.heading_input = QLineEdit()
         self.heading_input.setPlaceholderText("Rotation (degrees)")
@@ -307,6 +302,11 @@ class TransposePage(PresetUiMixin, QWidget):
         pass
 
     def save_preset(self):
+        try:
+            preset = self.capture_preset_data()
+        except CoordinateInputError as error:
+            QMessageBox.warning(self, "Invalid coordinate", str(error))
+            return
         default_name = self.airfield_name_input.text()
         name, ok = QInputDialog.getText(self, "Save Preset", "Enter preset name:", text=default_name)
         if not ok or not name:
@@ -314,15 +314,16 @@ class TransposePage(PresetUiMixin, QWidget):
 
         self.save_preset_data(
             name,
-            self.capture_preset_data(),
+            preset,
             error_title="Error",
         )
 
     def capture_preset_data(self) -> dict[str, object]:
+        latitude, longitude = self.coordinate_input.preset_components()
         return {
             "name": self.airfield_name_input.text(),
-            "latitude": self.lat_input.text(),
-            "longitude": self.lon_input.text(),
+            "latitude": latitude,
+            "longitude": longitude,
             "heading": self.heading_input.text(),
             "original_elevation_m": self.orig_height_input.text(),
         }
@@ -353,8 +354,10 @@ class TransposePage(PresetUiMixin, QWidget):
     def apply_preset_data(self, data: Mapping[str, object]) -> None:
         """Apply tolerant airfield settings from a validated preset envelope."""
         self.airfield_name_input.setText(data.get("name", ""))
-        self.lat_input.setText(data.get("latitude", ""))
-        self.lon_input.setText(data.get("longitude", ""))
+        self.coordinate_input.set_components(
+            data.get("latitude", ""),
+            data.get("longitude", ""),
+        )
         self.heading_input.setText(data.get("heading", ""))
         self.orig_height_input.setText(data.get("original_elevation_m", ""))
 
@@ -364,11 +367,14 @@ class TransposePage(PresetUiMixin, QWidget):
             return
 
         try:
-            lat = float(self.lat_input.text())
-            lon = float(self.lon_input.text())
+            coordinate = self.coordinate_input.coordinates()
+        except CoordinateInputError as error:
+            QMessageBox.warning(self, "Invalid coordinate", str(error))
+            return
+        try:
             heading = float(self.heading_input.text())
         except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please enter valid numeric values for Latitude, Longitude, and Heading.")
+            QMessageBox.warning(self, "Invalid Input", "Please enter a valid numeric Heading.")
             return
 
         # Get Original Height
@@ -412,8 +418,8 @@ class TransposePage(PresetUiMixin, QWidget):
         try:
             result = run_transposition(
                 plan=plan,
-                target_lat=lat,
-                target_lon=lon,
+                target_lat=coordinate.latitude,
+                target_lon=coordinate.longitude,
                 target_heading=heading,
                 ground_reference_elevation=orig_height,
             )

@@ -522,8 +522,7 @@ class DebrisPagePresetTests(PresetPageTestCase):
         self.page.terrain_m.setText("20")
         self.page.alt_m.setText("100")
         self.page.rb_bearing.setChecked(True)
-        self.page.bearing_lat_input.setText("51")
-        self.page.bearing_lon_input.setText("-1")
+        self.page.bearing_coordinate_input.setText("51, -1")
         self.page.azimuth_input.setText("90")
 
         data = self.page.capture_preset_data()
@@ -553,6 +552,40 @@ class DebrisPagePresetTests(PresetPageTestCase):
             {"lat": "51", "lon": "-1", "azimuth": "90"},
         )
 
+    def test_dms_capture_keeps_legacy_coordinate_keys_as_decimals(self):
+        self.page.coordinate1_input.setText('51°16\'22.2"N, 0°47\'31.4"W')
+        self.page.coordinate2_input.setText("51 16 30 N / 0 47 0 W")
+        self.page.bearing_coordinate_input.setText("52.1 -2.1")
+
+        data = self.page.capture_preset_data()
+
+        self.assertEqual(
+            data["flight_inputs"]["coords"],
+            {
+                "lat1": "51.27283333",
+                "lon1": "-0.79205556",
+                "lat2": "51.275",
+                "lon2": "-0.78333333",
+            },
+        )
+        self.assertEqual(
+            data["flight_inputs"]["bearing"],
+            {"lat": "52.1", "lon": "-2.1", "azimuth": ""},
+        )
+
+    def test_malformed_combined_coordinate_blocks_preset_save(self):
+        self.page.coordinate1_input.setText("not a coordinate")
+
+        with (
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QInputDialog, "getText") as name_dialog,
+        ):
+            self.page.save_preset()
+
+        self.assertIn("Coordinate 1", warning.call_args.args[2])
+        name_dialog.assert_not_called()
+        self.assertEqual(self.page.preset_repository.load_all(), {})
+
     def test_apply_preset_data_keeps_coords_and_bearing_workflows_explicit(self):
         cases = (
             (
@@ -565,7 +598,7 @@ class DebrisPagePresetTests(PresetPageTestCase):
                         "lon2": "-1.2",
                     }
                 },
-                ("51.1", "-1.1", "51.2", "-1.2"),
+                ("51.1, -1.1", "51.2, -1.2"),
             ),
             (
                 "bearing",
@@ -576,7 +609,7 @@ class DebrisPagePresetTests(PresetPageTestCase):
                         "azimuth": "135",
                     }
                 },
-                ("52.1", "-2.1", "135"),
+                ("52.1, -2.1", "135"),
             ),
         )
 
@@ -591,15 +624,12 @@ class DebrisPagePresetTests(PresetPageTestCase):
                 self.assertEqual(self.page.flight_mode, mode)
                 if mode == "coords":
                     actual = (
-                        self.page.lat1_input.text(),
-                        self.page.lon1_input.text(),
-                        self.page.lat2_input.text(),
-                        self.page.lon2_input.text(),
+                        self.page.coordinate1_input.text(),
+                        self.page.coordinate2_input.text(),
                     )
                 else:
                     actual = (
-                        self.page.bearing_lat_input.text(),
-                        self.page.bearing_lon_input.text(),
+                        self.page.bearing_coordinate_input.text(),
                         self.page.azimuth_input.text(),
                     )
                 self.assertEqual(actual, expected)
@@ -926,6 +956,19 @@ class TransposePagePresetTests(PresetPageTestCase):
 
         self.assertEqual(self.page.capture_preset_data(), expected)
 
+    def test_malformed_target_coordinate_blocks_airfield_preset_save(self):
+        self.page.coordinate_input.setText("not a coordinate")
+
+        with (
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QInputDialog, "getText") as name_dialog,
+        ):
+            self.page.save_preset()
+
+        self.assertIn("Target airfield coordinates", warning.call_args.args[2])
+        name_dialog.assert_not_called()
+        self.assertEqual(self.page.preset_repository.load_all(), {})
+
     def test_wrong_type_and_raw_legacy_external_imports_show_errors_without_writes(self):
         wrong = self.root / "wrong.json"
         raw = self.root / "raw.json"
@@ -955,8 +998,7 @@ class TransposePagePresetTests(PresetPageTestCase):
     def configure_transposition(self, *input_paths, airfield_name="RAF Fairford"):
         self.page.input_files = [str(path) for path in input_paths]
         self.page.airfield_name_input.setText(airfield_name)
-        self.page.lat_input.setText("51.0")
-        self.page.lon_input.setText("-1.0")
+        self.page.coordinate_input.setText("51.0, -1.0")
         self.page.heading_input.setText("90")
         self.page.orig_height_input.setText("38")
 
@@ -965,6 +1007,7 @@ class TransposePagePresetTests(PresetPageTestCase):
         output_dir = self.root / "outputs"
         output_dir.mkdir()
         self.configure_transposition(source, airfield_name="")
+        self.page.coordinate_input.setText('51°16\'22.2"N / 0°47\'31.4"W')
         successful_output = TranspositionFileOutcome(
             input_path=source,
             planned_output_path=output_dir / "line-string-namespaced-at-airfield.kml",
@@ -1003,6 +1046,9 @@ class TransposePagePresetTests(PresetPageTestCase):
             "line-string-namespaced-at-airfield.kml",
         )
         self.assertIs(run.call_args.kwargs["plan"], plan)
+        self.assertAlmostEqual(run.call_args.kwargs["target_lat"], 51.27283333333333)
+        self.assertAlmostEqual(run.call_args.kwargs["target_lon"], -0.7920555555555555)
+        self.assertEqual(self.page.coordinate_input.text(), "51.27283333, -0.79205556")
         self.dialog_state_mocks["transpose_directory"].assert_called_once_with(
             FileDialogWorkflow.TRANSPOSITION,
             FileDialogDirection.OUTPUT,
@@ -1013,6 +1059,22 @@ class TransposePagePresetTests(PresetPageTestCase):
             str(successful_output.output_path),
             information.call_args.args[2],
         )
+
+    def test_invalid_target_coordinate_blocks_before_output_folder(self):
+        source = KML_FIXTURES / "line_string_namespaced.kml"
+        self.configure_transposition(source)
+        self.page.coordinate_input.setText("invalid")
+
+        with (
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QFileDialog, "getExistingDirectory") as folder_dialog,
+            patch("pages.transpose_page.run_transposition") as run,
+        ):
+            self.page.run_transposition_ui()
+
+        self.assertIn("Target airfield coordinates", warning.call_args.args[2])
+        folder_dialog.assert_not_called()
+        run.assert_not_called()
 
     def test_cancelled_name_editor_writes_nothing_but_remembers_selected_folder(self):
         source = KML_FIXTURES / "line_string_namespaced.kml"

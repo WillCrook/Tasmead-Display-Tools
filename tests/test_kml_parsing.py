@@ -751,6 +751,68 @@ class DebrisKmlTests(unittest.TestCase):
             (51.2, -0.7, 51.3, -0.6),
         )
 
+    def test_combined_coordinate_and_track_modes_pass_decimal_values(self):
+        output = str(Path(self.temp_dir.name) / "debris.kml")
+        self.page.alt_m.setText("100")
+        self.page.terrain_m.setText("0")
+
+        cases = (
+            (
+                self.page.rb_coords,
+                lambda: (
+                    self.page.coordinate1_input.setText("51.2 -0.7"),
+                    self.page.coordinate2_input.setText("51.3/-0.6"),
+                ),
+                "input_coords_hook",
+                (51.2, -0.7, 51.3, -0.6),
+            ),
+            (
+                self.page.rb_bearing,
+                lambda: (
+                    self.page.bearing_coordinate_input.setText(
+                        '51°12\'0"N, 0°42\'0"W'
+                    ),
+                    self.page.azimuth_input.setText("135"),
+                ),
+                "input_bearing_hook",
+                (51.2, -0.7, 135.0),
+            ),
+        )
+
+        for radio_button, configure, argument, expected in cases:
+            with self.subTest(argument=argument):
+                radio_button.setChecked(True)
+                configure()
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getSaveFileName",
+                        return_value=(output, ""),
+                    ),
+                    patch.object(self.page, "run_debris_calculator") as calculator,
+                ):
+                    self.page.run_simulation()
+
+                self.assertEqual(calculator.call_args.kwargs[argument], expected)
+
+    def test_invalid_combined_coordinate_blocks_before_output_picker(self):
+        self.page.rb_coords.setChecked(True)
+        self.page.alt_m.setText("100")
+        self.page.terrain_m.setText("0")
+        self.page.coordinate1_input.setText("invalid")
+        self.page.coordinate2_input.setText("51.3, -0.6")
+
+        with (
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QFileDialog, "getSaveFileName") as save_dialog,
+            patch.object(self.page, "run_debris_calculator") as calculator,
+        ):
+            self.page.run_simulation()
+
+        self.assertIn("Coordinate 1", warning.call_args.args[2])
+        save_dialog.assert_not_called()
+        calculator.assert_not_called()
+
     def test_output_picker_uses_remembered_folder_and_keeps_custom_filename(self):
         self.page.select_and_parse_kml(
             self.fixture("line_string_namespaced.kml"),

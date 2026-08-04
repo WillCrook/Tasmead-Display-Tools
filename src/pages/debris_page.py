@@ -16,10 +16,11 @@ from file_dialog_state import (
 )
 from resource_paths import app_data_path, resource_path
 from services import (
-    DebrisSimulationRequest, DebrisSimulationResult, PresetType,
-    SimulationProgress, parse_kml_track,
+    CoordinateInputError, DebrisSimulationRequest, DebrisSimulationResult,
+    PresetType, SimulationProgress, parse_kml_track,
 )
 from workers import CancellationToken, DebrisSimulationWorker, SimulationFailure
+from pages.coordinate_input import CoordinatePairInput
 from pages.preset_ui import PresetPanelLabels, PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
 
@@ -229,7 +230,11 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.load_presets_from_disk()
 
     def save_preset(self):
-        preset = self.capture_preset_data()
+        try:
+            preset = self.capture_preset_data()
+        except CoordinateInputError as error:
+            QMessageBox.warning(self, "Invalid coordinate", str(error))
+            return
 
         name, ok = QInputDialog.getText(
             self,
@@ -242,6 +247,9 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.save_preset_data(name, preset, error_title="Preset Error")
 
     def capture_preset_data(self) -> dict[str, object]:
+        lat1, lon1 = self.coordinate1_input.preset_components()
+        lat2, lon2 = self.coordinate2_input.preset_components()
+        bearing_lat, bearing_lon = self.bearing_coordinate_input.preset_components()
         return {
             "config": {k: v.text() for k, v in self.inputs.items()},
             "surface": self.surface_combo.currentText(),
@@ -255,14 +263,14 @@ class DebrisPage(PresetUiMixin, QWidget):
                     "kml_path": self._kml_state.path
                 },
                 "coords": {
-                    "lat1": self.lat1_input.text(),
-                    "lon1": self.lon1_input.text(),
-                    "lat2": self.lat2_input.text(),
-                    "lon2": self.lon2_input.text(),
+                    "lat1": lat1,
+                    "lon1": lon1,
+                    "lat2": lat2,
+                    "lon2": lon2,
                 },
                 "bearing": {
-                    "lat": self.bearing_lat_input.text(),
-                    "lon": self.bearing_lon_input.text(),
+                    "lat": bearing_lat,
+                    "lon": bearing_lon,
                     "azimuth": self.azimuth_input.text(),
                 }
             }
@@ -326,15 +334,21 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         elif self.flight_mode == "coords":
             coords = flight_inputs.get("coords", {})
-            self.lat1_input.setText(coords.get("lat1", ""))
-            self.lon1_input.setText(coords.get("lon1", ""))
-            self.lat2_input.setText(coords.get("lat2", ""))
-            self.lon2_input.setText(coords.get("lon2", ""))
+            self.coordinate1_input.set_components(
+                coords.get("lat1", ""),
+                coords.get("lon1", ""),
+            )
+            self.coordinate2_input.set_components(
+                coords.get("lat2", ""),
+                coords.get("lon2", ""),
+            )
 
         elif self.flight_mode == "bearing":
             bearing = flight_inputs.get("bearing", {})
-            self.bearing_lat_input.setText(bearing.get("lat", ""))
-            self.bearing_lon_input.setText(bearing.get("lon", ""))
+            self.bearing_coordinate_input.set_components(
+                bearing.get("lat", ""),
+                bearing.get("lon", ""),
+            )
             self.azimuth_input.setText(bearing.get("azimuth", ""))
 
     def build_config(self, layout):
@@ -451,38 +465,26 @@ class DebrisPage(PresetUiMixin, QWidget):
         # Coordinates mode inputs
         self.coords_container = QWidget()
         coords_layout = QVBoxLayout(self.coords_container)
-        lat1_label = QLabel("Latitude 1")
-        self.lat1_input = QLineEdit()
-        lon1_label = QLabel("Longitude 1")
-        self.lon1_input = QLineEdit()
-        lat2_label = QLabel("Latitude 2")
-        self.lat2_input = QLineEdit()
-        lon2_label = QLabel("Longitude 2")
-        self.lon2_input = QLineEdit()
+        coordinate1_label = QLabel("Coordinate 1 (Latitude, Longitude)")
+        self.coordinate1_input = CoordinatePairInput("Coordinate 1")
+        coordinate2_label = QLabel("Coordinate 2 (Latitude, Longitude)")
+        self.coordinate2_input = CoordinatePairInput("Coordinate 2")
 
-        coords_layout.addWidget(lat1_label)
-        coords_layout.addWidget(self.lat1_input)
-        coords_layout.addWidget(lon1_label)
-        coords_layout.addWidget(self.lon1_input)
-        coords_layout.addWidget(lat2_label)
-        coords_layout.addWidget(self.lat2_input)
-        coords_layout.addWidget(lon2_label)
-        coords_layout.addWidget(self.lon2_input)
+        coords_layout.addWidget(coordinate1_label)
+        coords_layout.addWidget(self.coordinate1_input)
+        coords_layout.addWidget(coordinate2_label)
+        coords_layout.addWidget(self.coordinate2_input)
 
         # Bearing mode inputs
         self.bearing_container = QWidget()
         bearing_layout = QVBoxLayout(self.bearing_container)
-        lat_label = QLabel("Latitude")
-        self.bearing_lat_input = QLineEdit()
-        lon_label = QLabel("Longitude")
-        self.bearing_lon_input = QLineEdit()
+        coordinate_label = QLabel("Coordinate (Latitude, Longitude)")
+        self.bearing_coordinate_input = CoordinatePairInput("Track coordinate")
         azimuth_label = QLabel("Track (degrees)")
         self.azimuth_input = QLineEdit()
 
-        bearing_layout.addWidget(lat_label)
-        bearing_layout.addWidget(self.bearing_lat_input)
-        bearing_layout.addWidget(lon_label)
-        bearing_layout.addWidget(self.bearing_lon_input)
+        bearing_layout.addWidget(coordinate_label)
+        bearing_layout.addWidget(self.bearing_coordinate_input)
         bearing_layout.addWidget(azimuth_label)
         bearing_layout.addWidget(self.azimuth_input)
 
@@ -490,14 +492,11 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.flight_inputs = {
             "kml": {},
             "coords": {
-                "lat1": self.lat1_input,
-                "lon1": self.lon1_input,
-                "lat2": self.lat2_input,
-                "lon2": self.lon2_input,
+                "coordinate1": self.coordinate1_input,
+                "coordinate2": self.coordinate2_input,
             },
             "bearing": {
-                "lat": self.bearing_lat_input,
-                "lon": self.bearing_lon_input,
+                "coordinate": self.bearing_coordinate_input,
                 "azimuth": self.azimuth_input,
             }
         }
@@ -732,28 +731,38 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         elif self.flight_mode == "coords":
             try:
-                lat1 = float(self.lat1_input.text())
-                lon1 = float(self.lon1_input.text())
-                lat2 = float(self.lat2_input.text())
-                lon2 = float(self.lon2_input.text())
-            except ValueError:
-                QMessageBox.warning(self, "Invalid input", "Please enter valid coordinates for Lat 1, Lon 1, Lat 2, Lon 2.")
+                coordinate1 = self.coordinate1_input.coordinates()
+                coordinate2 = self.coordinate2_input.coordinates()
+            except CoordinateInputError as error:
+                QMessageBox.warning(self, "Invalid coordinate", str(error))
                 return
-            
-            input_coords = (lat1, lon1, lat2, lon2)
+
+            input_coords = (
+                coordinate1.latitude,
+                coordinate1.longitude,
+                coordinate2.latitude,
+                coordinate2.longitude,
+            )
             input_bearing = None
 
         elif self.flight_mode == "bearing":
             try:
-                lat = float(self.bearing_lat_input.text())
-                lon = float(self.bearing_lon_input.text())
+                coordinate = self.bearing_coordinate_input.coordinates()
+            except CoordinateInputError as error:
+                QMessageBox.warning(self, "Invalid coordinate", str(error))
+                return
+            try:
                 azimuth = float(self.azimuth_input.text())
             except ValueError:
-                QMessageBox.warning(self, "Invalid input", "Please enter valid Latitude, Longitude, and Track.")
+                QMessageBox.warning(self, "Invalid input", "Please enter a valid Track.")
                 return
-            
+
             input_coords = None
-            input_bearing = (lat, lon, azimuth)
+            input_bearing = (
+                coordinate.latitude,
+                coordinate.longitude,
+                azimuth,
+            )
         else:
             QMessageBox.warning(self, "Invalid mode", "Unknown flight input mode selected.")
             return
