@@ -15,7 +15,14 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 KML_FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "kml"
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+)
 
 from pages.debris_page import DebrisPage
 from pages.transpose_page import TransposePage
@@ -422,6 +429,130 @@ class DebrisPagePresetTests(PresetPageTestCase):
         self.assertTrue(self.page.rename_preset_btn.isEnabled())
         self.assertTrue(self.page.export_preset_btn.isEnabled())
 
+    def test_preset_panel_keeps_exact_visible_text_and_order(self):
+        labels = [
+            label.text()
+            for label in self.page.presets_widget.findChildren(QLabel)
+        ]
+        buttons = [
+            button.text()
+            for button in self.page.presets_widget.findChildren(QPushButton)
+        ]
+
+        self.assertIn("Presets", labels)
+        self.assertEqual(
+            buttons,
+            [
+                "Save preset",
+                "Load preset",
+                "Rename preset",
+                "Delete preset",
+                "Export preset",
+            ],
+        )
+
+    def test_unit_fields_keep_existing_conversion_and_derived_rules(self):
+        self.page.terrain_m.setText("20")
+        self.page.alt_m.setText("100")
+        self.assertEqual(self.page.terrain_ft.text(), "65.62")
+        self.assertEqual(self.page.alt_ft.text(), "328.08")
+        self.assertEqual(self.page.height_m.text(), "80.00")
+        self.assertEqual(self.page.height_ft.text(), "262.47")
+
+        self.page.height_ft.setText("164.042")
+        self.assertEqual(self.page.height_m.text(), "50.00")
+        self.assertEqual(self.page.alt_m.text(), "70.00")
+        self.assertEqual(self.page.alt_ft.text(), "229.66")
+
+    def test_capture_preset_data_keeps_exact_debris_schema(self):
+        self.page.inputs["Mass (kg)"].setText("12")
+        self.page.surface_combo.setCurrentText("grass")
+        self.page.include_ground_drag.setChecked(False)
+        self.page.terrain_m.setText("20")
+        self.page.alt_m.setText("100")
+        self.page.rb_bearing.setChecked(True)
+        self.page.bearing_lat_input.setText("51")
+        self.page.bearing_lon_input.setText("-1")
+        self.page.azimuth_input.setText("90")
+
+        data = self.page.capture_preset_data()
+
+        self.assertEqual(
+            set(data),
+            {
+                "config",
+                "surface",
+                "include_ground_drag",
+                "altitude_m",
+                "terrain_m",
+                "height_m",
+                "flight_mode",
+                "flight_inputs",
+            },
+        )
+        self.assertEqual(data["config"]["Mass (kg)"], "12")
+        self.assertEqual(data["surface"], "grass")
+        self.assertFalse(data["include_ground_drag"])
+        self.assertEqual(data["altitude_m"], "100")
+        self.assertEqual(data["terrain_m"], "20")
+        self.assertEqual(data["height_m"], "80.00")
+        self.assertEqual(data["flight_mode"], "bearing")
+        self.assertEqual(
+            data["flight_inputs"]["bearing"],
+            {"lat": "51", "lon": "-1", "azimuth": "90"},
+        )
+
+    def test_apply_preset_data_keeps_coords_and_bearing_workflows_explicit(self):
+        cases = (
+            (
+                "coords",
+                {
+                    "coords": {
+                        "lat1": "51.1",
+                        "lon1": "-1.1",
+                        "lat2": "51.2",
+                        "lon2": "-1.2",
+                    }
+                },
+                ("51.1", "-1.1", "51.2", "-1.2"),
+            ),
+            (
+                "bearing",
+                {
+                    "bearing": {
+                        "lat": "52.1",
+                        "lon": "-2.1",
+                        "azimuth": "135",
+                    }
+                },
+                ("52.1", "-2.1", "135"),
+            ),
+        )
+
+        for mode, flight_inputs, expected in cases:
+            with self.subTest(mode=mode):
+                self.page.apply_preset_data(
+                    {
+                        "flight_mode": mode,
+                        "flight_inputs": flight_inputs,
+                    }
+                )
+                self.assertEqual(self.page.flight_mode, mode)
+                if mode == "coords":
+                    actual = (
+                        self.page.lat1_input.text(),
+                        self.page.lon1_input.text(),
+                        self.page.lat2_input.text(),
+                        self.page.lon2_input.text(),
+                    )
+                else:
+                    actual = (
+                        self.page.bearing_lat_input.text(),
+                        self.page.bearing_lon_input.text(),
+                        self.page.azimuth_input.text(),
+                    )
+                self.assertEqual(actual, expected)
+
     def test_restoring_kml_preset_parses_immediately_and_kml_altitude_wins(self):
         path = KML_FIXTURES / "line_string_namespaced.kml"
 
@@ -585,6 +716,43 @@ class TransposePagePresetTests(PresetPageTestCase):
         self.assertEqual(self.page.airfield_name_input.text(), "Farnborough")
         self.assertEqual(self.page.heading_input.text(), "126")
         self.assertEqual(self.page.preset_list.currentItem().text(), "Imported Field")
+
+    def test_preset_panel_keeps_exact_visible_text_and_order(self):
+        splitter = self.page.layout().itemAt(0).widget()
+        presets_widget = splitter.widget(0)
+        labels = [label.text() for label in presets_widget.findChildren(QLabel)]
+        buttons = [
+            button.text()
+            for button in presets_widget.findChildren(QPushButton)
+        ]
+
+        self.assertIn("Airfield Presets", labels)
+        self.assertEqual(
+            buttons,
+            [
+                "Save Preset",
+                "Load Preset",
+                "Rename Preset",
+                "Delete Preset",
+                "Export Preset",
+            ],
+        )
+
+    def test_elevation_pair_keeps_existing_conversion_behavior(self):
+        self.page.orig_height_input.setText("10")
+        self.assertEqual(self.page.orig_height_ft_input.text(), "32.81")
+
+        self.page.orig_height_ft_input.setText("65.6168")
+        self.assertEqual(self.page.orig_height_input.text(), "20.00")
+
+        self.page.orig_height_input.setText("invalid")
+        self.assertEqual(self.page.orig_height_ft_input.text(), "")
+
+    def test_capture_and_apply_keep_exact_airfield_schema(self):
+        expected = self.data()
+        self.page.apply_preset_data(expected)
+
+        self.assertEqual(self.page.capture_preset_data(), expected)
 
     def test_wrong_type_and_raw_legacy_external_imports_show_errors_without_writes(self):
         wrong = self.root / "wrong.json"

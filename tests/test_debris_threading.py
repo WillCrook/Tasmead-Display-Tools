@@ -325,6 +325,7 @@ class DebrisSimulationUiTests(unittest.TestCase):
 
         self.assertEqual(self.page._simulation_state, SimulationUiState.RUNNING)
         self.assertFalse(self.page.run_btn.isEnabled())
+        self.assertFalse(self.page.presets_widget.isEnabled())
         self.assertFalse(self.page.config_widget.isEnabled())
         self.assertTrue(self.page.cancel_simulation_btn.isEnabled())
         self.assertEqual(self.page.simulation_progress_bar.value(), 50)
@@ -341,6 +342,7 @@ class DebrisSimulationUiTests(unittest.TestCase):
 
         self.assertFalse(self.page.has_active_simulation())
         self.assertTrue(self.page.run_btn.isEnabled())
+        self.assertTrue(self.page.presets_widget.isEnabled())
         self.assertTrue(self.page.config_widget.isEnabled())
         self.assertFalse(self.page.cancel_simulation_btn.isVisible())
         self.assertIn("not changed", self.page.simulation_status_label.text())

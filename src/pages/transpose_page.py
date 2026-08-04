@@ -1,5 +1,5 @@
 import os
-from uuid import UUID
+from collections.abc import Mapping
 
 from PyQt6.QtCore import QSettings, QStandardPaths, Qt
 from PyQt6.QtWidgets import (
@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (
 
 from resource_paths import app_data_path, resource_path
 from services import PresetType, create_transposition_plan, run_transposition
-from pages.preset_ui import PresetUiMixin
+from pages.preset_ui import PresetPanelLabels, PresetUiMixin
+from pages.unit_fields import MetreFeetFieldPair
 
 
 class TransposePage(PresetUiMixin, QWidget):
@@ -52,7 +53,17 @@ class TransposePage(PresetUiMixin, QWidget):
             legacy_readonly_directory=resource_path("data/airfields"),
             backup_directory=app_data_path("presets/legacy-backup/airfield"),
         )
-        self.build_presets_panel(presets_layout)
+        self.build_preset_panel(
+            presets_layout,
+            PresetPanelLabels(
+                title="Airfield Presets",
+                save="Save Preset",
+                load="Load Preset",
+                rename="Rename Preset",
+                delete="Delete Preset",
+                export="Export Preset",
+            ),
+        )
         self.load_presets_from_disk()
 
         # Config (Lat, Lon, Heading)
@@ -62,38 +73,6 @@ class TransposePage(PresetUiMixin, QWidget):
         self.input_files = []
         self.build_file_panel(file_layout)
 
-    def build_presets_panel(self, layout):
-        title = QLabel("Airfield Presets")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(title)
-
-        self.preset_list = QListWidget()
-        self.preset_list.itemClicked.connect(self.load_selected_preset)
-        self.preset_list.currentItemChanged.connect(self.update_preset_actions)
-        layout.addWidget(self.preset_list)
-
-        save_btn = QPushButton("Save Preset")
-        load_btn = QPushButton("Load Preset")
-        self.rename_preset_btn = QPushButton("Rename Preset")
-        self.delete_preset_btn = QPushButton("Delete Preset")
-        self.export_preset_btn = QPushButton("Export Preset")
-        self.rename_preset_btn.setEnabled(False)
-        self.delete_preset_btn.setEnabled(False)
-        self.export_preset_btn.setEnabled(False)
-
-        save_btn.clicked.connect(self.save_preset)
-        load_btn.clicked.connect(self.load_preset_from_file)
-        self.rename_preset_btn.clicked.connect(self.rename_preset)
-        self.delete_preset_btn.clicked.connect(self.delete_preset)
-        self.export_preset_btn.clicked.connect(self.export_preset)
-
-        layout.addWidget(save_btn)
-        layout.addWidget(load_btn)
-        layout.addWidget(self.rename_preset_btn)
-        layout.addWidget(self.delete_preset_btn)
-        layout.addWidget(self.export_preset_btn)
-        layout.addStretch()
-
     def build_config_panel(self, layout):
         # Original Airfield Height Section
         orig_title = QLabel("Original Airfield")
@@ -102,7 +81,6 @@ class TransposePage(PresetUiMixin, QWidget):
 
         self.orig_height_input = QLineEdit()
         self.orig_height_input.setPlaceholderText("Elevation (m)")
-        self.orig_height_input.textChanged.connect(self.orig_height_m_changed)
 
         m_layout = QVBoxLayout()
         m_layout.addWidget(QLabel("Original Elevation (m)"))
@@ -110,7 +88,6 @@ class TransposePage(PresetUiMixin, QWidget):
 
         self.orig_height_ft_input = QLineEdit()
         self.orig_height_ft_input.setPlaceholderText("Elevation (ft)")
-        self.orig_height_ft_input.textChanged.connect(self.orig_height_ft_changed)
 
         ft_layout = QVBoxLayout()
         ft_layout.addWidget(QLabel("Original Elevation (ft)"))
@@ -123,7 +100,10 @@ class TransposePage(PresetUiMixin, QWidget):
 
         layout.addLayout(h_layout)
 
-        self._orig_height_updating = False
+        self._orig_height_units = MetreFeetFieldPair(
+            self.orig_height_input,
+            self.orig_height_ft_input,
+        )
         
         layout.addSpacing(20)
 
@@ -238,15 +218,20 @@ class TransposePage(PresetUiMixin, QWidget):
         if not ok or not name:
             return
 
-        data = {
+        self.save_preset_data(
+            name,
+            self.capture_preset_data(),
+            error_title="Error",
+        )
+
+    def capture_preset_data(self) -> dict[str, object]:
+        return {
             "name": self.airfield_name_input.text(),
             "latitude": self.lat_input.text(),
             "longitude": self.lon_input.text(),
             "heading": self.heading_input.text(),
-            "original_elevation_m": self.orig_height_input.text()
+            "original_elevation_m": self.orig_height_input.text(),
         }
-
-        self.save_preset_data(name, data, error_title="Error")
 
     def load_preset_from_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -260,18 +245,9 @@ class TransposePage(PresetUiMixin, QWidget):
 
         record = self.import_preset_path(path, error_title="Error")
         if record is not None:
-            self._apply_preset_data(record.preset.data)
+            self.apply_preset_data(record.preset.data)
 
-    def load_selected_preset(self, item):
-        try:
-            preset_id = UUID(str(item.data(Qt.ItemDataRole.UserRole)))
-        except (TypeError, ValueError):
-            return
-        record = self.presets.get(preset_id)
-        if record is not None:
-            self._apply_preset_data(record.preset.data)
-
-    def _apply_preset_data(self, data):
+    def apply_preset_data(self, data: Mapping[str, object]) -> None:
         """Apply tolerant airfield settings from a validated preset envelope."""
         self.airfield_name_input.setText(data.get("name", ""))
         self.lat_input.setText(data.get("latitude", ""))
@@ -406,25 +382,3 @@ class TransposePage(PresetUiMixin, QWidget):
         )
         dialog.setDefaultButton(QMessageBox.StandardButton.Save)
         return dialog.exec() == QMessageBox.StandardButton.Save
-
-    def orig_height_m_changed(self, text):
-        if self._orig_height_updating:
-            return
-        self._orig_height_updating = True
-        try:
-            val_m = float(text)
-            self.orig_height_ft_input.setText(f"{val_m * 3.28084:.2f}")
-        except ValueError:
-            self.orig_height_ft_input.clear()
-        self._orig_height_updating = False
-
-    def orig_height_ft_changed(self, text):
-        if self._orig_height_updating:
-            return
-        self._orig_height_updating = True
-        try:
-            val_ft = float(text)
-            self.orig_height_input.setText(f"{val_ft / 3.28084:.2f}")
-        except ValueError:
-            self.orig_height_input.clear()
-        self._orig_height_updating = False

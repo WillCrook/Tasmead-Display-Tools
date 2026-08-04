@@ -1,12 +1,12 @@
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from uuid import UUID
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QProgressBar,
+    QInputDialog, QLabel, QLineEdit, QMessageBox, QProgressBar,
     QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -16,7 +16,8 @@ from services import (
     SimulationProgress, parse_kml_track,
 )
 from workers import CancellationToken, DebrisSimulationWorker, SimulationFailure
-from pages.preset_ui import PresetUiMixin
+from pages.preset_ui import PresetPanelLabels, PresetUiMixin
+from pages.unit_fields import MetreFeetFieldPair
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,47 +208,37 @@ class DebrisPage(PresetUiMixin, QWidget):
             backup_directory=app_data_path("presets/legacy-backup/debris"),
         )
 
-        self.build_presets_panel(presets)
+        self.build_preset_panel(
+            presets,
+            PresetPanelLabels(
+                title="Presets",
+                save="Save preset",
+                load="Load preset",
+                rename="Rename preset",
+                delete="Delete preset",
+                export="Export preset",
+            ),
+        )
         self.build_config(config)
         self.build_file_panel(file_panel)
 
         self.load_presets_from_disk()
 
-    def build_presets_panel(self, layout):
-        title = QLabel("Presets")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(title)
-
-        self.preset_list = QListWidget()
-        self.preset_list.itemClicked.connect(self.load_selected_preset)
-        self.preset_list.currentItemChanged.connect(self.update_preset_actions)
-        layout.addWidget(self.preset_list)
-
-        save_btn = QPushButton("Save preset")
-        load_btn = QPushButton("Load preset")
-        self.rename_preset_btn = QPushButton("Rename preset")
-        self.delete_preset_btn = QPushButton("Delete preset")
-        self.export_preset_btn = QPushButton("Export preset")
-        self.rename_preset_btn.setEnabled(False)
-        self.delete_preset_btn.setEnabled(False)
-        self.export_preset_btn.setEnabled(False)
-
-        save_btn.clicked.connect(self.save_preset)
-        load_btn.clicked.connect(self.load_preset_from_file)
-        self.rename_preset_btn.clicked.connect(self.rename_preset)
-        self.delete_preset_btn.clicked.connect(self.delete_preset)
-        self.export_preset_btn.clicked.connect(self.export_preset)
-
-        layout.addWidget(save_btn)
-        layout.addWidget(load_btn)
-        layout.addWidget(self.rename_preset_btn)
-        layout.addWidget(self.delete_preset_btn)
-        layout.addWidget(self.export_preset_btn)
-
-        layout.addStretch()
-
     def save_preset(self):
-        preset = {
+        preset = self.capture_preset_data()
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Preset",
+            "Enter preset name:"
+        )
+        if not ok or not name:
+            return
+
+        self.save_preset_data(name, preset, error_title="Preset Error")
+
+    def capture_preset_data(self) -> dict[str, object]:
+        return {
             "config": {k: v.text() for k, v in self.inputs.items()},
             "surface": self.surface_combo.currentText(),
             "include_ground_drag": self.include_ground_drag.isChecked(),
@@ -273,16 +264,6 @@ class DebrisPage(PresetUiMixin, QWidget):
             }
         }
 
-        name, ok = QInputDialog.getText(
-            self,
-            "Save Preset",
-            "Enter preset name:"
-        )
-        if not ok or not name:
-            return
-
-        self.save_preset_data(name, preset, error_title="Preset Error")
-
     def load_preset_from_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -295,16 +276,7 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         self.import_preset_path(path, error_title="Preset Error")
 
-    def load_selected_preset(self, item):
-        try:
-            preset_id = item.data(Qt.ItemDataRole.UserRole)
-            record = self.presets.get(UUID(str(preset_id)))
-        except (TypeError, ValueError):
-            return
-        if record is None:
-            return
-        data = record.preset.data
-
+    def apply_preset_data(self, data: Mapping[str, object]) -> None:
         for k, v in data.get("config", {}).items():
             if k in self.inputs:
                 self.inputs[k].setText(v)
@@ -555,19 +527,23 @@ class DebrisPage(PresetUiMixin, QWidget):
         height_layout.addWidget(self.height_ft)
         layout.addLayout(height_layout)
 
-        # Update flags
-        self._alt_updating = False
-        self._terrain_updating = False
-        self._height_updating = False
+        self._altitude_units = MetreFeetFieldPair(
+            self.alt_m,
+            self.alt_ft,
+            on_metres_changed=self.update_from_alt_terrain,
+        )
+        self._terrain_units = MetreFeetFieldPair(
+            self.terrain_m,
+            self.terrain_ft,
+            on_metres_changed=self.update_from_alt_terrain,
+        )
+        self._height_units = MetreFeetFieldPair(
+            self.height_m,
+            self.height_ft,
+            on_metres_changed=self.update_from_height,
+        )
 
-        # Connect signals
-        self.alt_m.textChanged.connect(self.alt_m_changed)
         self.alt_m.textChanged.connect(lambda _: self.render_kml_state())
-        self.alt_ft.textChanged.connect(self.alt_ft_changed)
-        self.terrain_m.textChanged.connect(self.terrain_m_changed)
-        self.terrain_ft.textChanged.connect(self.terrain_ft_changed)
-        self.height_m.textChanged.connect(self.height_m_changed)
-        self.height_ft.textChanged.connect(self.height_ft_changed)
 
         self.run_btn = QPushButton("Run Simulation")
         self.run_btn.clicked.connect(self.run_simulation)
@@ -636,108 +612,31 @@ class DebrisPage(PresetUiMixin, QWidget):
         elif self.flight_mode == "bearing":
             self.mode_stack_layout.addWidget(self.bearing_container)
 
-    # --- Fully linked handlers ---
-    def alt_m_changed(self, text):
-        if self._alt_updating:
-            return
-        self._alt_updating = True
-        try:
-            m = float(text)
-            self.alt_ft.setText(f"{m * 3.28084:.2f}")
-        except ValueError:
-            self.alt_ft.clear()
-        self._alt_updating = False
-        self.update_from_alt_terrain()
-
-    def alt_ft_changed(self, text):
-        if self._alt_updating:
-            return
-        self._alt_updating = True
-        try:
-            ft = float(text)
-            self.alt_m.setText(f"{ft / 3.28084:.2f}")
-        except ValueError:
-            self.alt_m.clear()
-        self._alt_updating = False
-        self.update_from_alt_terrain()
-
-    def terrain_m_changed(self, text):
-        if self._terrain_updating:
-            return
-        self._terrain_updating = True
-        try:
-            m = float(text)
-            self.terrain_ft.setText(f"{m * 3.28084:.2f}")
-        except ValueError:
-            self.terrain_ft.clear()
-        self._terrain_updating = False
-        self.update_from_alt_terrain()
-
-    def terrain_ft_changed(self, text):
-        if self._terrain_updating:
-            return
-        self._terrain_updating = True
-        try:
-            ft = float(text)
-            self.terrain_m.setText(f"{ft / 3.28084:.2f}")
-        except ValueError:
-            self.terrain_m.clear()
-        self._terrain_updating = False
-        self.update_from_alt_terrain()
-
-    def height_m_changed(self, text):
-        if self._height_updating:
-            return
-        self._height_updating = True
-        try:
-            m = float(text)
-            self.height_ft.setText(f"{m * 3.28084:.2f}")
-        except ValueError:
-            self.height_ft.clear()
-        self._height_updating = False
-        self.update_from_height()
-
-    def height_ft_changed(self, text):
-        if self._height_updating:
-            return
-        self._height_updating = True
-        try:
-            ft = float(text)
-            self.height_m.setText(f"{ft / 3.28084:.2f}")
-        except ValueError:
-            self.height_m.clear()
-        self._height_updating = False
-        self.update_from_height()
-
     def update_from_alt_terrain(self):
-        if self._height_updating:
-            return
         try:
             alt_m = float(self.alt_m.text())
             terr_m = float(self.terrain_m.text())
         except ValueError:
             return
 
-        self._height_updating = True
         height_m = alt_m - terr_m
-        self.height_m.setText(f"{height_m:.2f}")
-        self.height_ft.setText(f"{height_m * 3.28084:.2f}")
-        self._height_updating = False
+        self._height_units.set_metres_value(
+            height_m,
+            notify_dependents=False,
+        )
 
     def update_from_height(self):
-        if self._alt_updating or self._terrain_updating:
-            return
         try:
             height_m = float(self.height_m.text())
             terr_m = float(self.terrain_m.text())
         except ValueError:
             return
 
-        self._alt_updating = True
         alt_m = height_m + terr_m
-        self.alt_m.setText(f"{alt_m:.2f}")
-        self.alt_ft.setText(f"{alt_m * 3.28084:.2f}")
-        self._alt_updating = False
+        self._altitude_units.set_metres_value(
+            alt_m,
+            notify_dependents=False,
+        )
 
     def browse_file(self, _):
         file, _ = QFileDialog.getOpenFileName(

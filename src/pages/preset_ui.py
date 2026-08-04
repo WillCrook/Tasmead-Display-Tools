@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QFileDialog, QInputDialog, QListWidgetItem, QMessageBox
+from PyQt6.QtWidgets import (
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+)
 
 from services import (
     PresetError,
@@ -16,6 +26,18 @@ from services import (
     PresetRepository,
     PresetType,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PresetPanelLabels:
+    """Exact visible text for one page's shared preset panel."""
+
+    title: str
+    save: str
+    load: str
+    rename: str
+    delete: str
+    export: str
 
 
 class PresetUiMixin:
@@ -47,6 +69,38 @@ class PresetUiMixin:
         self.preset_transfer = PresetImportExportService(self.preset_repository)
         self.presets = {}
 
+    def build_preset_panel(self, layout, labels: PresetPanelLabels) -> None:
+        title = QLabel(labels.title)
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(title)
+
+        self.preset_list = QListWidget()
+        self.preset_list.itemClicked.connect(self.load_selected_preset)
+        self.preset_list.currentItemChanged.connect(self.update_preset_actions)
+        layout.addWidget(self.preset_list)
+
+        save_button = QPushButton(labels.save)
+        load_button = QPushButton(labels.load)
+        self.rename_preset_btn = QPushButton(labels.rename)
+        self.delete_preset_btn = QPushButton(labels.delete)
+        self.export_preset_btn = QPushButton(labels.export)
+        self.rename_preset_btn.setEnabled(False)
+        self.delete_preset_btn.setEnabled(False)
+        self.export_preset_btn.setEnabled(False)
+
+        save_button.clicked.connect(self.save_preset)
+        load_button.clicked.connect(self.load_preset_from_file)
+        self.rename_preset_btn.clicked.connect(self.rename_preset)
+        self.delete_preset_btn.clicked.connect(self.delete_preset)
+        self.export_preset_btn.clicked.connect(self.export_preset)
+
+        layout.addWidget(save_button)
+        layout.addWidget(load_button)
+        layout.addWidget(self.rename_preset_btn)
+        layout.addWidget(self.delete_preset_btn)
+        layout.addWidget(self.export_preset_btn)
+        layout.addStretch()
+
     def load_presets_from_disk(self) -> None:
         self.presets = self.preset_repository.load_all()
         if self.preset_repository.issues:
@@ -69,6 +123,24 @@ class PresetUiMixin:
         except (TypeError, ValueError):
             return None, None
         return preset_id, self.presets.get(preset_id)
+
+    def preset_record_for_item(self, item) -> PresetRecord | None:
+        if item is None:
+            return None
+        try:
+            preset_id = UUID(str(item.data(Qt.ItemDataRole.UserRole)))
+        except (TypeError, ValueError):
+            return None
+        return self.presets.get(preset_id)
+
+    def load_selected_preset(self, item) -> None:
+        record = self.preset_record_for_item(item)
+        if record is not None:
+            self.apply_preset_data(record.preset.data)
+
+    def apply_preset_data(self, data: Mapping[str, object]) -> None:
+        """Apply one validated, page-specific preset payload."""
+        raise NotImplementedError
 
     def refresh_preset_list(self, *, select_id: UUID | None = None) -> None:
         self.preset_list.clear()
