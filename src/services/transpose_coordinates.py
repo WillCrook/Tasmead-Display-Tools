@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import re
 import sys
@@ -21,6 +20,11 @@ from .kml_export import (
     export_kml,
 )
 from .kml_file_handling import KmlTrack, parse_kml_track
+from .runway_alignment import (
+    RunwayReference,
+    inverse_distance_bearing,
+    transpose_geodesic_points,
+)
 
 
 MAX_OUTPUT_COMPONENT_LENGTH = 96
@@ -38,6 +42,7 @@ class TranspositionJob:
     aircraft_slug: str
     target_airfield_slug: str
     overwrite_existing: bool = False
+    source_runway: RunwayReference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,10 +282,35 @@ def customize_transposition_plan(
             aircraft_slug=job.aircraft_slug,
             target_airfield_slug=job.target_airfield_slug,
             overwrite_existing=output_path.resolve(strict=False) in approved,
+            source_runway=job.source_runway,
         )
         for job, output_path in zip(plan.jobs, output_paths, strict=True)
     )
     return TranspositionPlan(output_directory=plan.output_directory, jobs=jobs)
+
+
+def apply_source_runways(
+    plan: TranspositionPlan,
+    source_runways: Sequence[RunwayReference | None],
+) -> TranspositionPlan:
+    """Attach one reviewed source runway alignment to each planned input."""
+    if len(source_runways) != len(plan.jobs):
+        raise ValueError("Provide exactly one source runway review for each input KML file.")
+    return TranspositionPlan(
+        output_directory=plan.output_directory,
+        jobs=tuple(
+            TranspositionJob(
+                input_path=job.input_path,
+                output_path=job.output_path,
+                aircraft_name=job.aircraft_name,
+                aircraft_slug=job.aircraft_slug,
+                target_airfield_slug=job.target_airfield_slug,
+                overwrite_existing=job.overwrite_existing,
+                source_runway=source_runway,
+            )
+            for job, source_runway in zip(plan.jobs, source_runways, strict=True)
+        ),
+    )
 
 
 # def fetch_single_elevation(coordinate):
@@ -300,57 +330,29 @@ def customize_transposition_plan(
 
 
 def rotate_route(waypoints, target_lat, target_lon, target_heading):
-    """
-    Rotate waypoints to align the route with the specified runway heading, accounting for dynamic take-off points.
-    """
+    """Deprecated first-segment adapter retained for direct legacy callers."""
+    warnings.warn(
+        "rotate_route() infers alignment from the first segment and is deprecated; "
+        "use transpose_geodesic_points() with reviewed runway references.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if len(waypoints) < 2:
         raise ValueError("At least two waypoints are needed to calculate the initial heading.")
-
-    # Extract the start and second waypoints
     start_lat, start_lon, _ = waypoints[0]
     next_lat, next_lon, _ = waypoints[1]
-
-    # Calculate the scaling factor for longitude based on the starting latitude
-    lat_rad = math.radians(start_lat)
-    source_lon_scale = math.cos(lat_rad)
-
-    # Calculate the scaling factor for the target latitude
-    target_lat_rad = math.radians(target_lat)
-    target_lon_scale = math.cos(target_lat_rad)
-
-    # Calculate the current heading (bearing) between the first two waypoints
-    delta_lat = next_lat - start_lat
-    delta_lon = (next_lon - start_lon) * source_lon_scale
-    initial_heading = math.degrees(math.atan2(delta_lon, delta_lat)) % 360
-
-    # Calculate the rotation angle required to align with the target runway heading
-    rotation_angle = math.radians(target_heading - initial_heading)
-
-    # Translate all waypoints so the first one matches the target location
-    translated_waypoints = [
-        (lat - start_lat, lon - start_lon, alt)
-        for lat, lon, alt in waypoints
-    ]
-
-    # Apply rotation around the origin (which corresponds to the start point)
-    rotated_waypoints = []
-    for rel_lat, rel_lon, alt in translated_waypoints:
-        # Scale longitude for rotation using SOURCE scale (converting to "meters")
-        scaled_rel_lon = rel_lon * source_lon_scale
-
-        # Apply rotation around the translated origin
-        rotated_lat = (rel_lat * math.cos(rotation_angle) -
-                       scaled_rel_lon * math.sin(rotation_angle))
-        rotated_scaled_lon = (rel_lat * math.sin(rotation_angle) +
-                              scaled_rel_lon * math.cos(rotation_angle))
-
-        # Unscale longitude using TARGET scale and add target location
-        final_lat = rotated_lat + target_lat
-        final_lon = (rotated_scaled_lon / target_lon_scale) + target_lon
-
-        rotated_waypoints.append((final_lat, final_lon, alt))
-
-    return rotated_waypoints
+    distance, initial_heading = inverse_distance_bearing(
+        start_lat, start_lon, next_lat, next_lon
+    )
+    if distance == 0.0:
+        raise ValueError("The first two waypoints are identical and have no heading.")
+    return list(
+        transpose_geodesic_points(
+            waypoints,
+            RunwayReference(start_lat, start_lon, initial_heading),
+            RunwayReference(target_lat, target_lon, target_heading),
+        )
+    )
 
 
 def write_kml(file_path, coordinates, name_of_aircraft, *, overwrite=False):
@@ -395,19 +397,32 @@ def read_config(config_file):
 
 def _waypoints_for_transposition(
     track: KmlTrack,
-    ground_reference_elevation: float,
+    source_runway: RunwayReference,
 ) -> list[tuple[float, float, float]]:
-    """Convert the shared KML model to the existing rotation tuple contract."""
-    return [
-        (
-            point.latitude,
-            point.longitude,
-            point.altitude_m
-            if point.altitude_m is not None
-            else ground_reference_elevation,
+    """Convert encoded KML heights to output relative-to-ground heights."""
+    if track.altitude_mode == "absolute" and source_runway.elevation_m is None:
+        raise ValueError(
+            "Source ground-reference elevation is required for a KML using absolute altitude."
         )
-        for point in track.points
-    ]
+    waypoints: list[tuple[float, float, float]] = []
+    for point in track.points:
+        if track.altitude_mode == "absolute":
+            altitude = (
+                point.altitude_m - source_runway.elevation_m
+                if point.altitude_m is not None
+                else 0.0
+            )
+        elif track.altitude_mode == "relativeToGround":
+            altitude = point.altitude_m if point.altitude_m is not None else 0.0
+        elif track.altitude_mode == "clampToGround":
+            altitude = 0.0
+        else:
+            raise ValueError(
+                f'KML altitude mode "{track.altitude_mode}" cannot be converted '
+                "safely to relative-to-ground output."
+            )
+        waypoints.append((point.latitude, point.longitude, altitude))
+    return waypoints
 
 
 def _failure_outcome(
@@ -444,10 +459,7 @@ def _failure_outcome(
 
 def _run_transposition_plan(
     plan: TranspositionPlan,
-    target_lat: float,
-    target_lon: float,
-    target_heading: float,
-    ground_reference_elevation: float,
+    target_runway: RunwayReference,
 ) -> TranspositionBatchResult:
     outcomes: list[TranspositionFileOutcome] = []
 
@@ -463,14 +475,16 @@ def _run_transposition_plan(
             continue
 
         try:
-            waypoints = _waypoints_for_transposition(track, ground_reference_elevation)
-            rotated_waypoints = rotate_route(
-                waypoints, target_lat, target_lon, target_heading
+            if job.source_runway is None:
+                raise ValueError(
+                    "Source runway alignment has not been reviewed for this input."
+                )
+            waypoints = _waypoints_for_transposition(track, job.source_runway)
+            adjusted_waypoints = transpose_geodesic_points(
+                waypoints,
+                job.source_runway,
+                target_runway,
             )
-            adjusted_waypoints = [
-                (lat, lon, elevation - ground_reference_elevation)
-                for lat, lon, elevation in rotated_waypoints
-            ]
         except Exception as error:
             outcomes.append(
                 _failure_outcome(job, output_path, TranspositionErrorCode.TRANSFORMATION, error)
@@ -563,11 +577,13 @@ def run_transposition(
     target_lat: float | None = None,
     target_lon: float | None = None,
     target_heading: float | None = None,
-    ground_reference_elevation: float = 0,
+    ground_reference_elevation: float | None = None,
+    target_runway: RunwayReference | None = None,
+    source_runway: RunwayReference | None = None,
     input_files: Sequence[str | os.PathLike[str]] | None = None,
     output_file: str | os.PathLike[str] | None = None,
 ) -> TranspositionBatchResult:
-    """Run a plan and return an ordered outcome for every planned input.
+    """Run reviewed runway-to-runway jobs and return one outcome per input.
 
     The legacy ``input_files``/``output_file`` invocation is supported for one
     input only and is deprecated; new callers must create a plan first.
@@ -618,16 +634,59 @@ def run_transposition(
         )
         active_plan = _legacy_plan(legacy_inputs, output_file)
 
-    if target_lat is None or target_lon is None or target_heading is None:
-        raise TypeError("target_lat, target_lon, and target_heading are required.")
+    if source_runway is not None:
+        if len(active_plan.jobs) != 1:
+            raise ValueError("source_runway can only be used with one input job.")
+        active_plan = apply_source_runways(active_plan, (source_runway,))
+    if ground_reference_elevation is not None:
+        if len(active_plan.jobs) != 1:
+            raise ValueError(
+                "A shared ground_reference_elevation is not valid for a batch; "
+                "set elevation_m on each source runway."
+            )
+        reviewed_source = active_plan.jobs[0].source_runway
+        if reviewed_source is not None:
+            if reviewed_source.elevation_m is not None:
+                raise TypeError(
+                    "Do not mix ground_reference_elevation with source runway elevation."
+                )
+            warnings.warn(
+                "ground_reference_elevation is deprecated; set elevation_m on the "
+                "source RunwayReference.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            active_plan = apply_source_runways(
+                active_plan,
+                (
+                    RunwayReference(
+                        reviewed_source.latitude,
+                        reviewed_source.longitude,
+                        reviewed_source.true_heading_deg,
+                        float(ground_reference_elevation),
+                    ),
+                ),
+            )
+    if target_runway is not None:
+        if any(value is not None for value in (target_lat, target_lon, target_heading)):
+            raise TypeError("Do not mix target_runway with legacy target coordinates.")
+        resolved_target = target_runway
+    else:
+        if target_lat is None or target_lon is None or target_heading is None:
+            raise TypeError("target_runway is required.")
+        warnings.warn(
+            "target_lat/target_lon/target_heading are deprecated; pass a "
+            "RunwayReference as target_runway.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        resolved_target = RunwayReference(
+            float(target_lat),
+            float(target_lon),
+            float(target_heading),
+        )
     _validate_transposition_plan(active_plan)
-    return _run_transposition_plan(
-        active_plan,
-        float(target_lat),
-        float(target_lon),
-        float(target_heading),
-        float(ground_reference_elevation),
-    )
+    return _run_transposition_plan(active_plan, resolved_target)
 
 
 if __name__ == "__main__":

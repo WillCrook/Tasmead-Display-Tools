@@ -23,14 +23,22 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QTableWidget,
 )
 
 from file_dialog_state import FileDialogDirection, FileDialogWorkflow
 from pages.debris_page import DebrisPage
-from pages.transpose_page import TransposePage, TranspositionOutputDialog
+from pages.transpose_page import (
+    RunwayReviewDialog,
+    TransposePage,
+    TranspositionOutputDialog,
+)
 import resource_paths
 from services import (
     CURRENT_FORMAT_VERSION,
+    KmlPoint,
+    KmlStructureError,
+    KmlTrack,
     Preset,
     PresetDestinationExistsError,
     PresetImportExportService,
@@ -42,6 +50,8 @@ from services import (
     PresetType,
     PresetTypeMismatchError,
     PresetValidationError,
+    RunwayReference,
+    RunwayInferenceResult,
     TranspositionBatchResult,
     TranspositionError,
     TranspositionErrorCode,
@@ -965,7 +975,10 @@ class TransposePagePresetTests(PresetPageTestCase):
         ):
             self.page.save_preset()
 
-        self.assertIn("Target airfield coordinates", warning.call_args.args[2])
+        self.assertIn(
+            "Target departure runway threshold coordinates",
+            warning.call_args.args[2],
+        )
         name_dialog.assert_not_called()
         self.assertEqual(self.page.preset_repository.load_all(), {})
 
@@ -1002,6 +1015,12 @@ class TransposePagePresetTests(PresetPageTestCase):
         self.page.heading_input.setText("90")
         self.page.orig_height_input.setText("38")
 
+    def reviewed_runways(self):
+        return tuple(
+            RunwayReference(51.2, -0.7, 32.0, 38.0)
+            for _ in self.page.input_files
+        )
+
     def test_transposition_uses_editable_plan_persists_location_and_runs(self):
         source = KML_FIXTURES / "line_string_namespaced.kml"
         output_dir = self.root / "outputs"
@@ -1027,6 +1046,11 @@ class TransposePagePresetTests(PresetPageTestCase):
             patch.object(self.page, "_initial_output_directory", return_value=str(self.root)),
             patch.object(
                 self.page,
+                "_review_source_runways",
+                return_value=self.reviewed_runways(),
+            ) as review,
+            patch.object(
+                self.page,
                 "_edit_output_plan",
                 side_effect=lambda plan: plan,
             ) as edit_plan,
@@ -1046,8 +1070,12 @@ class TransposePagePresetTests(PresetPageTestCase):
             "line-string-namespaced-at-airfield.kml",
         )
         self.assertIs(run.call_args.kwargs["plan"], plan)
-        self.assertAlmostEqual(run.call_args.kwargs["target_lat"], 51.27283333333333)
-        self.assertAlmostEqual(run.call_args.kwargs["target_lon"], -0.7920555555555555)
+        target = run.call_args.kwargs["target_runway"]
+        self.assertAlmostEqual(target.latitude, 51.27283333333333)
+        self.assertAlmostEqual(target.longitude, -0.7920555555555555)
+        self.assertEqual(target.true_heading_deg, 90.0)
+        self.assertEqual(plan.jobs[0].source_runway, self.reviewed_runways()[0])
+        review.assert_called_once_with(38.0)
         self.assertEqual(self.page.coordinate_input.text(), "51.27283333, -0.79205556")
         self.dialog_state_mocks["transpose_directory"].assert_called_once_with(
             FileDialogWorkflow.TRANSPOSITION,
@@ -1072,9 +1100,106 @@ class TransposePagePresetTests(PresetPageTestCase):
         ):
             self.page.run_transposition_ui()
 
-        self.assertIn("Target airfield coordinates", warning.call_args.args[2])
+        self.assertIn("Target departure runway threshold coordinates", warning.call_args.args[2])
         folder_dialog.assert_not_called()
         run.assert_not_called()
+
+    def test_cancelled_runway_review_blocks_before_output_folder(self):
+        source = KML_FIXTURES / "line_string_namespaced.kml"
+        self.configure_transposition(source)
+
+        with (
+            patch.object(self.page, "_review_source_runways", return_value=None) as review,
+            patch.object(QFileDialog, "getExistingDirectory") as folder_dialog,
+            patch("pages.transpose_page.run_transposition") as run,
+        ):
+            self.page.run_transposition_ui()
+
+        review.assert_called_once_with(38.0)
+        folder_dialog.assert_not_called()
+        run.assert_not_called()
+
+    def test_non_finite_heading_is_rejected_before_runway_review(self):
+        source = KML_FIXTURES / "line_string_namespaced.kml"
+        self.configure_transposition(source)
+        self.page.heading_input.setText("nan")
+
+        with (
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(self.page, "_review_source_runways") as review,
+        ):
+            self.page.run_transposition_ui()
+
+        self.assertIn("finite numeric", warning.call_args.args[2])
+        review.assert_not_called()
+
+    def test_runway_review_requires_manual_values_when_inference_has_no_candidate(self):
+        track = KmlTrack(
+            points=(KmlPoint(51.0, -1.0, 100.0), KmlPoint(51.1, -0.9, 120.0)),
+            geometry_kind="line_string",
+            placemark_name="Manual",
+            altitude_mode="absolute",
+        )
+        inference = RunwayInferenceResult(
+            candidate=None,
+            error="No sustained straight departure segment could be inferred.",
+        )
+        with (
+            patch("pages.transpose_page.parse_kml_track", return_value=track),
+            patch("pages.transpose_page.infer_departure_runway", return_value=inference),
+        ):
+            dialog = RunwayReviewDialog(("manual.kml",), parent=self.page)
+
+        dialog._validate_and_accept()
+        self.assertIn("could not convert", dialog.error_label.text())
+        latitude, longitude, heading, elevation = dialog._rows[0]["edits"]
+        latitude.setText("51")
+        longitude.setText("-1")
+        heading.setText("450")
+        elevation.setText("100")
+        dialog._validate_and_accept()
+
+        self.assertEqual(dialog.reviewed_runways[0].true_heading_deg, 90.0)
+        self.assertEqual(dialog.reviewed_runways[0].elevation_m, 100.0)
+        dialog.close()
+
+    def test_runway_review_labels_elevation_as_kml_ground_reference(self):
+        track = KmlTrack(
+            points=(KmlPoint(51.0, -1.0, 100.0), KmlPoint(51.1, -0.9, 120.0)),
+            geometry_kind="line_string",
+            placemark_name="Manual",
+            altitude_mode="absolute",
+        )
+        inference = RunwayInferenceResult(candidate=None, error="Manual review")
+        with (
+            patch("pages.transpose_page.parse_kml_track", return_value=track),
+            patch("pages.transpose_page.infer_departure_runway", return_value=inference),
+        ):
+            dialog = RunwayReviewDialog(("manual.kml",), parent=self.page)
+
+        table = dialog.findChild(QTableWidget)
+        instruction_text = " ".join(
+            label.text() for label in dialog.findChildren(QLabel)
+        )
+        self.assertEqual(
+            table.horizontalHeaderItem(4).text(),
+            "Ground reference elevation (m)",
+        )
+        self.assertIn("KML-derived suggestions", instruction_text)
+        self.assertIn("not surveyed", instruction_text)
+        dialog.close()
+
+    def test_runway_review_keeps_geometryless_input_as_failed_alignment(self):
+        with patch(
+            "pages.transpose_page.parse_kml_track",
+            side_effect=KmlStructureError("No path geometry"),
+        ):
+            dialog = RunwayReviewDialog(("telemetry-only.kml",), parent=self.page)
+
+        dialog._validate_and_accept()
+
+        self.assertEqual(dialog.reviewed_runways, (None,))
+        dialog.close()
 
     def test_cancelled_name_editor_writes_nothing_but_remembers_selected_folder(self):
         source = KML_FIXTURES / "line_string_namespaced.kml"
@@ -1083,6 +1208,11 @@ class TransposePagePresetTests(PresetPageTestCase):
         self.configure_transposition(source)
 
         with (
+            patch.object(
+                self.page,
+                "_review_source_runways",
+                return_value=self.reviewed_runways(),
+            ),
             patch.object(
                 QFileDialog,
                 "getExistingDirectory",
@@ -1139,6 +1269,11 @@ class TransposePagePresetTests(PresetPageTestCase):
 
         with (
             patch.object(
+                self.page,
+                "_review_source_runways",
+                return_value=self.reviewed_runways(),
+            ),
+            patch.object(
                 QFileDialog,
                 "getExistingDirectory",
                 return_value=str(output_dir),
@@ -1176,6 +1311,11 @@ class TransposePagePresetTests(PresetPageTestCase):
         result = TranspositionBatchResult(outcomes=(failure,))
 
         with (
+            patch.object(
+                self.page,
+                "_review_source_runways",
+                return_value=self.reviewed_runways(),
+            ),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
             patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
             patch("pages.transpose_page.run_transposition", return_value=result),

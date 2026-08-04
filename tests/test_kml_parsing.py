@@ -22,6 +22,8 @@ from services import (
     KmlStructureError,
     KmlTrack,
     KmlXmlError,
+    RunwayReference,
+    apply_source_runways,
     load_last_two_points_from_kml,
     parse_kml,
     parse_kml_track,
@@ -73,6 +75,11 @@ class KmlParserTests(unittest.TestCase):
             [(point.latitude, point.longitude, point.altitude_m) for point in track.points],
             [(51.2, -0.7, 100.0), (51.3, -0.6, 125.0)],
         )
+        self.assertEqual(
+            [point.timestamp for point in track.points],
+            ["2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"],
+        )
+        self.assertEqual(track.altitude_mode, "clampToGround")
 
     def test_multiple_supported_geometries_are_not_concatenated(self):
         with self.assertRaises(KmlStructureError) as raised:
@@ -137,18 +144,29 @@ class TranspositionKmlTests(unittest.TestCase):
     def fixture(self, name):
         return FIXTURES / name
 
-    def test_both_supported_geometry_types_reach_existing_rotation_contract(self):
+    def reviewed_plan(self, plan, elevation=0.0):
+        runway = RunwayReference(51.2, -0.7, 32.0, elevation)
+        return apply_source_runways(plan, (runway,) * len(plan.jobs))
+
+    def run_plan(self, plan, elevation=0.0):
+        plan = self.reviewed_plan(plan, elevation)
+        return run_transposition(
+            plan,
+            target_runway=RunwayReference(51.0, -1.0, 90.0),
+        )
+
+    def test_both_supported_geometry_types_reach_geodesic_contract(self):
         cases = [
-            ("line_string_namespaced.kml", [(51.2, -0.7, 100.0), (51.3, -0.6, 125.0)]),
-            ("gx_track.kml", [(51.2, -0.7, 100.0), (51.3, -0.6, 125.0)]),
+            ("line_string_namespaced.kml", ((51.2, -0.7, 0.0), (51.3, -0.6, 0.0))),
+            ("gx_track.kml", ((51.2, -0.7, 0.0), (51.3, -0.6, 0.0))),
         ]
         for filename, expected in cases:
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temp_dir:
                 with (
                     patch(
-                        "services.transpose_coordinates.rotate_route",
-                        side_effect=lambda waypoints, *_: waypoints,
-                    ) as rotate,
+                        "services.transpose_coordinates.transpose_geodesic_points",
+                        side_effect=lambda waypoints, *_: tuple(waypoints),
+                    ) as transpose,
                     patch("services.transpose_coordinates.write_kml") as write,
                 ):
                     plan = create_transposition_plan(
@@ -156,11 +174,10 @@ class TranspositionKmlTests(unittest.TestCase):
                         temp_dir,
                         "RAF Fairford",
                     )
+                    plan = self.reviewed_plan(plan)
                     result = run_transposition(
                         plan,
-                        target_lat=51.0,
-                        target_lon=-1.0,
-                        target_heading=90.0,
+                        target_runway=RunwayReference(51.0, -1.0, 90.0),
                     )
 
                 self.assertTrue(result.succeeded)
@@ -168,16 +185,16 @@ class TranspositionKmlTests(unittest.TestCase):
                     plan.jobs[0].output_path.name,
                     f"{Path(filename).stem.replace('_', '-')}-at-raf-fairford.kml",
                 )
-                self.assertEqual(rotate.call_args.args[0], expected)
+                self.assertEqual(transpose.call_args.args[0], list(expected))
                 self.assertEqual(write.call_args.args[1], expected)
 
-    def test_missing_altitude_uses_source_elevation_then_outputs_zero_relative_height(self):
+    def test_missing_clamped_altitude_outputs_zero_relative_height(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch(
-                    "services.transpose_coordinates.rotate_route",
-                    side_effect=lambda waypoints, *_: waypoints,
-                ) as rotate,
+                    "services.transpose_coordinates.transpose_geodesic_points",
+                    side_effect=lambda waypoints, *_: tuple(waypoints),
+                ) as transpose,
                 patch("services.transpose_coordinates.write_kml") as write,
             ):
                 plan = create_transposition_plan(
@@ -185,28 +202,26 @@ class TranspositionKmlTests(unittest.TestCase):
                     temp_dir,
                     "Field",
                 )
+                plan = self.reviewed_plan(plan, elevation=125.0)
                 result = run_transposition(
                     plan,
-                    target_lat=51.0,
-                    target_lon=-1.0,
-                    target_heading=90.0,
-                    ground_reference_elevation=125.0,
+                    target_runway=RunwayReference(51.0, -1.0, 90.0),
                 )
 
         self.assertTrue(result.succeeded)
         self.assertEqual(
-            rotate.call_args.args[0],
-            [(51.2, -0.7, 125.0), (51.3, -0.6, 125.0)],
+            transpose.call_args.args[0],
+            [(51.2, -0.7, 0.0), (51.3, -0.6, 0.0)],
         )
         self.assertEqual(
             write.call_args.args[1],
-            [(51.2, -0.7, 0.0), (51.3, -0.6, 0.0)],
+            ((51.2, -0.7, 0.0), (51.3, -0.6, 0.0)),
         )
 
     def test_parse_error_is_a_failed_outcome_without_rotation_or_write(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
-                patch("services.transpose_coordinates.rotate_route") as rotate,
+                patch("services.transpose_coordinates.transpose_geodesic_points") as transpose,
                 patch("services.transpose_coordinates.write_kml") as write,
             ):
                 plan = create_transposition_plan(
@@ -214,19 +229,33 @@ class TranspositionKmlTests(unittest.TestCase):
                     temp_dir,
                     "Field",
                 )
-                result = run_transposition(
-                    plan,
-                    target_lat=51.0,
-                    target_lon=-1.0,
-                    target_heading=90.0,
-                )
+                result = self.run_plan(plan)
 
         self.assertTrue(result.failed)
         self.assertEqual(result.failure_count, 1)
         self.assertEqual(result.failed_outcomes[0].error.code, TranspositionErrorCode.INPUT_KML)
         self.assertIn("must contain longitude,latitude", result.failed_outcomes[0].error.message)
-        rotate.assert_not_called()
+        transpose.assert_not_called()
         write.assert_not_called()
+
+    def test_programmatic_run_without_reviewed_source_alignment_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [self.fixture("line_string_namespaced.kml")],
+                temp_dir,
+                "Field",
+            )
+            result = run_transposition(
+                plan,
+                target_runway=RunwayReference(51.0, -1.0, 90.0),
+            )
+
+        self.assertTrue(result.failed)
+        self.assertEqual(
+            result.failed_outcomes[0].error.code,
+            TranspositionErrorCode.TRANSFORMATION,
+        )
+        self.assertIn("has not been reviewed", result.failed_outcomes[0].error.message)
 
     def test_naming_normalizes_components_fallbacks_extensions_and_length(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -311,10 +340,10 @@ class TranspositionKmlTests(unittest.TestCase):
             plan.jobs[0].output_path.write_text("appeared later", encoding="utf-8")
 
             with patch(
-                "services.transpose_coordinates.rotate_route",
-                side_effect=lambda waypoints, *_: waypoints,
+                "services.transpose_coordinates.transpose_geodesic_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
-                result = run_transposition(plan, 51.0, -1.0, 90.0)
+                result = self.run_plan(plan)
 
             self.assertTrue(result.failed)
             self.assertEqual(
@@ -344,10 +373,10 @@ class TranspositionKmlTests(unittest.TestCase):
             )
 
             with patch(
-                "services.transpose_coordinates.rotate_route",
-                side_effect=lambda waypoints, *_: waypoints,
+                "services.transpose_coordinates.transpose_geodesic_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
-                result = run_transposition(plan, 51.0, -1.0, 90.0)
+                result = self.run_plan(plan)
 
             self.assertTrue(result.succeeded)
             self.assertEqual(result.successful[0].output_path, destination)
@@ -364,10 +393,10 @@ class TranspositionKmlTests(unittest.TestCase):
                 "RAF Fairford",
             )
             with patch(
-                "services.transpose_coordinates.rotate_route",
-                side_effect=lambda waypoints, *_: waypoints,
+                "services.transpose_coordinates.transpose_geodesic_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
-                result = run_transposition(plan, 51.0, -1.0, 90.0)
+                result = self.run_plan(plan)
 
             self.assertTrue(result.succeeded)
             self.assertEqual(
@@ -393,10 +422,10 @@ class TranspositionKmlTests(unittest.TestCase):
                 "Field",
             )
             with patch(
-                "services.transpose_coordinates.rotate_route",
-                side_effect=lambda waypoints, *_: waypoints,
+                "services.transpose_coordinates.transpose_geodesic_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
-                result = run_transposition(plan, 51.0, -1.0, 90.0)
+                result = self.run_plan(plan)
 
             self.assertTrue(result.partially_succeeded)
             self.assertEqual(result.success_count, 2)
@@ -418,7 +447,7 @@ class TranspositionKmlTests(unittest.TestCase):
                 temp_dir,
                 "Field",
             )
-            result = run_transposition(plan, 51.0, -1.0, 90.0)
+            result = self.run_plan(plan)
 
         self.assertTrue(result.failed)
         self.assertFalse(result.succeeded)
@@ -444,15 +473,15 @@ class TranspositionKmlTests(unittest.TestCase):
 
             with (
                 patch(
-                    "services.transpose_coordinates.rotate_route",
-                    side_effect=lambda waypoints, *_: waypoints,
+                    "services.transpose_coordinates.transpose_geodesic_points",
+                    side_effect=lambda waypoints, *_: tuple(waypoints),
                 ),
                 patch(
                     "services.transpose_coordinates.write_kml",
                     side_effect=fail_first_write,
                 ),
             ):
-                result = run_transposition(plan, 51.0, -1.0, 90.0)
+                result = self.run_plan(plan)
 
             self.assertTrue(result.partially_succeeded)
             self.assertEqual(result.failed_outcomes[0].error.code, TranspositionErrorCode.FILESYSTEM_WRITE)
@@ -467,7 +496,7 @@ class TranspositionKmlTests(unittest.TestCase):
                 "services.transpose_coordinates.parse_kml_track",
                 side_effect=RuntimeError("internal details"),
             ):
-                result = run_transposition(plan, 51.0, -1.0, 90.0)
+                result = self.run_plan(plan)
 
         error = result.failed_outcomes[0].error
         self.assertEqual(error.exception_type, "RuntimeError")
@@ -477,8 +506,8 @@ class TranspositionKmlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "legacy.kml"
             with patch(
-                "services.transpose_coordinates.rotate_route",
-                side_effect=lambda waypoints, *_: waypoints,
+                "services.transpose_coordinates.transpose_geodesic_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
             ), self.assertWarns(DeprecationWarning):
                 result = run_transposition(
                     [self.fixture("line_string_namespaced.kml")],
@@ -486,6 +515,7 @@ class TranspositionKmlTests(unittest.TestCase):
                     51.0,
                     -1.0,
                     90.0,
+                    source_runway=RunwayReference(51.2, -0.7, 32.0, 0.0),
                 )
             self.assertTrue(result.succeeded)
             self.assertTrue(output.is_file())
@@ -497,6 +527,7 @@ class TranspositionKmlTests(unittest.TestCase):
                     51.0,
                     -1.0,
                     90.0,
+                    source_runway=RunwayReference(51.2, -0.7, 32.0, 0.0),
                 )
 
     def test_failed_write_removes_the_incomplete_output(self):

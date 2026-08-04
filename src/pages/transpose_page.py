@@ -1,4 +1,6 @@
 from collections.abc import Mapping
+import math
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -13,8 +15,9 @@ from file_dialog_state import (
 )
 from resource_paths import app_data_path, resource_path
 from services import (
-    CoordinateInputError, PresetType, create_transposition_plan,
-    customize_transposition_plan, run_transposition,
+    CoordinateInputError, PresetType, RunwayReference, apply_source_runways,
+    create_transposition_plan, customize_transposition_plan,
+    infer_departure_runway, parse_kml_track, run_transposition,
 )
 from pages.coordinate_input import CoordinatePairInput
 from pages.preset_ui import PresetPanelLabels, PresetUiMixin
@@ -96,6 +99,172 @@ class TranspositionOutputDialog(QDialog):
         self.accept()
 
 
+class RunwayReviewDialog(QDialog):
+    """Require confirmation of one inferred departure alignment per input."""
+
+    def __init__(self, input_files, fallback_elevation_m=None, parent=None):
+        super().__init__(parent)
+        self.reviewed_runways = None
+        self._rows = []
+        self.setWindowTitle("Review Source Departure Runways")
+        self.resize(1120, min(680, 230 + len(input_files) * 62))
+
+        layout = QVBoxLayout(self)
+        instruction = QLabel(
+            "Review every inferred departure threshold, true heading, and source "
+            "ground-reference elevation. These are KML-derived suggestions, not "
+            "surveyed or confirmed runway data."
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+
+        table = QTableWidget(len(input_files), 7, self)
+        table.setHorizontalHeaderLabels(
+            (
+                "Input KML",
+                "Threshold latitude",
+                "Threshold longitude",
+                "True heading (°)",
+                "Ground reference elevation (m)",
+                "Heading / threshold confidence",
+                "Evidence / warnings",
+            )
+        )
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setAlternatingRowColors(True)
+
+        for row, input_file in enumerate(input_files):
+            path = Path(input_file)
+            input_item = QTableWidgetItem(path.name)
+            input_item.setToolTip(str(path))
+            input_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 0, input_item)
+
+            parsed_track = None
+            inference = None
+            parse_error = None
+            try:
+                parsed_track = parse_kml_track(path)
+                inference = infer_departure_runway(
+                    parsed_track,
+                    fallback_elevation_m=fallback_elevation_m,
+                )
+            except Exception as error:
+                parse_error = str(error)
+
+            candidate = inference.candidate if inference is not None else None
+            reference = candidate.reference if candidate is not None else None
+            edits = []
+            initial_values = (
+                f"{reference.latitude:.8f}" if reference else "",
+                f"{reference.longitude:.8f}" if reference else "",
+                f"{reference.true_heading_deg:.2f}" if reference else "",
+                (
+                    f"{reference.elevation_m:.2f}"
+                    if reference is not None and reference.elevation_m is not None
+                    else f"{fallback_elevation_m:.2f}"
+                    if parsed_track is not None
+                    and parsed_track.altitude_mode == "absolute"
+                    and fallback_elevation_m is not None
+                    else ""
+                ),
+            )
+            for column, value in enumerate(initial_values, start=1):
+                edit = QLineEdit(value)
+                edit.setAccessibleName(
+                    f"{table.horizontalHeaderItem(column).text()} for {path.name}"
+                )
+                if parse_error is not None:
+                    edit.setEnabled(False)
+                table.setCellWidget(row, column, edit)
+                edits.append(edit)
+
+            if parse_error is not None:
+                confidence_text = "Unavailable"
+                notes = parse_error
+            elif candidate is None:
+                confidence_text = "Manual entry required"
+                notes = inference.error or "No runway candidate was inferred."
+                if inference.warnings:
+                    notes += " " + " ".join(inference.warnings)
+            else:
+                confidence_text = (
+                    f"Heading: {candidate.heading_confidence.value.title()}; "
+                    f"threshold: {candidate.threshold_confidence.value.title()}"
+                )
+                notes = "; ".join(candidate.evidence + candidate.warnings)
+            confidence_item = QTableWidgetItem(confidence_text)
+            confidence_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 5, confidence_item)
+            notes_item = QTableWidgetItem(notes)
+            notes_item.setToolTip(notes)
+            notes_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 6, notes_item)
+            self._rows.append(
+                {
+                    "path": path,
+                    "edits": tuple(edits),
+                    "altitude_mode": (
+                        parsed_track.altitude_mode if parsed_track is not None else None
+                    ),
+                    "parse_error": parse_error,
+                }
+            )
+
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+
+        self.error_label = QLabel()
+        self.error_label.setStyleSheet("color: #b00020;")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAccessibleName("Runway review error")
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Confirm Runway Alignments"
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _validate_and_accept(self):
+        reviewed = []
+        for row in self._rows:
+            if row["parse_error"] is not None:
+                reviewed.append(None)
+                continue
+            path = row["path"]
+            latitude_edit, longitude_edit, heading_edit, elevation_edit = row["edits"]
+            try:
+                latitude = float(latitude_edit.text())
+                longitude = float(longitude_edit.text())
+                heading = float(heading_edit.text())
+                elevation_text = elevation_edit.text().strip()
+                elevation = float(elevation_text) if elevation_text else None
+                if row["altitude_mode"] == "absolute" and elevation is None:
+                    raise ValueError(
+                        "source elevation is required for absolute-altitude KML"
+                    )
+                reference = RunwayReference(
+                    latitude=latitude,
+                    longitude=longitude,
+                    true_heading_deg=heading,
+                    elevation_m=elevation,
+                )
+            except ValueError as error:
+                self.error_label.setText(f"{path.name}: {error}")
+                return
+            reviewed.append(reference)
+        self.error_label.clear()
+        self.reviewed_runways = tuple(reviewed)
+        self.accept()
+
+
 class TransposePage(PresetUiMixin, QWidget):
 
     def __init__(self):
@@ -156,8 +325,8 @@ class TransposePage(PresetUiMixin, QWidget):
         self.build_file_panel(file_layout)
 
     def build_config_panel(self, layout):
-        # Original Airfield Height Section
-        orig_title = QLabel("Original Airfield")
+        # Backward-compatible fallback for legacy airfield presets.
+        orig_title = QLabel("Source Runway Fallback")
         orig_title.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(orig_title)
 
@@ -165,14 +334,14 @@ class TransposePage(PresetUiMixin, QWidget):
         self.orig_height_input.setPlaceholderText("Elevation (m)")
 
         m_layout = QVBoxLayout()
-        m_layout.addWidget(QLabel("Original Elevation (m)"))
+        m_layout.addWidget(QLabel("Fallback Elevation (m)"))
         m_layout.addWidget(self.orig_height_input)
 
         self.orig_height_ft_input = QLineEdit()
         self.orig_height_ft_input.setPlaceholderText("Elevation (ft)")
 
         ft_layout = QVBoxLayout()
-        ft_layout.addWidget(QLabel("Original Elevation (ft)"))
+        ft_layout.addWidget(QLabel("Fallback Elevation (ft)"))
         ft_layout.addWidget(self.orig_height_ft_input)
         
         # Container for both
@@ -199,13 +368,15 @@ class TransposePage(PresetUiMixin, QWidget):
         layout.addWidget(QLabel("Airfield Name"))
         layout.addWidget(self.airfield_name_input)
 
-        self.coordinate_input = CoordinatePairInput("Target airfield coordinates")
-        layout.addWidget(QLabel("Coordinates (Latitude, Longitude)"))
+        self.coordinate_input = CoordinatePairInput(
+            "Target departure runway threshold coordinates"
+        )
+        layout.addWidget(QLabel("Departure Threshold (Latitude, Longitude)"))
         layout.addWidget(self.coordinate_input)
 
         self.heading_input = QLineEdit()
-        self.heading_input.setPlaceholderText("Rotation (degrees)")
-        layout.addWidget(QLabel("Rotation"))
+        self.heading_input.setPlaceholderText("True heading (0–360°)")
+        layout.addWidget(QLabel("Target Runway True Heading (°)"))
         layout.addWidget(self.heading_input)
 
         layout.addStretch()
@@ -373,19 +544,41 @@ class TransposePage(PresetUiMixin, QWidget):
             return
         try:
             heading = float(self.heading_input.text())
+            if not math.isfinite(heading):
+                raise ValueError
         except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please enter a valid numeric Heading.")
+            QMessageBox.warning(
+                self,
+                "Invalid Input",
+                "Please enter a finite numeric target runway true heading.",
+            )
             return
 
         # Get Original Height
         try:
             orig_height_text = self.orig_height_input.text()
             if not orig_height_text:
-                orig_height = 0.0
+                orig_height = None
             else:
                 orig_height = float(orig_height_text)
+                if not math.isfinite(orig_height):
+                    raise ValueError
         except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please enter a valid numeric value for Original Height.")
+            QMessageBox.warning(
+                self,
+                "Invalid Input",
+                "Please enter a finite numeric fallback source elevation.",
+            )
+            return
+
+        target_runway = RunwayReference(
+            latitude=coordinate.latitude,
+            longitude=coordinate.longitude,
+            true_heading_deg=heading,
+        )
+        self.heading_input.setText(f"{target_runway.true_heading_deg:g}")
+        reviewed_runways = self._review_source_runways(orig_height)
+        if reviewed_runways is None:
             return
 
         output_dir = QFileDialog.getExistingDirectory(
@@ -407,6 +600,7 @@ class TransposePage(PresetUiMixin, QWidget):
                 output_directory=output_dir,
                 target_airfield=self.airfield_name_input.text(),
             )
+            plan = apply_source_runways(plan, reviewed_runways)
         except Exception as error:
             QMessageBox.critical(self, "Error", f"Could not plan outputs: {error}")
             return
@@ -418,10 +612,7 @@ class TransposePage(PresetUiMixin, QWidget):
         try:
             result = run_transposition(
                 plan=plan,
-                target_lat=coordinate.latitude,
-                target_lon=coordinate.longitude,
-                target_heading=heading,
-                ground_reference_elevation=orig_height,
+                target_runway=target_runway,
             )
         except Exception as error:
             QMessageBox.critical(self, "Error", f"Transposition failed: {error}")
@@ -468,6 +659,16 @@ class TransposePage(PresetUiMixin, QWidget):
             FileDialogWorkflow.TRANSPOSITION,
             FileDialogDirection.OUTPUT,
         )
+
+    def _review_source_runways(self, fallback_elevation_m):
+        dialog = RunwayReviewDialog(
+            self.input_files,
+            fallback_elevation_m=fallback_elevation_m,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.reviewed_runways
 
     def _edit_output_plan(self, plan):
         dialog = TranspositionOutputDialog(plan, self)

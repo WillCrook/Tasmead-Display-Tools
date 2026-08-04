@@ -37,6 +37,7 @@ class KmlPoint:
     latitude: float
     longitude: float
     altitude_m: float | None
+    timestamp: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class KmlTrack:
     points: tuple[KmlPoint, ...]
     geometry_kind: Literal["line_string", "gx_track"]
     placemark_name: str | None
+    altitude_mode: str = "clampToGround"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,11 +165,47 @@ def _parse_line_string(
     return tuple(points)
 
 
+def _altitude_mode(
+    path: Path,
+    candidate: _TrackCandidate,
+    namespace: str,
+) -> str:
+    supported = {
+        "absolute",
+        "relativeToGround",
+        "clampToGround",
+        "relativeToSeaFloor",
+        "clampToSeaFloor",
+    }
+    tags = {
+        _qualified(namespace, "altitudeMode"),
+        _qualified(GX_NAMESPACE, "altitudeMode"),
+    }
+    for child in candidate.element:
+        if child.tag in tags and child.text:
+            value = child.text.strip()
+            if value in supported:
+                return value
+            raise KmlStructureError(
+                f'{_context(path, candidate)}: unsupported altitude mode "{value}".'
+            )
+    return "clampToGround"
+
+
 def _parse_gx_track(path: Path, candidate: _TrackCandidate) -> tuple[KmlPoint, ...]:
     coord_tag = _qualified(GX_NAMESPACE, "coord")
     elements = [child for child in candidate.element if child.tag == coord_tag]
     if not elements:
         raise KmlCoordinateError(f"{_context(path, candidate)}: gx:Track contains no gx:coord elements.")
+
+    when_tags = {_qualified(KML_NAMESPACE, "when"), "when"}
+    timestamps = [
+        child.text.strip() if child.text and child.text.strip() else None
+        for child in candidate.element
+        if child.tag in when_tags
+    ]
+    if len(timestamps) != len(elements):
+        timestamps = [None] * len(elements)
 
     points: list[KmlPoint] = []
     for index, element in enumerate(elements, start=1):
@@ -182,7 +220,15 @@ def _parse_gx_track(path: Path, candidate: _TrackCandidate) -> tuple[KmlPoint, .
             raise KmlCoordinateError(
                 f'{_context(path, candidate, index)}: "{text}" must contain longitude latitude altitude.'
             )
-        points.append(_make_point(values, path, candidate, index))
+        point = _make_point(values, path, candidate, index)
+        points.append(
+            KmlPoint(
+                latitude=point.latitude,
+                longitude=point.longitude,
+                altitude_m=point.altitude_m,
+                timestamp=timestamps[index - 1],
+            )
+        )
     return tuple(points)
 
 
@@ -253,6 +299,7 @@ def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
         points=points,
         geometry_kind=candidate.geometry_kind,
         placemark_name=candidate.placemark_name,
+        altitude_mode=_altitude_mode(path, candidate, namespace),
     )
 
 

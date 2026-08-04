@@ -38,6 +38,16 @@ from .kml_export import (
     export_kml,
     render_kml,
 )
+from .runway_alignment import (
+    RunwayCandidate,
+    RunwayConfidence,
+    RunwayInferenceResult,
+    RunwayReference,
+    destination_point,
+    infer_departure_runway,
+    inverse_distance_bearing,
+    transpose_geodesic_points,
+)
 from .preset_filenames import canonical_filename, canonical_stem, readable_export_filename
 from .preset_model import (
     CURRENT_FORMAT_VERSION,
@@ -73,6 +83,7 @@ from .transpose_coordinates import (
     TranspositionJob,
     TranspositionOutput,
     TranspositionPlan,
+    apply_source_runways,
     create_transposition_plan,
     customize_transposition_plan,
     run_transposition,
@@ -116,6 +127,10 @@ __all__ = [
     "PresetType",
     "PresetTypeMismatchError",
     "PresetValidationError",
+    "RunwayCandidate",
+    "RunwayConfidence",
+    "RunwayInferenceResult",
+    "RunwayReference",
     "SimulationCancelled",
     "SimulationPhase",
     "SimulationProgress",
@@ -131,11 +146,15 @@ __all__ = [
     "UnsafePresetPathError",
     "canonical_filename",
     "canonical_stem",
+    "apply_source_runways",
     "create_transposition_plan",
     "customize_transposition_plan",
+    "destination_point",
     "export_kml",
     "format_coordinate_pair",
     "format_coordinate_value",
+    "infer_departure_runway",
+    "inverse_distance_bearing",
     "load_last_two_points_from_kml",
     "parse_kml",
     "parse_kml_track",
@@ -144,4 +163,5 @@ __all__ = [
     "render_kml",
     "run_debris_simulation_request",
     "run_transposition",
+    "transpose_geodesic_points",
 ]
