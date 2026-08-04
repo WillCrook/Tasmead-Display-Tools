@@ -37,6 +37,7 @@ class TranspositionJob:
     aircraft_name: str
     aircraft_slug: str
     target_airfield_slug: str
+    overwrite_existing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +229,60 @@ def create_transposition_plan(
     return TranspositionPlan(output_directory=output_dir, jobs=tuple(jobs))
 
 
+def _normalized_output_filename(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("Each output filename must be text.")
+    filename = value.strip()
+    if not filename:
+        raise ValueError("Output filenames cannot be empty.")
+    if filename in {".", ".."} or "/" in filename or "\\" in filename:
+        raise ValueError(f'Output filename must not contain a folder: "{value}".')
+    if any(character in filename for character in '<>:"|?*\0'):
+        raise ValueError(f'Output filename contains an unsupported character: "{value}".')
+    if not filename.lower().endswith(".kml"):
+        filename = f"{filename}.kml"
+    if len(filename) > 255:
+        raise ValueError("Output filenames must be 255 characters or fewer.")
+    return filename
+
+
+def customize_transposition_plan(
+    plan: TranspositionPlan,
+    output_filenames: Sequence[str],
+    approved_overwrites: Sequence[str | os.PathLike[str]] = (),
+) -> TranspositionPlan:
+    """Return a plan using exact, validated output filenames in job order."""
+    if len(output_filenames) != len(plan.jobs):
+        raise ValueError("Provide exactly one output filename for each input KML file.")
+
+    filenames = tuple(_normalized_output_filename(value) for value in output_filenames)
+    folded_names = [filename.casefold() for filename in filenames]
+    if len(set(folded_names)) != len(folded_names):
+        raise ValueError("Output filenames must be unique, ignoring letter case.")
+
+    approved = {
+        Path(path).resolve(strict=False) for path in approved_overwrites
+    }
+    output_paths = tuple(plan.output_directory / filename for filename in filenames)
+    planned_paths = {path.resolve(strict=False) for path in output_paths}
+    unknown_approvals = approved - planned_paths
+    if unknown_approvals:
+        raise ValueError("Overwrite approval includes a file outside this output plan.")
+
+    jobs = tuple(
+        TranspositionJob(
+            input_path=job.input_path,
+            output_path=output_path,
+            aircraft_name=job.aircraft_name,
+            aircraft_slug=job.aircraft_slug,
+            target_airfield_slug=job.target_airfield_slug,
+            overwrite_existing=output_path.resolve(strict=False) in approved,
+        )
+        for job, output_path in zip(plan.jobs, output_paths, strict=True)
+    )
+    return TranspositionPlan(output_directory=plan.output_directory, jobs=jobs)
+
+
 # def fetch_single_elevation(coordinate):
 #     """
 #     Fetch the ground elevation for a single (lat, lon) coordinate.
@@ -298,7 +353,7 @@ def rotate_route(waypoints, target_lat, target_lon, target_heading):
     return rotated_waypoints
 
 
-def write_kml(file_path, coordinates, name_of_aircraft):
+def write_kml(file_path, coordinates, name_of_aircraft, *, overwrite=False):
     """Create a collision-safe, Google Earth-ready transposed KML output."""
     document = KmlDocument(
         name=f"{name_of_aircraft} Adjusted Coordinates",
@@ -319,7 +374,7 @@ def write_kml(file_path, coordinates, name_of_aircraft):
             ),
         ),
     )
-    export_kml(file_path, document, overwrite=False)
+    export_kml(file_path, document, overwrite=overwrite)
 
 
 def read_config(config_file):
@@ -353,30 +408,6 @@ def _waypoints_for_transposition(
         )
         for point in track.points
     ]
-
-
-def _runtime_collision_path(
-    plan: TranspositionPlan,
-    current_index: int,
-    successful: list[TranspositionOutput],
-) -> Path:
-    current_job = plan.jobs[current_index]
-    occupied_names = {
-        entry.name.casefold() for entry in plan.output_directory.iterdir()
-    }
-    occupied_names.update(
-        job.output_path.name.casefold()
-        for job in plan.jobs[current_index + 1:]
-    )
-    occupied_names.update(
-        output.output_path.name.casefold() for output in successful
-    )
-    return _next_available_output_path(
-        plan.output_directory,
-        current_job.aircraft_slug,
-        current_job.target_airfield_slug,
-        occupied_names,
-    )
 
 
 def _failure_outcome(
@@ -419,9 +450,8 @@ def _run_transposition_plan(
     ground_reference_elevation: float,
 ) -> TranspositionBatchResult:
     outcomes: list[TranspositionFileOutcome] = []
-    successful_outputs: list[TranspositionOutput] = []
 
-    for index, job in enumerate(plan.jobs):
+    for job in plan.jobs:
         output_path = job.output_path
         LOGGER.info("Transposing %s", job.input_path)
         try:
@@ -448,27 +478,22 @@ def _run_transposition_plan(
             continue
 
         try:
-            write_succeeded = False
-            while True:
-                try:
-                    write_kml(output_path, adjusted_waypoints, job.aircraft_name)
-                    write_succeeded = True
-                    break
-                except FileExistsError:
-                    try:
-                        output_path = _runtime_collision_path(
-                            plan, index, successful_outputs
-                        )
-                    except Exception as error:
-                        outcomes.append(
-                            _failure_outcome(
-                                job,
-                                output_path,
-                                TranspositionErrorCode.OUTPUT_COLLISION,
-                                error,
-                            )
-                        )
-                        break
+            write_kml(
+                output_path,
+                adjusted_waypoints,
+                job.aircraft_name,
+                overwrite=job.overwrite_existing,
+            )
+        except FileExistsError as error:
+            outcomes.append(
+                _failure_outcome(
+                    job,
+                    output_path,
+                    TranspositionErrorCode.OUTPUT_COLLISION,
+                    error,
+                )
+            )
+            continue
         except Exception as error:
             outcomes.append(
                 _failure_outcome(
@@ -477,11 +502,6 @@ def _run_transposition_plan(
             )
             continue
 
-        if not write_succeeded:
-            continue
-        successful_outputs.append(
-            TranspositionOutput(input_path=job.input_path, output_path=output_path)
-        )
         outcomes.append(
             TranspositionFileOutcome(
                 input_path=job.input_path,
@@ -504,6 +524,9 @@ def _validate_transposition_plan(plan: TranspositionPlan) -> None:
         )
     if any(job.output_path.parent != plan.output_directory for job in plan.jobs):
         raise ValueError("Every planned output must be inside the output directory.")
+    names = [job.output_path.name.casefold() for job in plan.jobs]
+    if len(names) != len(set(names)):
+        raise ValueError("Every planned output filename must be unique.")
 
 
 def _legacy_plan(

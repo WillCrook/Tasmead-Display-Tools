@@ -15,6 +15,7 @@ FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "kml"
 
 from pages.debris_page import DebrisPage
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from file_dialog_state import FileDialogDirection, FileDialogWorkflow
 from services import (
     KmlCoordinateError,
     KmlPoint,
@@ -28,6 +29,7 @@ from services import (
 from services.transpose_coordinates import (
     TranspositionErrorCode,
     create_transposition_plan,
+    customize_transposition_plan,
     run_transposition,
     write_kml,
 )
@@ -269,7 +271,35 @@ class TranspositionKmlTests(unittest.TestCase):
             ["display-at-field-2.kml", "display-at-field-3.kml"],
         )
 
-    def test_runtime_collision_is_renumbered_without_overwriting(self):
+    def test_custom_output_names_are_normalized_and_validated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = create_transposition_plan(
+                [
+                    self.fixture("line_string_namespaced.kml"),
+                    self.fixture("gx_track.kml"),
+                ],
+                root,
+                "Field",
+            )
+            customized = customize_transposition_plan(
+                plan,
+                ("Display route.final", "Second.KML"),
+            )
+
+            self.assertEqual(
+                [job.output_path.name for job in customized.jobs],
+                ["Display route.final.kml", "Second.KML"],
+            )
+            for invalid in (
+                ("", "second.kml"),
+                ("folder/name.kml", "second.kml"),
+                ("same.kml", "SAME.KML"),
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    customize_transposition_plan(plan, invalid)
+
+    def test_runtime_collision_fails_without_overwriting_or_renaming(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plan = create_transposition_plan(
@@ -277,6 +307,7 @@ class TranspositionKmlTests(unittest.TestCase):
                 root,
                 "Field",
             )
+            plan = customize_transposition_plan(plan, ("chosen-name.kml",))
             plan.jobs[0].output_path.write_text("appeared later", encoding="utf-8")
 
             with patch(
@@ -285,16 +316,42 @@ class TranspositionKmlTests(unittest.TestCase):
             ):
                 result = run_transposition(plan, 51.0, -1.0, 90.0)
 
-            self.assertTrue(result.succeeded)
+            self.assertTrue(result.failed)
             self.assertEqual(
-                result.successful[0].output_path.name,
-                "line-string-namespaced-at-field-2.kml",
+                result.failed_outcomes[0].error.code,
+                TranspositionErrorCode.OUTPUT_COLLISION,
             )
             self.assertEqual(
                 plan.jobs[0].output_path.read_text(encoding="utf-8"),
                 "appeared later",
             )
-            self.assertTrue(result.successful[0].output_path.is_file())
+            self.assertFalse((root / "chosen-name-2.kml").exists())
+
+    def test_approved_existing_output_is_atomically_replaced_at_exact_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = create_transposition_plan(
+                [self.fixture("line_string_namespaced.kml")],
+                root,
+                "Field",
+            )
+            destination = root / "chosen-name.kml"
+            destination.write_text("replace me", encoding="utf-8")
+            plan = customize_transposition_plan(
+                plan,
+                (destination.name,),
+                approved_overwrites=(destination,),
+            )
+
+            with patch(
+                "services.transpose_coordinates.rotate_route",
+                side_effect=lambda waypoints, *_: waypoints,
+            ):
+                result = run_transposition(plan, 51.0, -1.0, 90.0)
+
+            self.assertTrue(result.succeeded)
+            self.assertEqual(result.successful[0].output_path, destination)
+            self.assertEqual(len(parse_kml_track(destination).points), 2)
 
     def test_multiple_inputs_write_multiple_distinct_parseable_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -380,10 +437,10 @@ class TranspositionKmlTests(unittest.TestCase):
                 "Field",
             )
 
-            def fail_first_write(path, *args):
+            def fail_first_write(path, *args, **kwargs):
                 if Path(path) == plan.jobs[0].output_path:
                     raise OSError("disk full")
-                return write_kml(path, *args)
+                return write_kml(path, *args, **kwargs)
 
             with (
                 patch(
@@ -503,10 +560,13 @@ class DebrisKmlTests(unittest.TestCase):
         )
         self.app_patch.start()
         self.resource_patch.start()
+        self.remember_patch = patch("pages.debris_page.remember_file_selection")
+        self.remember_selection = self.remember_patch.start()
         self.page = DebrisPage()
 
     def tearDown(self):
         self.page.close()
+        self.remember_patch.stop()
         self.resource_patch.stop()
         self.app_patch.stop()
         self.temp_dir.cleanup()
@@ -530,6 +590,39 @@ class DebrisKmlTests(unittest.TestCase):
                 self.assertEqual(self.page.kml_status_label.text(), "KML ready.")
                 self.assertEqual(self.page.load_kml_btn.text(), "Reload selected KML")
                 self.assertTrue(self.page.load_kml_btn.isEnabled())
+
+    def test_browse_uses_and_remembers_debris_input_directory(self):
+        path = str(self.fixture("line_string_namespaced.kml"))
+        initial = str(Path(self.temp_dir.name) / "remembered-input")
+        self.remember_selection.reset_mock()
+        with (
+            patch(
+                "pages.debris_page.remembered_directory",
+                return_value=initial,
+            ) as remembered,
+            patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                return_value=(path, ""),
+            ) as file_dialog,
+        ):
+            self.page.browse_file(None)
+
+        remembered.assert_called_once_with(
+            FileDialogWorkflow.DEBRIS,
+            FileDialogDirection.INPUT,
+        )
+        file_dialog.assert_called_once_with(
+            self.page,
+            "Open KML",
+            initial,
+            "KML Files (*.kml)",
+        )
+        self.remember_selection.assert_called_once_with(
+            FileDialogWorkflow.DEBRIS,
+            FileDialogDirection.INPUT,
+            path,
+        )
 
     def test_missing_final_altitude_clears_stale_value_and_warns_for_manual_entry(self):
         self.page.alt_m.setText("999")
@@ -657,6 +750,47 @@ class DebrisKmlTests(unittest.TestCase):
             calculator.call_args.kwargs["input_coords_hook"],
             (51.2, -0.7, 51.3, -0.6),
         )
+
+    def test_output_picker_uses_remembered_folder_and_keeps_custom_filename(self):
+        self.page.select_and_parse_kml(
+            self.fixture("line_string_namespaced.kml"),
+            notify=False,
+        )
+        self.page.terrain_m.setText("0")
+        initial = str(Path(self.temp_dir.name) / "debris_trajectory.kml")
+        selected = str(Path(self.temp_dir.name) / "My custom result")
+        self.remember_selection.reset_mock()
+        with (
+            patch(
+                "pages.debris_page.suggested_save_path",
+                return_value=initial,
+            ) as suggestion,
+            patch.object(
+                QFileDialog,
+                "getSaveFileName",
+                return_value=(selected, ""),
+            ) as save_dialog,
+            patch.object(self.page, "run_debris_calculator") as calculator,
+        ):
+            self.page.run_simulation()
+
+        suggestion.assert_called_once_with(
+            FileDialogWorkflow.DEBRIS,
+            "debris_trajectory.kml",
+        )
+        save_dialog.assert_called_once_with(
+            self.page,
+            "Save output KML",
+            initial,
+            "KML Files (*.kml)",
+        )
+        expected = f"{selected}.kml"
+        self.remember_selection.assert_called_once_with(
+            FileDialogWorkflow.DEBRIS,
+            FileDialogDirection.OUTPUT,
+            expected,
+        )
+        self.assertEqual(calculator.call_args.kwargs["output_kml"], expected)
 
 
 if __name__ == "__main__":

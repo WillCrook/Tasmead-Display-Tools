@@ -18,6 +18,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
 )
 
+from file_dialog_state import (
+    FileDialogDirection, FileDialogWorkflow, ensure_extension,
+    remember_file_selection, suggested_save_path,
+)
 from services import (
     PresetError,
     PresetImportExportService,
@@ -57,6 +61,11 @@ class PresetUiMixin:
         backup_directory: str,
     ) -> None:
         self.presets_dir = managed_directory
+        self.preset_dialog_workflow = (
+            FileDialogWorkflow.AIRFIELD_PRESET
+            if preset_type is PresetType.AIRFIELD
+            else FileDialogWorkflow.DEBRIS_PRESET
+        )
         self.preset_repository = PresetRepository(
             managed_directory,
             preset_type,
@@ -326,14 +335,21 @@ class PresetUiMixin:
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Preset",
-            self.preset_transfer.suggested_export_filename(record.preset),
+            suggested_save_path(
+                self.preset_dialog_workflow,
+                self.preset_transfer.suggested_export_filename(record.preset),
+            ),
             "JSON Files (*.json)",
             options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
             return
-        if not path.lower().endswith(".json"):
-            path = f"{path}.json"
+        path = ensure_extension(path, ".json")
+        remember_file_selection(
+            self.preset_dialog_workflow,
+            FileDialogDirection.OUTPUT,
+            path,
+        )
         overwrite = False
         if Path(path).exists():
             answer = QMessageBox.question(

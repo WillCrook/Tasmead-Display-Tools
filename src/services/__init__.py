@@ -67,6 +67,7 @@ from .transpose_coordinates import (
     TranspositionOutput,
     TranspositionPlan,
     create_transposition_plan,
+    customize_transposition_plan,
     run_transposition,
 )
 
@@ -122,6 +123,7 @@ __all__ = [
     "canonical_filename",
     "canonical_stem",
     "create_transposition_plan",
+    "customize_transposition_plan",
     "export_kml",
     "load_last_two_points_from_kml",
     "parse_kml",

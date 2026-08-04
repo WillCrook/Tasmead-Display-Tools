@@ -1,20 +1,101 @@
-import os
 from collections.abc import Mapping
 
-from PyQt6.QtCore import QSettings, QStandardPaths, Qt
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QMessageBox, QPushButton, QSplitter, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from file_dialog_state import (
+    FileDialogDirection, FileDialogWorkflow, remember_directory,
+    remember_file_selection, remembered_directory,
+)
 from resource_paths import app_data_path, resource_path
-from services import PresetType, create_transposition_plan, run_transposition
+from services import (
+    PresetType, create_transposition_plan, customize_transposition_plan,
+    run_transposition,
+)
 from pages.preset_ui import PresetPanelLabels, PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
 
 
+class TranspositionOutputDialog(QDialog):
+    """Edit and validate every output filename in a transposition batch."""
+
+    def __init__(self, plan, parent=None):
+        super().__init__(parent)
+        self._source_plan = plan
+        self.validated_plan = None
+        self.filename_edits = []
+        self.setWindowTitle("Choose Transposition Output Names")
+        self.resize(720, min(560, 190 + len(plan.jobs) * 42))
+
+        layout = QVBoxLayout(self)
+        instruction = QLabel(
+            "Review or change each output filename before saving the batch."
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+
+        folder_label = QLabel(f"Output folder: {plan.output_directory}")
+        folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        folder_label.setWordWrap(True)
+        layout.addWidget(folder_label)
+
+        table = QTableWidget(len(plan.jobs), 2, self)
+        table.setHorizontalHeaderLabels(("Input KML", "Output filename"))
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setAlternatingRowColors(True)
+        for row, job in enumerate(plan.jobs):
+            input_item = QTableWidgetItem(job.input_path.name)
+            input_item.setToolTip(str(job.input_path))
+            input_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            table.setItem(row, 0, input_item)
+
+            filename_edit = QLineEdit(job.output_path.name)
+            filename_edit.setAccessibleName(
+                f"Output filename for {job.input_path.name}"
+            )
+            table.setCellWidget(row, 1, filename_edit)
+            self.filename_edits.append(filename_edit)
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+
+        self.error_label = QLabel()
+        self.error_label.setStyleSheet("color: #b00020;")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAccessibleName("Output filename error")
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def output_filenames(self):
+        return tuple(edit.text() for edit in self.filename_edits)
+
+    def _validate_and_accept(self):
+        try:
+            self.validated_plan = customize_transposition_plan(
+                self._source_plan,
+                self.output_filenames(),
+            )
+        except (TypeError, ValueError) as error:
+            self.error_label.setText(str(error))
+            return
+        self.error_label.clear()
+        self.accept()
+
+
 class TransposePage(PresetUiMixin, QWidget):
-    LAST_OUTPUT_DIRECTORY_KEY = "transpose/last-output-directory"
 
     def __init__(self):
         super().__init__()
@@ -190,8 +271,21 @@ class TransposePage(PresetUiMixin, QWidget):
             self.add_files_to_list(new_files)
 
     def browse_files(self, event=None):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select KML Files", "", "KML Files (*.kml)")
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select KML Files",
+            remembered_directory(
+                FileDialogWorkflow.TRANSPOSITION,
+                FileDialogDirection.INPUT,
+            ),
+            "KML Files (*.kml)",
+        )
         if files:
+            remember_file_selection(
+                FileDialogWorkflow.TRANSPOSITION,
+                FileDialogDirection.INPUT,
+                files[0],
+            )
             self.add_files_to_list(files)
 
     def add_files_to_list(self, files):
@@ -237,11 +331,20 @@ class TransposePage(PresetUiMixin, QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load Preset",
-            self.presets_dir,
+            remembered_directory(
+                FileDialogWorkflow.AIRFIELD_PRESET,
+                FileDialogDirection.INPUT,
+            ),
             "JSON Files (*.json);;All Files (*)",
         )
         if not path:
             return
+
+        remember_file_selection(
+            FileDialogWorkflow.AIRFIELD_PRESET,
+            FileDialogDirection.INPUT,
+            path,
+        )
 
         record = self.import_preset_path(path, error_title="Error")
         if record is not None:
@@ -286,6 +389,11 @@ class TransposePage(PresetUiMixin, QWidget):
         )
         if not output_dir:
             return
+        remember_directory(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.OUTPUT,
+            output_dir,
+        )
 
         try:
             plan = create_transposition_plan(
@@ -297,12 +405,9 @@ class TransposePage(PresetUiMixin, QWidget):
             QMessageBox.critical(self, "Error", f"Could not plan outputs: {error}")
             return
 
-        if not self._confirm_output_plan(plan):
+        plan = self._edit_output_plan(plan)
+        if plan is None:
             return
-
-        settings = QSettings()
-        settings.setValue(self.LAST_OUTPUT_DIRECTORY_KEY, output_dir)
-        settings.sync()
 
         try:
             result = run_transposition(
@@ -353,32 +458,39 @@ class TransposePage(PresetUiMixin, QWidget):
         )
 
     def _initial_output_directory(self):
-        saved_directory = QSettings().value(
-            self.LAST_OUTPUT_DIRECTORY_KEY,
-            "",
-            type=str,
+        return remembered_directory(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.OUTPUT,
         )
-        if saved_directory and os.path.isdir(saved_directory):
-            return saved_directory
 
-        documents_directory = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.DocumentsLocation
-        )
-        if documents_directory and os.path.isdir(documents_directory):
-            return documents_directory
-        return os.getcwd()
+    def _edit_output_plan(self, plan):
+        dialog = TranspositionOutputDialog(plan, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
 
-    def _confirm_output_plan(self, plan):
-        dialog = QMessageBox(self)
-        dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setWindowTitle("Confirm Transposition Outputs")
-        dialog.setText(f"Save {len(plan.jobs)} KML file(s) to this folder?")
-        dialog.setInformativeText(str(plan.output_directory))
-        dialog.setDetailedText(
-            "\n".join(job.output_path.name for job in plan.jobs)
+        candidate = dialog.validated_plan
+        if candidate is None:
+            return None
+        existing_paths = tuple(
+            job.output_path for job in candidate.jobs if job.output_path.exists()
         )
-        dialog.setStandardButtons(
-            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel
+        if not existing_paths:
+            return candidate
+
+        filenames = "\n".join(f"• {path.name}" for path in existing_paths)
+        answer = QMessageBox.question(
+            self,
+            "Replace existing output files?",
+            "The following output files already exist and will be replaced:\n\n"
+            f"{filenames}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
-        dialog.setDefaultButton(QMessageBox.StandardButton.Save)
-        return dialog.exec() == QMessageBox.StandardButton.Save
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+
+        return customize_transposition_plan(
+            candidate,
+            tuple(job.output_path.name for job in candidate.jobs),
+            approved_overwrites=existing_paths,
+        )

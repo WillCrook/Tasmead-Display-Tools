@@ -17,6 +17,7 @@ KML_FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "kml"
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -24,8 +25,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
 )
 
+from file_dialog_state import FileDialogDirection, FileDialogWorkflow
 from pages.debris_page import DebrisPage
-from pages.transpose_page import TransposePage
+from pages.transpose_page import TransposePage, TranspositionOutputDialog
 import resource_paths
 from services import (
     CURRENT_FORMAT_VERSION,
@@ -49,6 +51,7 @@ from services import (
     canonical_filename,
     canonical_stem,
     create_transposition_plan,
+    customize_transposition_plan,
     readable_export_filename,
 )
 
@@ -364,8 +367,20 @@ class PresetPageTestCase(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.app_root = self.root / "app-data"
         self.bundle_root = self.root / "bundle"
+        self.dialog_state_patches = {
+            "debris": patch("pages.debris_page.remember_file_selection"),
+            "transpose_file": patch("pages.transpose_page.remember_file_selection"),
+            "transpose_directory": patch("pages.transpose_page.remember_directory"),
+            "preset": patch("pages.preset_ui.remember_file_selection"),
+        }
+        self.dialog_state_mocks = {
+            name: patcher.start()
+            for name, patcher in self.dialog_state_patches.items()
+        }
 
     def tearDown(self):
+        for patcher in reversed(tuple(self.dialog_state_patches.values())):
+            patcher.stop()
         self.temp_dir.cleanup()
 
     def app_data_path(self, relative):
@@ -428,6 +443,42 @@ class DebrisPagePresetTests(PresetPageTestCase):
         self.assertEqual(UUID(item.data(Qt.ItemDataRole.UserRole)), record.preset.id)
         self.assertTrue(self.page.rename_preset_btn.isEnabled())
         self.assertTrue(self.page.export_preset_btn.isEnabled())
+
+    def test_import_uses_and_remembers_debris_preset_input_directory(self):
+        preset = Preset.create(PresetType.DEBRIS, "Imported", self.data())
+        source = self.root / "external-debris.json"
+        write_preset(source, preset)
+        initial = str(self.root / "remembered-debris-preset-input")
+        self.dialog_state_mocks["debris"].reset_mock()
+        with (
+            patch(
+                "pages.debris_page.remembered_directory",
+                return_value=initial,
+            ) as remembered,
+            patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                return_value=(str(source), ""),
+            ) as file_dialog,
+        ):
+            self.page.load_preset_from_file()
+
+        remembered.assert_called_once_with(
+            FileDialogWorkflow.DEBRIS_PRESET,
+            FileDialogDirection.INPUT,
+        )
+        file_dialog.assert_called_once_with(
+            self.page,
+            "Load Aircraft Preset",
+            initial,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        self.dialog_state_mocks["debris"].assert_called_once_with(
+            FileDialogWorkflow.DEBRIS_PRESET,
+            FileDialogDirection.INPUT,
+            str(source),
+        )
+        self.assertIsNotNone(self.page.preset_repository.get(preset.id))
 
     def test_preset_panel_keeps_exact_visible_text_and_order(self):
         labels = [
@@ -668,9 +719,37 @@ class DebrisPagePresetTests(PresetPageTestCase):
 
         destination = self.root / "Friendly export.json"
         self.select(self.page, record.preset.id)
-        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(destination), "")):
+        initial = str(self.root / "After.json")
+        self.dialog_state_mocks["preset"].reset_mock()
+        with (
+            patch(
+                "pages.preset_ui.suggested_save_path",
+                return_value=initial,
+            ) as suggestion,
+            patch.object(
+                QFileDialog,
+                "getSaveFileName",
+                return_value=(str(destination), ""),
+            ) as save_dialog,
+        ):
             self.page.export_preset()
 
+        suggestion.assert_called_once_with(
+            FileDialogWorkflow.DEBRIS_PRESET,
+            "After.json",
+        )
+        save_dialog.assert_called_once_with(
+            self.page,
+            "Export Preset",
+            initial,
+            "JSON Files (*.json)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        self.dialog_state_mocks["preset"].assert_called_once_with(
+            FileDialogWorkflow.DEBRIS_PRESET,
+            FileDialogDirection.OUTPUT,
+            str(destination),
+        )
         document = json.loads(destination.read_text())
         self.assertEqual(renamed.preset.id, record.preset.id)
         self.assertEqual(renamed.filename, "after.json")
@@ -709,9 +788,36 @@ class TransposePagePresetTests(PresetPageTestCase):
         source = self.root / "not-the-preset-name.json"
         write_preset(source, preset)
 
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+        initial = str(self.root / "remembered-airfield-input")
+        self.dialog_state_mocks["transpose_file"].reset_mock()
+        with (
+            patch(
+                "pages.transpose_page.remembered_directory",
+                return_value=initial,
+            ) as remembered,
+            patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                return_value=(str(source), ""),
+            ) as file_dialog,
+        ):
             self.page.load_preset_from_file()
 
+        remembered.assert_called_once_with(
+            FileDialogWorkflow.AIRFIELD_PRESET,
+            FileDialogDirection.INPUT,
+        )
+        file_dialog.assert_called_once_with(
+            self.page,
+            "Load Preset",
+            initial,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        self.dialog_state_mocks["transpose_file"].assert_called_once_with(
+            FileDialogWorkflow.AIRFIELD_PRESET,
+            FileDialogDirection.INPUT,
+            str(source),
+        )
         self.assertIsNotNone(self.page.preset_repository.get(preset.id))
         self.assertEqual(self.page.airfield_name_input.text(), "Farnborough")
         self.assertEqual(self.page.heading_input.text(), "126")
@@ -737,6 +843,72 @@ class TransposePagePresetTests(PresetPageTestCase):
                 "Export Preset",
             ],
         )
+
+    def test_add_files_uses_and_remembers_transposition_input_directory(self):
+        source = KML_FIXTURES / "line_string_namespaced.kml"
+        initial = str(self.root / "remembered-kml-input")
+        self.dialog_state_mocks["transpose_file"].reset_mock()
+        with (
+            patch(
+                "pages.transpose_page.remembered_directory",
+                return_value=initial,
+            ) as remembered,
+            patch.object(
+                QFileDialog,
+                "getOpenFileNames",
+                return_value=([str(source)], ""),
+            ) as file_dialog,
+        ):
+            self.page.browse_files()
+
+        remembered.assert_called_once_with(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.INPUT,
+        )
+        file_dialog.assert_called_once_with(
+            self.page,
+            "Select KML Files",
+            initial,
+            "KML Files (*.kml)",
+        )
+        self.dialog_state_mocks["transpose_file"].assert_called_once_with(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.INPUT,
+            str(source),
+        )
+        self.assertEqual(self.page.input_files, [str(source)])
+
+    def test_airfield_preset_export_uses_its_own_output_history(self):
+        record = self.page.preset_repository.create("Display Field", self.data())
+        self.page.load_presets_from_disk()
+        self.select(self.page, record.preset.id)
+        initial = str(self.root / "Display Field.json")
+        destination = self.root / "Custom airfield export"
+        self.dialog_state_mocks["preset"].reset_mock()
+        with (
+            patch(
+                "pages.preset_ui.suggested_save_path",
+                return_value=initial,
+            ) as suggestion,
+            patch.object(
+                QFileDialog,
+                "getSaveFileName",
+                return_value=(str(destination), ""),
+            ),
+        ):
+            self.page.export_preset()
+
+        expected = f"{destination}.json"
+        suggestion.assert_called_once_with(
+            FileDialogWorkflow.AIRFIELD_PRESET,
+            "Display Field.json",
+        )
+        self.dialog_state_mocks["preset"].assert_called_once_with(
+            FileDialogWorkflow.AIRFIELD_PRESET,
+            FileDialogDirection.OUTPUT,
+            expected,
+        )
+        self.assertTrue(Path(expected).is_file())
 
     def test_elevation_pair_keeps_existing_conversion_behavior(self):
         self.page.orig_height_input.setText("10")
@@ -788,7 +960,7 @@ class TransposePagePresetTests(PresetPageTestCase):
         self.page.heading_input.setText("90")
         self.page.orig_height_input.setText("38")
 
-    def test_transposition_uses_folder_preview_persists_location_and_runs_plan(self):
+    def test_transposition_uses_editable_plan_persists_location_and_runs(self):
         source = KML_FIXTURES / "line_string_namespaced.kml"
         output_dir = self.root / "outputs"
         output_dir.mkdir()
@@ -810,9 +982,12 @@ class TransposePagePresetTests(PresetPageTestCase):
                 return_value=str(output_dir),
             ) as folder_dialog,
             patch.object(self.page, "_initial_output_directory", return_value=str(self.root)),
-            patch.object(self.page, "_confirm_output_plan", return_value=True) as confirm,
+            patch.object(
+                self.page,
+                "_edit_output_plan",
+                side_effect=lambda plan: plan,
+            ) as edit_plan,
             patch("pages.transpose_page.run_transposition", return_value=result) as run,
-            patch("pages.transpose_page.QSettings") as settings_class,
             patch.object(QMessageBox, "information") as information,
         ):
             self.page.run_transposition_ui()
@@ -822,24 +997,24 @@ class TransposePagePresetTests(PresetPageTestCase):
             "Select Output Folder",
             str(self.root),
         )
-        plan = confirm.call_args.args[0]
+        plan = edit_plan.call_args.args[0]
         self.assertEqual(
             plan.jobs[0].output_path.name,
             "line-string-namespaced-at-airfield.kml",
         )
         self.assertIs(run.call_args.kwargs["plan"], plan)
-        settings_class.return_value.setValue.assert_called_once_with(
-            self.page.LAST_OUTPUT_DIRECTORY_KEY,
+        self.dialog_state_mocks["transpose_directory"].assert_called_once_with(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.OUTPUT,
             str(output_dir),
         )
-        settings_class.return_value.sync.assert_called_once_with()
         information.assert_called_once()
         self.assertIn(
             str(successful_output.output_path),
             information.call_args.args[2],
         )
 
-    def test_cancelled_preview_writes_nothing_and_does_not_persist_folder(self):
+    def test_cancelled_name_editor_writes_nothing_but_remembers_selected_folder(self):
         source = KML_FIXTURES / "line_string_namespaced.kml"
         output_dir = self.root / "outputs"
         output_dir.mkdir()
@@ -851,14 +1026,17 @@ class TransposePagePresetTests(PresetPageTestCase):
                 "getExistingDirectory",
                 return_value=str(output_dir),
             ),
-            patch.object(self.page, "_confirm_output_plan", return_value=False),
+            patch.object(self.page, "_edit_output_plan", return_value=None),
             patch("pages.transpose_page.run_transposition") as run,
-            patch("pages.transpose_page.QSettings") as settings_class,
         ):
             self.page.run_transposition_ui()
 
         run.assert_not_called()
-        settings_class.return_value.setValue.assert_not_called()
+        self.dialog_state_mocks["transpose_directory"].assert_called_once_with(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.OUTPUT,
+            str(output_dir),
+        )
         self.assertEqual(list(output_dir.iterdir()), [])
 
     def test_partial_failure_dialog_reports_every_success_and_failure(self):
@@ -903,9 +1081,8 @@ class TransposePagePresetTests(PresetPageTestCase):
                 "getExistingDirectory",
                 return_value=str(output_dir),
             ),
-            patch.object(self.page, "_confirm_output_plan", return_value=True),
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
             patch("pages.transpose_page.run_transposition", return_value=result),
-            patch("pages.transpose_page.QSettings"),
             patch.object(QMessageBox, "warning") as warning,
         ):
             self.page.run_transposition_ui()
@@ -938,9 +1115,8 @@ class TransposePagePresetTests(PresetPageTestCase):
 
         with (
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
-            patch.object(self.page, "_confirm_output_plan", return_value=True),
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
             patch("pages.transpose_page.run_transposition", return_value=result),
-            patch("pages.transpose_page.QSettings"),
             patch.object(QMessageBox, "critical") as critical,
             patch.object(QMessageBox, "information") as information,
         ):
@@ -954,18 +1130,19 @@ class TransposePagePresetTests(PresetPageTestCase):
         output_dir = self.root / "remembered"
         output_dir.mkdir()
 
-        with patch("pages.transpose_page.QSettings") as settings_class:
-            settings_class.return_value.value.return_value = str(output_dir)
+        with patch(
+            "pages.transpose_page.remembered_directory",
+            return_value=str(output_dir),
+        ) as remembered:
             initial = self.page._initial_output_directory()
 
         self.assertEqual(initial, str(output_dir))
-        settings_class.return_value.value.assert_called_once_with(
-            self.page.LAST_OUTPUT_DIRECTORY_KEY,
-            "",
-            type=str,
+        remembered.assert_called_once_with(
+            FileDialogWorkflow.TRANSPOSITION,
+            FileDialogDirection.OUTPUT,
         )
 
-    def test_confirmation_preview_lists_every_planned_filename(self):
+    def test_output_dialog_lists_and_accepts_an_edit_for_every_filename(self):
         output_dir = self.root / "outputs"
         output_dir.mkdir()
         plan = create_transposition_plan(
@@ -977,20 +1154,98 @@ class TransposePagePresetTests(PresetPageTestCase):
             "RAF Fairford",
         )
 
+        dialog = TranspositionOutputDialog(plan, self.page)
+        self.assertEqual(
+            dialog.output_filenames(),
+            (
+                "line-string-namespaced-at-raf-fairford.kml",
+                "gx-track-at-raf-fairford.kml",
+            ),
+        )
+        dialog.filename_edits[0].setText("Lead display")
+        dialog.filename_edits[1].setText("Support.Display.KML")
+        dialog._validate_and_accept()
+
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(
+            [job.output_path.name for job in dialog.validated_plan.jobs],
+            ["Lead display.kml", "Support.Display.KML"],
+        )
+
+    def test_output_dialog_keeps_invalid_duplicate_names_open(self):
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        plan = create_transposition_plan(
+            [
+                KML_FIXTURES / "line_string_namespaced.kml",
+                KML_FIXTURES / "gx_track.kml",
+            ],
+            output_dir,
+            "RAF Fairford",
+        )
+        dialog = TranspositionOutputDialog(plan, self.page)
+        dialog.filename_edits[0].setText("Same.kml")
+        dialog.filename_edits[1].setText("same.KML")
+
+        dialog._validate_and_accept()
+
+        self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertIn("unique", dialog.error_label.text())
+
+    def test_existing_custom_outputs_require_confirmation_and_mark_overwrite(self):
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        plan = create_transposition_plan(
+            [KML_FIXTURES / "line_string_namespaced.kml"],
+            output_dir,
+            "RAF Fairford",
+        )
+        destination = output_dir / "chosen.kml"
+        destination.write_text("existing", encoding="utf-8")
+        candidate = customize_transposition_plan(plan, (destination.name,))
+
         with (
+            patch("pages.transpose_page.TranspositionOutputDialog") as dialog_class,
             patch.object(
                 QMessageBox,
-                "exec",
-                return_value=QMessageBox.StandardButton.Save,
-            ),
-            patch.object(QMessageBox, "setDetailedText") as detailed_text,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as question,
         ):
-            accepted = self.page._confirm_output_plan(plan)
+            dialog_class.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            dialog_class.return_value.validated_plan = candidate
+            approved = self.page._edit_output_plan(plan)
 
-        self.assertTrue(accepted)
-        preview = detailed_text.call_args.args[0]
-        self.assertIn("line-string-namespaced-at-raf-fairford.kml", preview)
-        self.assertIn("gx-track-at-raf-fairford.kml", preview)
+        question.assert_called_once()
+        self.assertTrue(approved.jobs[0].overwrite_existing)
+        self.assertEqual(approved.jobs[0].output_path, destination)
+
+    def test_cancelling_existing_output_confirmation_aborts_before_writing(self):
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        plan = create_transposition_plan(
+            [KML_FIXTURES / "line_string_namespaced.kml"],
+            output_dir,
+            "RAF Fairford",
+        )
+        destination = output_dir / "chosen.kml"
+        destination.write_text("keep me", encoding="utf-8")
+        candidate = customize_transposition_plan(plan, (destination.name,))
+
+        with (
+            patch("pages.transpose_page.TranspositionOutputDialog") as dialog_class,
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ),
+        ):
+            dialog_class.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            dialog_class.return_value.validated_plan = candidate
+            selected = self.page._edit_output_plan(plan)
+
+        self.assertIsNone(selected)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "keep me")
 
 
 if __name__ == "__main__":

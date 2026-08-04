@@ -10,6 +10,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
+from file_dialog_state import (
+    FileDialogDirection, FileDialogWorkflow, ensure_extension,
+    remember_file_selection, remembered_directory, suggested_save_path,
+)
 from resource_paths import app_data_path, resource_path
 from services import (
     DebrisSimulationRequest, DebrisSimulationResult, PresetType,
@@ -268,11 +272,20 @@ class DebrisPage(PresetUiMixin, QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load Aircraft Preset",
-            "",
+            remembered_directory(
+                FileDialogWorkflow.DEBRIS_PRESET,
+                FileDialogDirection.INPUT,
+            ),
             "JSON Files (*.json);;All Files (*)"
         )
         if not path:
             return
+
+        remember_file_selection(
+            FileDialogWorkflow.DEBRIS_PRESET,
+            FileDialogDirection.INPUT,
+            path,
+        )
 
         self.import_preset_path(path, error_title="Preset Error")
 
@@ -640,9 +653,20 @@ class DebrisPage(PresetUiMixin, QWidget):
 
     def browse_file(self, _):
         file, _ = QFileDialog.getOpenFileName(
-            self, "Open KML", "", "KML Files (*.kml)"
+            self,
+            "Open KML",
+            remembered_directory(
+                FileDialogWorkflow.DEBRIS,
+                FileDialogDirection.INPUT,
+            ),
+            "KML Files (*.kml)",
         )
         if file:
+            remember_file_selection(
+                FileDialogWorkflow.DEBRIS,
+                FileDialogDirection.INPUT,
+                file,
+            )
             self.select_and_parse_kml(file)
 
     def drag_enter(self, event):
@@ -737,11 +761,20 @@ class DebrisPage(PresetUiMixin, QWidget):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save output KML",
-            "debris_trajectory.kml",
+            suggested_save_path(
+                FileDialogWorkflow.DEBRIS,
+                "debris_trajectory.kml",
+            ),
             "KML Files (*.kml)"
         )
         if not save_path:
             return
+        save_path = ensure_extension(save_path, ".kml")
+        remember_file_selection(
+            FileDialogWorkflow.DEBRIS,
+            FileDialogDirection.OUTPUT,
+            save_path,
+        )
 
         self.run_debris_calculator(
             input_coords_hook=input_coords,
