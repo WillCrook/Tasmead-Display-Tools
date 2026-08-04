@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<k:kml xmlns:k="http://www.opengis.net/kml/2.2">
-  <k:Placemark>
-    <k:name>Mixed altitude</k:name>
-    <k:LineString>
-      <k:coordinates>-0.7,51.2 -0.6,51.3,125</k:coordinates>
-    </k:LineString>
-  </k:Placemark>
-</k:kml>

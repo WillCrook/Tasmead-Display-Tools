@@ -37,3 +37,7 @@ app.ico
 
 #Other files
 .DS_Store
+
+#Test file
+tests/
+tests/test_*assurance*.py
