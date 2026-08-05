@@ -131,6 +131,16 @@ class TransposePageTests(unittest.TestCase):
         )
         self.assertEqual(self.page.file_list.item(0).toolTip(), str(first.resolve()))
 
+    def test_action_buttons_use_local_icons(self):
+        for button in (
+            self.page.add_files_btn,
+            self.page.remove_files_btn,
+            self.page.manage_airfields_btn,
+            self.page.source_card.details_button,
+        ):
+            with self.subTest(button=button.text()):
+                self.assertFalse(button.icon().isNull())
+
     def test_add_files_uses_and_remembers_transposition_input_directory(self):
         source = self.root / "source.kml"
         initial = str(self.root / "remembered-input")

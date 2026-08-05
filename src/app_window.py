@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pages import DebrisPage, TransposePage
+from icon_utils import refresh_icons
 from resource_paths import find_icon_path
 from settings_dialog import SettingsDialog
 from theme import ThemeController, apply_card_shadows
@@ -81,9 +82,9 @@ class App(QMainWindow):
 
         self.set_page(self.transpose_page)
         self.theme_controller.effective_mode_changed.connect(
-            self._apply_card_shadows
+            self._apply_theme_decorations
         )
-        self._apply_card_shadows(self.theme_controller.effective_mode)
+        self._apply_theme_decorations(self.theme_controller.effective_mode)
         central.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _create_page_scroll(self, page):
@@ -184,6 +185,11 @@ class App(QMainWindow):
 
     def _apply_card_shadows(self, mode):
         apply_card_shadows(self, mode)
+
+    def _apply_theme_decorations(self, mode):
+        """Refresh theme-dependent decorative resources after a mode change."""
+        apply_card_shadows(self, mode)
+        refresh_icons(self, mode)
 
     # (build_menu removed)
 

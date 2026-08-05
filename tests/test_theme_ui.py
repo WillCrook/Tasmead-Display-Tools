@@ -360,6 +360,18 @@ class ModernHeaderTests(unittest.TestCase):
         for card in top_level_cards:
             self.assertEqual(card.graphicsEffect().color().alpha(), 89)
 
+    def test_registered_action_icons_refresh_with_the_effective_theme(self):
+        self.controller.set_mode(ThemeMode.LIGHT)
+        self.app.processEvents()
+        button = self.window.transpose_page.add_files_btn
+        light_icon_key = button.icon().cacheKey()
+
+        self.controller.set_mode(ThemeMode.DARK)
+        self.app.processEvents()
+
+        self.assertFalse(button.icon().isNull())
+        self.assertNotEqual(light_icon_key, button.icon().cacheKey())
+
 
 if __name__ == "__main__":
     unittest.main()

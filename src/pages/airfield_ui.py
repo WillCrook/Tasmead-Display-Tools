@@ -23,7 +23,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -35,6 +34,7 @@ from file_dialog_state import (
     remember_file_selection,
     remembered_directory,
 )
+from icon_utils import AppIcon, set_button_icon
 from pages.coordinate_input import CoordinatePairInput
 from pages.preset_ui import PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
@@ -229,9 +229,7 @@ class AirfieldCard(QFrame):
         self.details_button = QToolButton()
         self.details_button.setText("Evidence and warnings")
         self.details_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.details_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
-        )
+        set_button_icon(self.details_button, AppIcon.INFO_CIRCLE)
         self.details_button.clicked.connect(self._show_details)
         self.restore_button = QPushButton("Restore auto-detected")
         self.restore_button.clicked.connect(self.restore_auto_requested)

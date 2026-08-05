@@ -63,6 +63,11 @@ class DebrisWorkspaceTests(DebrisUiTestCase):
         self.assertEqual(self.page.run_btn.objectName(), "primaryButton")
         self.assertFalse(self.page.preview_btn.isEnabled())
 
+    def test_action_buttons_use_local_icons(self):
+        for button in (self.page.manage_presets_btn, self.page.preview_btn):
+            with self.subTest(button=button.text()):
+                self.assertFalse(button.icon().isNull())
+
     def test_mode_selector_keeps_stored_values_and_only_mounts_active_form(self):
         cases = (
             (self.page.rb_kml, "kml", None),
@@ -127,6 +132,7 @@ class DebrisPreviewDialogTests(unittest.TestCase):
     def test_dialog_identifies_output_and_escape_closes_it(self):
         dialog = DebrisPreviewDialog("/tmp/generated trajectory.kml")
         self.assertEqual(dialog.output_path, Path("/tmp/generated trajectory.kml"))
+        self.assertFalse(dialog.close_button.icon().isNull())
         dialog.showFullScreen()
         self.app.processEvents()
         self.assertTrue(dialog.isFullScreen())

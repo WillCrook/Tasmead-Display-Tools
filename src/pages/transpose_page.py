@@ -22,7 +22,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -36,6 +35,7 @@ from file_dialog_state import (
     remember_file_selection,
     remembered_directory,
 )
+from icon_utils import AppIcon, set_button_icon
 from pages.airfield_ui import (
     AirfieldCard,
     AirfieldFormValues,
@@ -261,13 +261,9 @@ class TransposePage(QWidget):
 
         file_actions = QHBoxLayout()
         self.add_files_btn = QPushButton("Add files")
-        self.add_files_btn.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder)
-        )
+        set_button_icon(self.add_files_btn, AppIcon.FOLDER_PLUS)
         self.remove_files_btn = QPushButton("Remove")
-        self.remove_files_btn.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
-        )
+        set_button_icon(self.remove_files_btn, AppIcon.TRASH)
         self.add_files_btn.clicked.connect(self.browse_files)
         self.remove_files_btn.clicked.connect(self.remove_selected_files)
         file_actions.addWidget(self.add_files_btn)
@@ -275,9 +271,7 @@ class TransposePage(QWidget):
         layout.addLayout(file_actions)
 
         self.manage_airfields_btn = QPushButton("Manage airfields…")
-        self.manage_airfields_btn.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
-        )
+        set_button_icon(self.manage_airfields_btn, AppIcon.LIST)
         self.manage_airfields_btn.clicked.connect(self.open_airfield_manager)
         layout.addWidget(self.manage_airfields_btn)
         self.splitter.addWidget(panel)

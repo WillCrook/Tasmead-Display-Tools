@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -29,6 +28,7 @@ from file_dialog_state import (
     remember_file_selection,
     remembered_directory,
 )
+from icon_utils import AppIcon, set_button_icon
 from pages.preset_ui import PresetUiMixin
 from services import PresetImportExportService, PresetRecord, PresetRepository
 
@@ -55,12 +55,10 @@ class DebrisPreviewDialog(QDialog):
         titles.addWidget(title)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
-        close_button = QPushButton("Close preview")
-        close_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton)
-        )
-        close_button.clicked.connect(self.close)
-        header.addWidget(close_button)
+        self.close_button = QPushButton("Close preview")
+        set_button_icon(self.close_button, AppIcon.X)
+        self.close_button.clicked.connect(self.close)
+        header.addWidget(self.close_button)
         root.addLayout(header)
 
         preview_host = QFrame()

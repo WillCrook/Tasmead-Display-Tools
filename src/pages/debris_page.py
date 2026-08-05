@@ -8,7 +8,7 @@ from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
     QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
-    QProgressBar, QPushButton, QRadioButton, QSplitter, QStyle, QVBoxLayout,
+    QProgressBar, QPushButton, QRadioButton, QSplitter, QVBoxLayout,
     QWidget,
 )
 
@@ -16,6 +16,7 @@ from file_dialog_state import (
     FileDialogDirection, FileDialogWorkflow, ensure_extension,
     remember_file_selection, remembered_directory, suggested_save_path,
 )
+from icon_utils import AppIcon, set_button_icon
 from resource_paths import app_data_path, resource_path
 from services import (
     CoordinateInputError, DebrisSimulationRequest, DebrisSimulationResult,
@@ -390,9 +391,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         layout.addWidget(self.save_preset_btn)
 
         self.manage_presets_btn = QPushButton("Manage presets…")
-        self.manage_presets_btn.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
-        )
+        set_button_icon(self.manage_presets_btn, AppIcon.LIST)
         self.manage_presets_btn.clicked.connect(self.open_preset_manager)
         layout.addWidget(self.manage_presets_btn)
 
@@ -812,9 +811,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         header.addWidget(title)
         header.addStretch()
         self.preview_btn = QPushButton("Open 3D preview")
-        self.preview_btn.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-        )
+        set_button_icon(self.preview_btn, AppIcon.MONITOR)
         self.preview_btn.setEnabled(False)
         self.preview_btn.setToolTip(
             "Available after a debris trajectory is generated successfully."
