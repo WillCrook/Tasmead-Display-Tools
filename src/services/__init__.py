@@ -23,6 +23,13 @@ from .debris_trajectory_calculator import (
     SimulationProgress,
     run_debris_simulation_request,
 )
+from .geodesy import (
+    EnuCoordinate,
+    LocalEnuFrame,
+    destination_point,
+    inverse_distance_bearing,
+    transpose_wgs84_enu_points,
+)
 from .kml_file_handling import (
     KmlCoordinateError,
     KmlParseError,
@@ -50,9 +57,7 @@ from .runway_alignment import (
     RunwayConfidence,
     RunwayInferenceResult,
     RunwayReference,
-    destination_point,
     infer_departure_runway,
-    inverse_distance_bearing,
     transpose_geodesic_points,
 )
 from .preset_filenames import canonical_filename, canonical_stem, readable_export_filename
@@ -106,6 +111,7 @@ __all__ = [
     "DebrisSimulationRequest",
     "DebrisSimulationResult",
     "DebrisTrajectoryCalculator",
+    "EnuCoordinate",
     "ImportInspection",
     "KmlCoordinateError",
     "KmlCoordinate",
@@ -119,6 +125,7 @@ __all__ = [
     "KmlStructureError",
     "KmlTrack",
     "KmlXmlError",
+    "LocalEnuFrame",
     "Preset",
     "PresetAlreadyExistsError",
     "PresetDestinationExistsError",
@@ -175,4 +182,5 @@ __all__ = [
     "run_debris_simulation_request",
     "run_transposition",
     "transpose_geodesic_points",
+    "transpose_wgs84_enu_points",
 ]

@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Sequence
 import warnings
 
+from .geodesy import (
+    inverse_distance_bearing,
+    transpose_wgs84_enu_points,
+)
 from .kml_export import (
     ATR_MAGENTA_TRACK_STYLE,
     KmlCoordinate,
@@ -20,11 +24,7 @@ from .kml_export import (
     export_kml,
 )
 from .kml_file_handling import KmlTrack, parse_kml_track
-from .runway_alignment import (
-    RunwayReference,
-    inverse_distance_bearing,
-    transpose_geodesic_points,
-)
+from .runway_alignment import RunwayReference
 
 
 MAX_OUTPUT_COMPONENT_LENGTH = 96
@@ -334,7 +334,7 @@ def rotate_route(waypoints, target_lat, target_lon, target_heading):
     """Deprecated first-segment adapter retained for direct legacy callers."""
     warnings.warn(
         "rotate_route() infers alignment from the first segment and is deprecated; "
-        "use transpose_geodesic_points() with reviewed runway references.",
+        "use transpose_wgs84_enu_points() with reviewed runway references.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -348,10 +348,11 @@ def rotate_route(waypoints, target_lat, target_lon, target_heading):
     if distance == 0.0:
         raise ValueError("The first two waypoints are identical and have no heading.")
     return list(
-        transpose_geodesic_points(
+        transpose_wgs84_enu_points(
             waypoints,
-            RunwayReference(start_lat, start_lon, initial_heading),
-            RunwayReference(target_lat, target_lon, target_heading),
+            (start_lat, start_lon),
+            (target_lat, target_lon),
+            target_heading - initial_heading,
         )
     )
 
@@ -508,10 +509,12 @@ def _run_transposition_plan(
                 track,
                 job.source_runway,
             )
-            adjusted_waypoints = transpose_geodesic_points(
+            adjusted_waypoints = transpose_wgs84_enu_points(
                 waypoints,
-                job.source_runway,
-                target_runway,
+                (job.source_runway.latitude, job.source_runway.longitude),
+                (target_runway.latitude, target_runway.longitude),
+                target_runway.true_heading_deg
+                - job.source_runway.true_heading_deg,
             )
         except Exception as error:
             outcomes.append(

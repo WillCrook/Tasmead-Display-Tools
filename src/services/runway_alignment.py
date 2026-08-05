@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import math
 import statistics
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Sequence
+from typing import Sequence
 
+from .geodesy import (
+    LocalEnuFrame,
+    destination_point,
+    inverse_distance_bearing,
+    transpose_wgs84_enu_points,
+)
 from .kml_file_handling import KmlPoint, KmlTrack
 
 
-EARTH_RADIUS_M = 6_371_008.8
 JITTER_DISTANCE_M = 2.0
 MIN_CANDIDATE_LENGTH_M = 400.0
 PREFERRED_CANDIDATE_LENGTH_M = 800.0
@@ -164,76 +170,18 @@ def _angular_difference(left: float, right: float) -> float:
     return (left - right + 180.0) % 360.0 - 180.0
 
 
-def inverse_distance_bearing(
-    start_latitude: float,
-    start_longitude: float,
-    end_latitude: float,
-    end_longitude: float,
-) -> tuple[float, float]:
-    """Return spherical surface distance in metres and initial true bearing."""
-    lat1, lat2 = map(math.radians, (start_latitude, end_latitude))
-    delta_lat = lat2 - lat1
-    delta_lon = math.radians(end_longitude - start_longitude)
-    haversine = (
-        math.sin(delta_lat / 2.0) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
-    )
-    distance = 2.0 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(haversine)))
-    y = math.sin(delta_lon) * math.cos(lat2)
-    x = (
-        math.cos(lat1) * math.sin(lat2)
-        - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon)
-    )
-    bearing = math.degrees(math.atan2(y, x)) % 360.0 if distance else 0.0
-    return distance, bearing
-
-
-def destination_point(
-    latitude: float,
-    longitude: float,
-    distance_m: float,
-    true_bearing_deg: float,
-) -> tuple[float, float]:
-    """Project a point along a spherical geodesic."""
-    angular_distance = float(distance_m) / EARTH_RADIUS_M
-    bearing = math.radians(true_bearing_deg)
-    latitude_r = math.radians(latitude)
-    longitude_r = math.radians(longitude)
-    final_latitude = math.asin(
-        math.sin(latitude_r) * math.cos(angular_distance)
-        + math.cos(latitude_r) * math.sin(angular_distance) * math.cos(bearing)
-    )
-    final_longitude = longitude_r + math.atan2(
-        math.sin(bearing) * math.sin(angular_distance) * math.cos(latitude_r),
-        math.cos(angular_distance) - math.sin(latitude_r) * math.sin(final_latitude),
-    )
-    normalized_longitude = (math.degrees(final_longitude) + 540.0) % 360.0 - 180.0
-    return math.degrees(final_latitude), normalized_longitude
-
-
 def transpose_geodesic_points(
     points: Iterable[tuple[float, float, float]],
     source_runway: RunwayReference,
     target_runway: RunwayReference,
 ) -> tuple[tuple[float, float, float], ...]:
-    """Move and rotate points between directional runway thresholds."""
-    heading_delta = target_runway.true_heading_deg - source_runway.true_heading_deg
-    transformed: list[tuple[float, float, float]] = []
-    for latitude, longitude, altitude in points:
-        distance, bearing = inverse_distance_bearing(
-            source_runway.latitude,
-            source_runway.longitude,
-            latitude,
-            longitude,
-        )
-        final_latitude, final_longitude = destination_point(
-            target_runway.latitude,
-            target_runway.longitude,
-            distance,
-            bearing + heading_delta,
-        )
-        transformed.append((final_latitude, final_longitude, altitude))
-    return tuple(transformed)
+    """Compatibility wrapper for WGS84 local-ENU runway transposition."""
+    return transpose_wgs84_enu_points(
+        points,
+        (source_runway.latitude, source_runway.longitude),
+        (target_runway.latitude, target_runway.longitude),
+        target_runway.true_heading_deg - source_runway.true_heading_deg,
+    )
 
 
 def _percentile(values: Sequence[float], fraction: float) -> float:
@@ -246,29 +194,21 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
 
 def _local_samples(track: KmlTrack) -> tuple[list[_Sample], int]:
     origin = track.points[0]
-    latitude_scale = math.pi * EARTH_RADIUS_M / 180.0
-    longitude_scale = latitude_scale * math.cos(math.radians(origin.latitude))
+    frame = LocalEnuFrame(origin.latitude, origin.longitude)
     samples: list[_Sample] = []
     discarded = 0
     for index, point in enumerate(track.points):
-        if samples:
-            distance, _ = inverse_distance_bearing(
-                samples[-1].point.latitude,
-                samples[-1].point.longitude,
-                point.latitude,
-                point.longitude,
-            )
-            if distance < JITTER_DISTANCE_M:
-                discarded += 1
-                continue
-        samples.append(
-            _Sample(
-                original_index=index,
-                point=point,
-                east_m=(point.longitude - origin.longitude) * longitude_scale,
-                north_m=(point.latitude - origin.latitude) * latitude_scale,
-            )
+        position = frame.to_enu(point.latitude, point.longitude)
+        sample = _Sample(
+            original_index=index,
+            point=point,
+            east_m=position.east_m,
+            north_m=position.north_m,
         )
+        if samples and _sample_distance(samples[-1], sample) < JITTER_DISTANCE_M:
+            discarded += 1
+            continue
+        samples.append(sample)
     return samples, discarded
 
 

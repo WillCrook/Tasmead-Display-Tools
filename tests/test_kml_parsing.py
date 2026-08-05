@@ -164,7 +164,7 @@ class TranspositionKmlTests(unittest.TestCase):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temp_dir:
                 with (
                     patch(
-                        "services.transpose_coordinates.transpose_geodesic_points",
+                        "services.transpose_coordinates.transpose_wgs84_enu_points",
                         side_effect=lambda waypoints, *_: tuple(waypoints),
                     ) as transpose,
                     patch("services.transpose_coordinates.write_kml") as write,
@@ -192,7 +192,7 @@ class TranspositionKmlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch(
-                    "services.transpose_coordinates.transpose_geodesic_points",
+                    "services.transpose_coordinates.transpose_wgs84_enu_points",
                     side_effect=lambda waypoints, *_: tuple(waypoints),
                 ) as transpose,
                 patch("services.transpose_coordinates.write_kml") as write,
@@ -238,7 +238,7 @@ class TranspositionKmlTests(unittest.TestCase):
                 return_value=track,
             ),
             patch(
-                "services.transpose_coordinates.transpose_geodesic_points",
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
                 side_effect=lambda waypoints, *_: tuple(waypoints),
             ),
         ):
@@ -308,7 +308,7 @@ class TranspositionKmlTests(unittest.TestCase):
     def test_parse_error_is_a_failed_outcome_without_rotation_or_write(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
-                patch("services.transpose_coordinates.transpose_geodesic_points") as transpose,
+                patch("services.transpose_coordinates.transpose_wgs84_enu_points") as transpose,
                 patch("services.transpose_coordinates.write_kml") as write,
             ):
                 plan = create_transposition_plan(
@@ -427,7 +427,7 @@ class TranspositionKmlTests(unittest.TestCase):
             plan.jobs[0].output_path.write_text("appeared later", encoding="utf-8")
 
             with patch(
-                "services.transpose_coordinates.transpose_geodesic_points",
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
                 side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
                 result = self.run_plan(plan)
@@ -460,7 +460,7 @@ class TranspositionKmlTests(unittest.TestCase):
             )
 
             with patch(
-                "services.transpose_coordinates.transpose_geodesic_points",
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
                 side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
                 result = self.run_plan(plan)
@@ -480,7 +480,7 @@ class TranspositionKmlTests(unittest.TestCase):
                 "RAF Fairford",
             )
             with patch(
-                "services.transpose_coordinates.transpose_geodesic_points",
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
                 side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
                 result = self.run_plan(plan)
@@ -509,7 +509,7 @@ class TranspositionKmlTests(unittest.TestCase):
                 "Field",
             )
             with patch(
-                "services.transpose_coordinates.transpose_geodesic_points",
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
                 side_effect=lambda waypoints, *_: tuple(waypoints),
             ):
                 result = self.run_plan(plan)
@@ -560,7 +560,7 @@ class TranspositionKmlTests(unittest.TestCase):
 
             with (
                 patch(
-                    "services.transpose_coordinates.transpose_geodesic_points",
+                    "services.transpose_coordinates.transpose_wgs84_enu_points",
                     side_effect=lambda waypoints, *_: tuple(waypoints),
                 ),
                 patch(
@@ -593,7 +593,7 @@ class TranspositionKmlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "legacy.kml"
             with patch(
-                "services.transpose_coordinates.transpose_geodesic_points",
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
                 side_effect=lambda waypoints, *_: tuple(waypoints),
             ), self.assertWarns(DeprecationWarning):
                 result = run_transposition(
