@@ -2,12 +2,14 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from uuid import UUID
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QMessageBox, QProgressBar,
-    QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
+    QProgressBar, QPushButton, QRadioButton, QSplitter, QStyle, QVBoxLayout,
+    QWidget,
 )
 
 from file_dialog_state import (
@@ -21,8 +23,143 @@ from services import (
 )
 from workers import CancellationToken, DebrisSimulationWorker, SimulationFailure
 from pages.coordinate_input import CoordinatePairInput
-from pages.preset_ui import PresetPanelLabels, PresetUiMixin
+from pages.debris_ui import DebrisPresetManagerDialog, DebrisPreviewDialog
+from pages.preset_ui import PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
+
+
+PAGE_STYLE = """
+DebrisPage {
+    background: palette(window);
+}
+DebrisPage QFrame#workspacePanel,
+DebrisPage QFrame#presetToolbar,
+DebrisPage QFrame#resultsCard,
+DebrisPage QFrame#previewHost,
+DebrisPage QDialog#debrisPresetManager,
+DebrisPage QDialog#debrisPreviewDialog {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 10px;
+}
+DebrisPage QLabel#pageTitle,
+DebrisPage QLabel#dialogTitle {
+    font-size: 22px;
+    font-weight: 700;
+}
+DebrisPage QLabel#cardTitle,
+DebrisPage QLabel#panelTitle {
+    font-size: 15px;
+    font-weight: 650;
+}
+DebrisPage QLabel#sectionTitle {
+    font-weight: 650;
+    padding-top: 4px;
+}
+DebrisPage QLabel#mutedText {
+    color: palette(window-text);
+}
+DebrisPage QFrame#statusPanel,
+DebrisPage QFrame#inputPanel {
+    background: palette(alternate-base);
+    border: 1px solid palette(midlight);
+    border-radius: 7px;
+}
+DebrisPage QFrame#dropZone {
+    background: palette(alternate-base);
+    border: 1px dashed palette(mid);
+    border-radius: 8px;
+}
+DebrisPage QFrame#dropZone[status="ready"] {
+    border: 2px solid #2e7d32;
+}
+DebrisPage QFrame#dropZone[status="error"] {
+    border: 2px solid #b3261e;
+}
+DebrisPage QLabel[status="success"] {
+    color: #2e7d32;
+    font-weight: 650;
+}
+DebrisPage QLabel[status="warning"] {
+    color: #a65f00;
+    font-weight: 650;
+}
+DebrisPage QLabel[status="error"] {
+    color: #b3261e;
+    font-weight: 650;
+}
+DebrisPage QLineEdit,
+DebrisPage QComboBox,
+DebrisPage QListWidget {
+    min-height: 28px;
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 3px 7px;
+    background: palette(base);
+    color: palette(text);
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+DebrisPage QLineEdit:focus,
+DebrisPage QComboBox:focus,
+DebrisPage QListWidget:focus {
+    border: 2px solid palette(highlight);
+}
+DebrisPage QPushButton {
+    min-height: 28px;
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 4px 10px;
+    background: palette(button);
+    color: palette(button-text);
+}
+DebrisPage QPushButton:hover {
+    background: palette(midlight);
+}
+DebrisPage QPushButton#primaryButton {
+    min-height: 38px;
+    background: palette(highlight);
+    color: palette(highlighted-text);
+    border-color: palette(highlight);
+    font-weight: 700;
+}
+DebrisPage QPushButton#dangerButton {
+    color: #b3261e;
+}
+DebrisPage QPushButton#dangerButton:disabled {
+    color: palette(mid);
+}
+DebrisPage QRadioButton {
+    min-height: 28px;
+    padding: 3px 6px;
+}
+DebrisPage QProgressBar {
+    min-height: 16px;
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    text-align: center;
+    background: palette(base);
+}
+DebrisPage QProgressBar::chunk {
+    background: palette(highlight);
+    border-radius: 5px;
+}
+DebrisPage QSplitter::handle {
+    background: palette(midlight);
+    width: 3px;
+    margin: 8px 4px;
+}
+DebrisPage QLabel#previewIcon {
+    font-size: 54px;
+    color: palette(mid);
+}
+DebrisPage QLabel#previewPath {
+    background: palette(alternate-base);
+    border: 1px solid palette(midlight);
+    border-radius: 6px;
+    padding: 10px;
+}
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +196,75 @@ class DebrisPage(PresetUiMixin, QWidget):
         """Legacy path assignment invalidates any parse result until Run reparses it."""
         self._kml_state = DebrisKmlState(path=os.fspath(path) if path else "")
 
+    @staticmethod
+    def _set_widget_status(widget, status):
+        widget.setProperty("status", status)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
     def update_preset_actions(self, *args):
-        super().update_preset_actions(*args)
-        if self.has_active_simulation():
-            self.rename_preset_btn.setEnabled(False)
-            self.delete_preset_btn.setEnabled(False)
-            self.export_preset_btn.setEnabled(False)
+        if not hasattr(self, "preset_combo"):
+            return
+        busy = self.has_active_simulation()
+        selected = self.preset_combo.currentData(Qt.ItemDataRole.UserRole) is not None
+        self.apply_preset_btn.setEnabled(selected and not busy)
+        self.save_preset_btn.setEnabled(not busy)
+        self.manage_presets_btn.setEnabled(not busy)
+
+    def refresh_preset_list(self, *, select_id=None):
+        """Populate the compact preset selector used by the debris workspace."""
+        current = select_id or self.preset_combo.currentData(Qt.ItemDataRole.UserRole)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("Choose a debris preset", None)
+        for record in sorted(
+            self.presets.values(), key=lambda item: item.preset.name.casefold()
+        ):
+            self.preset_combo.addItem(record.preset.name, str(record.preset.id))
+        if current:
+            index = self.preset_combo.findData(str(current), Qt.ItemDataRole.UserRole)
+            if index >= 0:
+                self.preset_combo.setCurrentIndex(index)
+        self.preset_combo.blockSignals(False)
+        self.update_preset_actions()
+
+    def selected_preset_record(self):
+        raw_id = self.preset_combo.currentData(Qt.ItemDataRole.UserRole)
+        if not raw_id:
+            return None, None
+        try:
+            preset_id = UUID(str(raw_id))
+        except ValueError:
+            return None, None
+        return preset_id, self.presets.get(preset_id)
+
+    def apply_selected_preset(self):
+        _, record = self.selected_preset_record()
+        if record is not None:
+            self.apply_preset_data(record.preset.data)
+
+    def open_preset_manager(self):
+        current_id, _ = self.selected_preset_record()
+        dialog = DebrisPresetManagerDialog(
+            self.preset_repository,
+            self.preset_transfer,
+            self,
+        )
+        if current_id is not None:
+            dialog.refresh_preset_list(select_id=current_id)
+        dialog.exec()
+        selected_id = dialog.selected_preset_id or current_id
+        self.presets = self.preset_repository.load_all()
+        self.refresh_preset_list(select_id=selected_id)
+
+    def open_preview(self):
+        if not self._last_successful_output:
+            return
+        self._preview_dialog = DebrisPreviewDialog(
+            self._last_successful_output,
+            self,
+        )
+        self._preview_dialog.showFullScreen()
 
     def render_kml_state(self):
         """Render the complete KML state without retaining metadata from another path."""
@@ -80,20 +280,24 @@ class DebrisPage(PresetUiMixin, QWidget):
             bool(state.path) and not self.has_active_simulation()
         )
         self.file_label.setText(state.path or "Drop KML file here")
+        self.file_label.setToolTip(state.path)
 
         if not state.path:
             self.kml_status_label.setText("No KML selected.")
-            self.kml_status_label.setStyleSheet("")
+            self._set_widget_status(self.kml_status_label, "idle")
+            self._set_widget_status(self.kml_drop_zone, "idle")
             return
 
         if state.error:
             self.kml_status_label.setText(f"KML error: {state.error}")
-            self.kml_status_label.setStyleSheet("color: #b00020;")
+            self._set_widget_status(self.kml_status_label, "error")
+            self._set_widget_status(self.kml_drop_zone, "error")
             return
 
         if not state.ready:
             self.kml_status_label.setText("Loading KML…")
-            self.kml_status_label.setStyleSheet("")
+            self._set_widget_status(self.kml_status_label, "warning")
+            self._set_widget_status(self.kml_drop_zone, "idle")
             return
 
         penultimate_lat, penultimate_lon, final_lat, final_lon = state.coordinates
@@ -101,13 +305,16 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.kml_meta_pen_lon.setText(f"Penultimate longitude: {penultimate_lon}")
         self.kml_meta_fin_lat.setText(f"Final latitude: {final_lat}")
         self.kml_meta_fin_lon.setText(f"Final longitude: {final_lon}")
-        self.kml_status_label.setStyleSheet("")
+        self._set_widget_status(self.kml_drop_zone, "ready")
         if state.final_altitude_m is not None:
             self.kml_status_label.setText("KML ready.")
+            self._set_widget_status(self.kml_status_label, "success")
         elif self.alt_m.text():
             self.kml_status_label.setText("KML ready — using entered altitude.")
+            self._set_widget_status(self.kml_status_label, "success")
         else:
             self.kml_status_label.setText("KML ready — enter altitude in metres.")
+            self._set_widget_status(self.kml_status_label, "warning")
 
     def select_and_parse_kml(self, path, *, altitude_fallback=None, notify=True):
         """Select and synchronously parse one path, committing a complete result."""
@@ -170,6 +377,8 @@ class DebrisPage(PresetUiMixin, QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName("DebrisPage")
+        self.setStyleSheet(PAGE_STYLE)
 
         self._simulation_state = SimulationUiState.IDLE
         self._simulation_thread = None
@@ -177,33 +386,8 @@ class DebrisPage(PresetUiMixin, QWidget):
         self._cancellation_token = None
         self._terminal_outcome = None
         self._suppress_terminal_dialogs = False
-
-        layout = QHBoxLayout(self)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("""
-            QSplitter::handle {
-                background-color: black;
-                width: 6px;
-            }
-        """)
-        layout.addWidget(splitter)
-
-        self.presets_widget = QWidget()
-        self.config_widget = QWidget()
-        self.file_widget = QWidget()
-
-        presets = QVBoxLayout(self.presets_widget)
-        config = QVBoxLayout(self.config_widget)
-        file_panel = QVBoxLayout(self.file_widget)
-
-        splitter.addWidget(self.presets_widget)
-        splitter.addWidget(self.config_widget)
-        splitter.addWidget(self.file_widget)
-
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 2)
+        self._last_successful_output = None
+        self._preview_dialog = None
 
         self.initialize_preset_management(
             preset_type=PresetType.DEBRIS,
@@ -213,21 +397,94 @@ class DebrisPage(PresetUiMixin, QWidget):
             backup_directory=app_data_path("presets/legacy-backup/debris"),
         )
 
-        self.build_preset_panel(
-            presets,
-            PresetPanelLabels(
-                title="Presets",
-                save="Save preset",
-                load="Load preset",
-                rename="Rename preset",
-                delete="Delete preset",
-                export="Export preset",
-            ),
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 10, 14, 14)
+        root.setSpacing(10)
+
+        title = QLabel("Debris trajectory")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Configure the debris model, define the flight state, then generate a "
+            "Google Earth-ready trajectory KML."
         )
+        subtitle.setObjectName("mutedText")
+        subtitle.setWordWrap(True)
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        self.presets_widget = QFrame()
+        self.presets_widget.setObjectName("presetToolbar")
+        self._build_preset_toolbar(QHBoxLayout(self.presets_widget))
+        root.addWidget(self.presets_widget)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        root.addWidget(self.splitter, 1)
+
+        self.config_widget = QFrame()
+        self.config_widget.setObjectName("workspacePanel")
+        config = QVBoxLayout(self.config_widget)
+        config.setContentsMargins(18, 16, 18, 16)
+        config.setSpacing(10)
         self.build_config(config)
+
+        self.file_widget = QWidget()
+        right = QVBoxLayout(self.file_widget)
+        right.setContentsMargins(7, 0, 0, 0)
+        right.setSpacing(10)
+
+        self.flight_input_card = QFrame()
+        self.flight_input_card.setObjectName("workspacePanel")
+        file_panel = QVBoxLayout(self.flight_input_card)
+        file_panel.setContentsMargins(18, 16, 18, 16)
+        file_panel.setSpacing(10)
         self.build_file_panel(file_panel)
+        right.addWidget(self.flight_input_card)
+
+        self.results_widget = QFrame()
+        self.results_widget.setObjectName("resultsCard")
+        results_layout = QVBoxLayout(self.results_widget)
+        results_layout.setContentsMargins(18, 16, 18, 16)
+        results_layout.setSpacing(9)
+        self.build_results_panel(results_layout)
+        right.addWidget(self.results_widget)
+        right.addStretch()
+
+        self.splitter.addWidget(self.config_widget)
+        self.splitter.addWidget(self.file_widget)
+        self.splitter.setStretchFactor(0, 4)
+        self.splitter.setStretchFactor(1, 5)
+        self.splitter.setSizes((410, 490))
 
         self.load_presets_from_disk()
+
+    def _build_preset_toolbar(self, layout):
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+        title = QLabel("Preset")
+        title.setObjectName("cardTitle")
+        layout.addWidget(title)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.setAccessibleName("Debris preset")
+        self.preset_combo.setMinimumContentsLength(18)
+        self.preset_combo.currentIndexChanged.connect(self.update_preset_actions)
+        layout.addWidget(self.preset_combo, 1)
+
+        self.apply_preset_btn = QPushButton("Apply")
+        self.apply_preset_btn.clicked.connect(self.apply_selected_preset)
+        layout.addWidget(self.apply_preset_btn)
+
+        self.save_preset_btn = QPushButton("Save current…")
+        self.save_preset_btn.clicked.connect(self.save_preset)
+        layout.addWidget(self.save_preset_btn)
+
+        self.manage_presets_btn = QPushButton("Manage presets…")
+        self.manage_presets_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        )
+        self.manage_presets_btn.clicked.connect(self.open_preset_manager)
+        layout.addWidget(self.manage_presets_btn)
 
     def save_preset(self):
         try:
@@ -363,44 +620,93 @@ class DebrisPage(PresetUiMixin, QWidget):
             "Impact / slide physics": "0.5"
         }
 
-        title = QLabel("Config")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        title = QLabel("Debris model")
+        title.setObjectName("cardTitle")
         layout.addWidget(title)
+        subtitle = QLabel(
+            "Set the physical object, atmosphere, integration, and ground-contact parameters."
+        )
+        subtitle.setObjectName("mutedText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
 
         self.inputs = {}
 
-        for key, value in defaults.items():
-            lbl = QLabel(key)
-            edit = QLineEdit()
-            edit.setPlaceholderText(key)
-            if value != "":
-                edit.setText(value)
-            layout.addWidget(lbl)
-            layout.addWidget(edit)
-            self.inputs[key] = edit
+        def add_fields(section_title, keys):
+            heading = QLabel(section_title)
+            heading.setObjectName("sectionTitle")
+            layout.addWidget(heading)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(7)
+            grid.setColumnStretch(1, 1)
+            for row, key in enumerate(keys):
+                label = QLabel(key)
+                edit = QLineEdit(defaults[key])
+                edit.setPlaceholderText(key)
+                edit.setAccessibleName(key)
+                grid.addWidget(label, row, 0)
+                grid.addWidget(edit, row, 1)
+                self.inputs[key] = edit
+            layout.addLayout(grid)
+
+        add_fields(
+            "Object and release",
+            ("Mass (kg)", "Frontal area A (m²)", "KTAS (knots true airspeed)"),
+        )
+        add_fields(
+            "Atmosphere and integration",
+            (
+                "Drag Coefficient Cd",
+                "Air Density ρ (kg/m³)",
+                "Gravity g (m/s²)",
+                "Time step (s)",
+            ),
+        )
+
+        ground_heading = QLabel("Ground interaction")
+        ground_heading.setObjectName("sectionTitle")
+        layout.addWidget(ground_heading)
+        ground_grid = QGridLayout()
+        ground_grid.setHorizontalSpacing(12)
+        ground_grid.setVerticalSpacing(7)
+        ground_grid.setColumnStretch(1, 1)
+        impact_key = "Impact / slide physics"
+        impact_input = QLineEdit(defaults[impact_key])
+        impact_input.setPlaceholderText(impact_key)
+        impact_input.setAccessibleName(impact_key)
+        self.inputs[impact_key] = impact_input
+        ground_grid.addWidget(QLabel(impact_key), 0, 0)
+        ground_grid.addWidget(impact_input, 0, 1)
+
+        self.surface_combo = QComboBox()
+        self.surface_combo.addItems(["concrete", "asphalt", "grass"])
+        self.surface_combo.setAccessibleName("Surface type")
+        ground_grid.addWidget(QLabel("Surface type"), 1, 0)
+        ground_grid.addWidget(self.surface_combo, 1, 1)
+        layout.addLayout(ground_grid)
 
         self.include_ground_drag = QCheckBox("Include ground drag")
         self.include_ground_drag.setChecked(True)
         layout.addWidget(self.include_ground_drag)
 
-        # Add surface type dropdown
-        surface_label = QLabel("Surface Type")
-        layout.addWidget(surface_label)
-        self.surface_combo = QComboBox()
-        self.surface_combo.addItems(["concrete", "asphalt", "grass"])
-        layout.addWidget(self.surface_combo)
-
         layout.addStretch()
 
     def build_file_panel(self, layout):
-        title = QLabel("Flight Input & Simulation")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        title = QLabel("Flight input")
+        title.setObjectName("cardTitle")
         layout.addWidget(title)
+        subtitle = QLabel(
+            "Choose how the release position and direction should be resolved."
+        )
+        subtitle.setObjectName("mutedText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
 
         self.mode_group = QButtonGroup(self)
-        self.rb_kml = QRadioButton("From KML")
-        self.rb_coords = QRadioButton("From Coordinates")
-        self.rb_bearing = QRadioButton("From Track")
+        self.rb_kml = QRadioButton("KML file")
+        self.rb_coords = QRadioButton("Two coordinates")
+        self.rb_bearing = QRadioButton("Coordinate + track")
 
         self.rb_kml.setChecked(True)
 
@@ -424,24 +730,36 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         self.mode_stack = QWidget()
         self.mode_stack_layout = QVBoxLayout(self.mode_stack)
+        self.mode_stack_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.mode_stack)
 
         # KML drop area (only for KML mode)
-        self.kml_container = QWidget()
+        self.kml_container = QFrame()
+        self.kml_container.setObjectName("inputPanel")
         kml_layout = QVBoxLayout(self.kml_container)
+        kml_layout.setContentsMargins(12, 12, 12, 12)
+        kml_layout.setSpacing(8)
 
         # Drag & drop area
+        self.kml_drop_zone = QFrame()
+        self.kml_drop_zone.setObjectName("dropZone")
+        drop_layout = QVBoxLayout(self.kml_drop_zone)
+        drop_layout.setContentsMargins(12, 12, 12, 12)
         self.file_label = QLabel("Drop KML file here")
         self.file_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.file_label.setFrameShape(QFrame.Shape.Box)
-        self.file_label.setMinimumHeight(120)
+        self.file_label.setMinimumHeight(72)
+        self.file_label.setWordWrap(True)
+        self.file_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self.file_label.setAcceptDrops(True)
 
         self.file_label.mousePressEvent = self.browse_file
         self.file_label.dragEnterEvent = self.drag_enter
         self.file_label.dropEvent = self.drop_event
 
-        kml_layout.addWidget(self.file_label)
+        drop_layout.addWidget(self.file_label)
+        kml_layout.addWidget(self.kml_drop_zone)
 
         self.load_kml_btn = QPushButton("Reload selected KML")
         self.load_kml_btn.clicked.connect(self.reload_selected_kml)
@@ -452,19 +770,28 @@ class DebrisPage(PresetUiMixin, QWidget):
         kml_layout.addWidget(self.kml_status_label)
 
         # Metadata display labels
+        metadata = QFrame()
+        metadata.setObjectName("statusPanel")
+        metadata_layout = QGridLayout(metadata)
+        metadata_layout.setContentsMargins(10, 8, 10, 8)
+        metadata_layout.setHorizontalSpacing(12)
+        metadata_layout.setVerticalSpacing(4)
         self.kml_meta_pen_lat = QLabel("Penultimate latitude: —")
         self.kml_meta_pen_lon = QLabel("Penultimate longitude: —")
         self.kml_meta_fin_lat = QLabel("Final latitude: —")
         self.kml_meta_fin_lon = QLabel("Final longitude: —")
 
-        kml_layout.addWidget(self.kml_meta_pen_lat)
-        kml_layout.addWidget(self.kml_meta_pen_lon)
-        kml_layout.addWidget(self.kml_meta_fin_lat)
-        kml_layout.addWidget(self.kml_meta_fin_lon)
+        metadata_layout.addWidget(self.kml_meta_pen_lat, 0, 0)
+        metadata_layout.addWidget(self.kml_meta_pen_lon, 0, 1)
+        metadata_layout.addWidget(self.kml_meta_fin_lat, 1, 0)
+        metadata_layout.addWidget(self.kml_meta_fin_lon, 1, 1)
+        kml_layout.addWidget(metadata)
 
         # Coordinates mode inputs
-        self.coords_container = QWidget()
+        self.coords_container = QFrame()
+        self.coords_container.setObjectName("inputPanel")
         coords_layout = QVBoxLayout(self.coords_container)
+        coords_layout.setContentsMargins(12, 12, 12, 12)
         coordinate1_label = QLabel("Coordinate 1 (Latitude, Longitude)")
         self.coordinate1_input = CoordinatePairInput("Coordinate 1")
         coordinate2_label = QLabel("Coordinate 2 (Latitude, Longitude)")
@@ -476,8 +803,10 @@ class DebrisPage(PresetUiMixin, QWidget):
         coords_layout.addWidget(self.coordinate2_input)
 
         # Bearing mode inputs
-        self.bearing_container = QWidget()
+        self.bearing_container = QFrame()
+        self.bearing_container.setObjectName("inputPanel")
         bearing_layout = QVBoxLayout(self.bearing_container)
+        bearing_layout.setContentsMargins(12, 12, 12, 12)
         coordinate_label = QLabel("Coordinate (Latitude, Longitude)")
         self.bearing_coordinate_input = CoordinatePairInput("Track coordinate")
         azimuth_label = QLabel("Track (degrees)")
@@ -503,41 +832,39 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         layout.addWidget(self.kml_container)
 
-        # Altitude inputs (shared by all modes)
-        alt_layout = QHBoxLayout()
-        alt_m_label = QLabel("Altitude (m)")
+        height_heading = QLabel("Altitude and terrain")
+        height_heading.setObjectName("sectionTitle")
+        layout.addWidget(height_heading)
+        height_grid = QGridLayout()
+        height_grid.setHorizontalSpacing(10)
+        height_grid.setVerticalSpacing(7)
+        height_grid.setColumnStretch(1, 1)
+        height_grid.setColumnStretch(2, 1)
+        metres_heading = QLabel("metres")
+        metres_heading.setObjectName("mutedText")
+        feet_heading = QLabel("feet")
+        feet_heading.setObjectName("mutedText")
+        height_grid.addWidget(metres_heading, 0, 1)
+        height_grid.addWidget(feet_heading, 0, 2)
+
         self.alt_m = QLineEdit()
-        alt_ft_label = QLabel("Altitude (ft)")
         self.alt_ft = QLineEdit()
-        alt_layout.addWidget(alt_m_label)
-        alt_layout.addWidget(self.alt_m)
-        alt_layout.addWidget(alt_ft_label)
-        alt_layout.addWidget(self.alt_ft)
-        layout.addLayout(alt_layout)
-
-        # Terrain inputs
-        terrain_layout = QHBoxLayout()
-        terrain_m_label = QLabel("Terrain (m)")
         self.terrain_m = QLineEdit()
-        terrain_ft_label = QLabel("Terrain (ft)")
         self.terrain_ft = QLineEdit()
-        terrain_layout.addWidget(terrain_m_label)
-        terrain_layout.addWidget(self.terrain_m)
-        terrain_layout.addWidget(terrain_ft_label)
-        terrain_layout.addWidget(self.terrain_ft)
-        layout.addLayout(terrain_layout)
-
-        # Height above ground inputs
-        height_layout = QHBoxLayout()
-        height_m_label = QLabel("Height (m)")
         self.height_m = QLineEdit()
-        height_ft_label = QLabel("Height (ft)")
         self.height_ft = QLineEdit()
-        height_layout.addWidget(height_m_label)
-        height_layout.addWidget(self.height_m)
-        height_layout.addWidget(height_ft_label)
-        height_layout.addWidget(self.height_ft)
-        layout.addLayout(height_layout)
+        unit_rows = (
+            ("Altitude", self.alt_m, self.alt_ft),
+            ("Terrain", self.terrain_m, self.terrain_ft),
+            ("Height above ground", self.height_m, self.height_ft),
+        )
+        for row, (name, metres, feet) in enumerate(unit_rows, start=1):
+            metres.setAccessibleName(f"{name} metres")
+            feet.setAccessibleName(f"{name} feet")
+            height_grid.addWidget(QLabel(name), row, 0)
+            height_grid.addWidget(metres, row, 1)
+            height_grid.addWidget(feet, row, 2)
+        layout.addLayout(height_grid)
 
         self._altitude_units = MetreFeetFieldPair(
             self.alt_m,
@@ -557,11 +884,35 @@ class DebrisPage(PresetUiMixin, QWidget):
 
         self.alt_m.textChanged.connect(lambda _: self.render_kml_state())
 
+        layout.addStretch()
+        self.render_kml_state()
+        self.update_flight_mode_ui()
+
+    def build_results_panel(self, layout):
+        header = QHBoxLayout()
+        title = QLabel("Run and results")
+        title.setObjectName("cardTitle")
+        header.addWidget(title)
+        header.addStretch()
+        self.preview_btn = QPushButton("Open 3D preview")
+        self.preview_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        )
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.setToolTip(
+            "Available after a debris trajectory is generated successfully."
+        )
+        self.preview_btn.clicked.connect(self.open_preview)
+        header.addWidget(self.preview_btn)
+        layout.addLayout(header)
+
         self.run_btn = QPushButton("Run Simulation")
+        self.run_btn.setObjectName("primaryButton")
         self.run_btn.clicked.connect(self.run_simulation)
         layout.addWidget(self.run_btn)
 
         self.cancel_simulation_btn = QPushButton("Cancel Simulation")
+        self.cancel_simulation_btn.setObjectName("dangerButton")
         self.cancel_simulation_btn.clicked.connect(
             lambda: self.cancel_simulation()
         )
@@ -574,13 +925,18 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.simulation_progress_bar.hide()
         layout.addWidget(self.simulation_progress_bar)
 
+        status_panel = QFrame()
+        status_panel.setObjectName("statusPanel")
+        status_layout = QVBoxLayout(status_panel)
+        status_layout.setContentsMargins(10, 8, 10, 8)
         self.simulation_status_label = QLabel("Ready.")
         self.simulation_status_label.setWordWrap(True)
-        layout.addWidget(self.simulation_status_label)
+        status_layout.addWidget(self.simulation_status_label)
+        layout.addWidget(status_panel)
 
         # --- Simulation summary UI elements ---
-        summary_title = QLabel("Simulation Summary")
-        summary_title.setStyleSheet("font-weight: bold;")
+        summary_title = QLabel("Simulation summary")
+        summary_title.setObjectName("sectionTitle")
         layout.addWidget(summary_title)
 
         self.summary_heading = QLabel("Track used (deg): —")
@@ -589,16 +945,15 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.summary_total = QLabel("Total ground‑planar distance (m): —")
         self.summary_impacts = QLabel("Impacts (incl. first): —")
 
-        layout.addWidget(self.summary_heading)
-        layout.addWidget(self.summary_air)
-        layout.addWidget(self.summary_ground)
-        layout.addWidget(self.summary_total)
-        layout.addWidget(self.summary_impacts)
-
-        layout.addStretch()
-
-        self.render_kml_state()
-        self.update_flight_mode_ui()
+        summary_grid = QGridLayout()
+        summary_grid.setHorizontalSpacing(14)
+        summary_grid.setVerticalSpacing(5)
+        summary_grid.addWidget(self.summary_heading, 0, 0)
+        summary_grid.addWidget(self.summary_impacts, 0, 1)
+        summary_grid.addWidget(self.summary_air, 1, 0, 1, 2)
+        summary_grid.addWidget(self.summary_ground, 2, 0, 1, 2)
+        summary_grid.addWidget(self.summary_total, 3, 0, 1, 2)
+        layout.addLayout(summary_grid)
 
     def set_flight_mode(self, mode):
         self.flight_mode = mode
@@ -901,6 +1256,9 @@ class DebrisPage(PresetUiMixin, QWidget):
             widget.setEnabled(inputs_enabled)
         self.file_label.setAcceptDrops(inputs_enabled)
         self.run_btn.setEnabled(inputs_enabled)
+        self.preview_btn.setEnabled(
+            inputs_enabled and bool(self._last_successful_output)
+        )
 
         self.cancel_simulation_btn.setVisible(busy)
         self.cancel_simulation_btn.setEnabled(
@@ -910,8 +1268,10 @@ class DebrisPage(PresetUiMixin, QWidget):
         if state is SimulationUiState.RUNNING:
             self.simulation_progress_bar.setValue(0)
             self.simulation_status_label.setText("Starting simulation…")
+            self._set_widget_status(self.simulation_status_label, "warning")
         elif state is SimulationUiState.CANCELLING:
             self.simulation_status_label.setText("Cancelling simulation…")
+            self._set_widget_status(self.simulation_status_label, "warning")
 
         if not busy:
             self.render_kml_state()
@@ -926,6 +1286,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.simulation_progress_bar.setValue(percentage)
         if self._simulation_state is SimulationUiState.RUNNING:
             self.simulation_status_label.setText(progress.message)
+            self._set_widget_status(self.simulation_status_label, "warning")
 
     def _record_terminal_outcome(self, kind, payload=None):
         if self._terminal_outcome is None:
@@ -975,6 +1336,9 @@ class DebrisPage(PresetUiMixin, QWidget):
             )
             self.simulation_progress_bar.setValue(100)
             self.simulation_status_label.setText("Simulation complete.")
+            self._set_widget_status(self.simulation_status_label, "success")
+            self._last_successful_output = payload.output_file
+            self.preview_btn.setEnabled(True)
             if not self._suppress_terminal_dialogs:
                 QMessageBox.information(
                     self,
@@ -985,6 +1349,7 @@ class DebrisPage(PresetUiMixin, QWidget):
             self.simulation_status_label.setText(
                 "Simulation cancelled; the output file was not changed."
             )
+            self._set_widget_status(self.simulation_status_label, "warning")
             if not self._suppress_terminal_dialogs:
                 QMessageBox.information(
                     self,
@@ -1000,6 +1365,7 @@ class DebrisPage(PresetUiMixin, QWidget):
                     traceback="",
                 )
             self.simulation_status_label.setText("Simulation failed.")
+            self._set_widget_status(self.simulation_status_label, "error")
             if not self._suppress_terminal_dialogs:
                 dialog = QMessageBox(self)
                 dialog.setIcon(QMessageBox.Icon.Critical)

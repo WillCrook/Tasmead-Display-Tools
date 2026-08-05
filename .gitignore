@@ -26,7 +26,6 @@ data/
 presets/
 
 #pyinstaller files
-app.icns
 dist/
 build/
 *.spec

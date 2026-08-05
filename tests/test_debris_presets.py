@@ -382,6 +382,14 @@ class PresetPageTestCase(unittest.TestCase):
 
     @staticmethod
     def select(page, preset_id):
+        if hasattr(page, "preset_combo"):
+            index = page.preset_combo.findData(
+                str(preset_id), Qt.ItemDataRole.UserRole
+            )
+            if index >= 0:
+                page.preset_combo.setCurrentIndex(index)
+                return page.preset_combo.model().item(index)
+            raise AssertionError(f"Preset {preset_id} was not listed")
         for row in range(page.preset_list.count()):
             item = page.preset_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == str(preset_id):
@@ -432,8 +440,8 @@ class DebrisPagePresetTests(PresetPageTestCase):
 
         self.assertEqual(Path(self.page.presets_dir), self.app_root / "presets" / "debris")
         self.assertEqual(UUID(item.data(Qt.ItemDataRole.UserRole)), record.preset.id)
-        self.assertTrue(self.page.rename_preset_btn.isEnabled())
-        self.assertTrue(self.page.export_preset_btn.isEnabled())
+        self.assertTrue(self.page.apply_preset_btn.isEnabled())
+        self.assertTrue(self.page.manage_presets_btn.isEnabled())
 
     def test_import_uses_and_remembers_debris_preset_input_directory(self):
         preset = Preset.create(PresetType.DEBRIS, "Imported", self.data())
@@ -471,7 +479,7 @@ class DebrisPagePresetTests(PresetPageTestCase):
         )
         self.assertIsNotNone(self.page.preset_repository.get(preset.id))
 
-    def test_preset_panel_keeps_exact_visible_text_and_order(self):
+    def test_compact_preset_toolbar_exposes_apply_save_and_manager_actions(self):
         labels = [
             label.text()
             for label in self.page.presets_widget.findChildren(QLabel)
@@ -481,15 +489,17 @@ class DebrisPagePresetTests(PresetPageTestCase):
             for button in self.page.presets_widget.findChildren(QPushButton)
         ]
 
-        self.assertIn("Presets", labels)
+        self.assertIn("Preset", labels)
+        self.assertEqual(
+            self.page.preset_combo.itemText(0),
+            "Choose a debris preset",
+        )
         self.assertEqual(
             buttons,
             [
-                "Save preset",
-                "Load preset",
-                "Rename preset",
-                "Delete preset",
-                "Export preset",
+                "Apply",
+                "Save current…",
+                "Manage presets…",
             ],
         )
 
