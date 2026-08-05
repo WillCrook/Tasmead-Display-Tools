@@ -126,7 +126,7 @@ class DebrisSimulationServiceTests(unittest.TestCase):
             self.assertEqual(output.read_text(encoding="utf-8"), "existing")
             self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp")), [])
 
-    def test_debris_output_uses_atr_magenta_style_and_google_earth_geometry_settings(self):
+    def test_debris_output_uses_phase_colours_and_google_earth_geometry_settings(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "trajectory.kml"
             run_debris_simulation_request(make_request(output))
@@ -137,18 +137,26 @@ class DebrisSimulationServiceTests(unittest.TestCase):
                 style.get("id"): style
                 for style in root.findall("kml:Document/kml:Style", namespace)
             }
-            track_style = styles["magentaTrackLine"]
+            airborne_style = styles["airborneTrackLine"]
             self.assertEqual(
-                track_style.find("kml:LineStyle/kml:color", namespace).text,
-                "aaff00ff",
+                airborne_style.find("kml:LineStyle/kml:color", namespace).text,
+                "aaff0000",
             )
             self.assertEqual(
-                track_style.find("kml:LineStyle/kml:width", namespace).text,
+                airborne_style.find("kml:LineStyle/kml:width", namespace).text,
                 "6",
             )
             self.assertEqual(
-                track_style.find("kml:PolyStyle/kml:color", namespace).text,
-                "33ff00ff",
+                airborne_style.find("kml:PolyStyle/kml:color", namespace).text,
+                "33ff0000",
+            )
+            self.assertEqual(
+                styles["groundRunLine"].find("kml:LineStyle/kml:color", namespace).text,
+                "aa0000ff",
+            )
+            self.assertEqual(
+                styles["debrisZone"].find("kml:LineStyle/kml:color", namespace).text,
+                "aa0000ff",
             )
             self.assertEqual(
                 styles["debrisZone"].find("kml:PolyStyle/kml:color", namespace).text,
@@ -159,6 +167,18 @@ class DebrisSimulationServiceTests(unittest.TestCase):
                 placemark.find("kml:name", namespace).text: placemark
                 for placemark in root.findall("kml:Document/kml:Placemark", namespace)
             }
+            self.assertEqual(
+                paths["Airborne"].find("kml:styleUrl", namespace).text,
+                "#airborneTrackLine",
+            )
+            self.assertEqual(
+                paths["Ground run"].find("kml:styleUrl", namespace).text,
+                "#groundRunLine",
+            )
+            self.assertEqual(
+                paths["Debris zone"].find("kml:styleUrl", namespace).text,
+                "#debrisZone",
+            )
             airborne = paths["Airborne"].find("kml:LineString", namespace)
             ground_run = paths["Ground run"].find("kml:LineString", namespace)
             self.assertEqual(airborne.find("kml:extrude", namespace).text, "1")

@@ -81,6 +81,30 @@ class KmlParserTests(unittest.TestCase):
         )
         self.assertEqual(track.altitude_mode, "clampToGround")
 
+    def test_resolves_inline_referenced_and_normal_style_map_line_colours(self):
+        cases = (
+            ("line_string_inline_style.kml", "7f112233"),
+            ("line_string_referenced_style.kml", "aa445566"),
+            ("gx_track_style_map.kml", "bb778899"),
+        )
+        for filename, expected_colour in cases:
+            with self.subTest(filename=filename):
+                track = parse_kml_track(self.fixture(filename))
+                self.assertEqual(track.source_line_colour, expected_colour)
+
+    def test_unresolved_or_nondeterministic_styles_do_not_fail_track_parsing(self):
+        filenames = (
+            "line_string_namespaced.kml",
+            "line_string_invalid_style.kml",
+            "line_string_random_style.kml",
+            "line_string_external_style.kml",
+            "line_string_cyclic_style_map.kml",
+        )
+        for filename in filenames:
+            with self.subTest(filename=filename):
+                track = parse_kml_track(self.fixture(filename))
+                self.assertIsNone(track.source_line_colour)
+
     def test_multiple_supported_geometries_are_not_concatenated(self):
         with self.assertRaises(KmlStructureError) as raised:
             parse_kml_track(self.fixture("multiple_paths.kml"))
@@ -187,6 +211,38 @@ class TranspositionKmlTests(unittest.TestCase):
                 )
                 self.assertEqual(transpose.call_args.args[0], list(expected))
                 self.assertEqual(write.call_args.args[1], expected)
+
+    def test_each_output_uses_its_source_colour_or_yellow_fallback(self):
+        filenames_and_colours = (
+            ("line_string_inline_style.kml", "7f112233"),
+            ("line_string_referenced_style.kml", "aa445566"),
+            ("line_string_namespaced.kml", "aa00ffff"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [self.fixture(filename) for filename, _ in filenames_and_colours],
+                temp_dir,
+                "Field",
+            )
+            result = self.run_plan(plan)
+
+            self.assertTrue(result.succeeded)
+            namespace = {"kml": "http://www.opengis.net/kml/2.2"}
+            outcomes_by_input = {
+                outcome.input_path.name: outcome for outcome in result.successful
+            }
+            for filename, expected_colour in filenames_and_colours:
+                with self.subTest(filename=filename):
+                    root = ET.parse(outcomes_by_input[filename].output_path).getroot()
+                    style = root.find("kml:Document/kml:Style", namespace)
+                    self.assertEqual(
+                        style.find("kml:LineStyle/kml:color", namespace).text,
+                        expected_colour,
+                    )
+                    self.assertEqual(
+                        style.find("kml:PolyStyle/kml:color", namespace).text,
+                        f"33{expected_colour[2:]}",
+                    )
 
     def test_missing_clamped_altitude_outputs_zero_relative_height(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -649,7 +705,11 @@ class TranspositionKmlTests(unittest.TestCase):
             line = root.find("kml:Document/kml:Placemark/kml:LineString", namespace)
             self.assertEqual(
                 root.find("kml:Document/kml:Style/kml:LineStyle/kml:color", namespace).text,
-                "aaff00ff",
+                "aa00ffff",
+            )
+            self.assertEqual(
+                root.find("kml:Document/kml:Style/kml:PolyStyle/kml:color", namespace).text,
+                "3300ffff",
             )
             self.assertEqual(
                 root.find("kml:Document/kml:Style/kml:LineStyle/kml:width", namespace).text,

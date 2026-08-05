@@ -7,7 +7,6 @@ from typing import Callable
 import pandas as pd
 
 from .kml_export import (
-    ATR_MAGENTA_TRACK_STYLE,
     KmlCoordinate,
     KmlDocument,
     KmlLineString,
@@ -516,10 +515,20 @@ class DebrisTrajectoryCalculator:
             teardrop_points = teardrop_outer + teardrop_inner
 
         styles = [
-            ATR_MAGENTA_TRACK_STYLE,
+            KmlStyle(
+                style_id="airborneTrackLine",
+                line_colour="aaff0000",
+                line_width=6,
+                poly_colour="33ff0000",
+            ),
+            KmlStyle(
+                style_id="groundRunLine",
+                line_colour="aa0000ff",
+                line_width=6,
+            ),
             KmlStyle(
                 style_id="debrisZone",
-                line_colour="aaff00ff",
+                line_colour="aa0000ff",
                 line_width=6,
                 poly_colour="7f0000ff",
             ),
@@ -529,7 +538,7 @@ class DebrisTrajectoryCalculator:
             placemarks.append(
                 KmlPlacemark(
                     name="Airborne",
-                    style_url="#magentaTrackLine",
+                    style_url="#airborneTrackLine",
                     geometry=KmlLineString(
                         coordinates=tuple(KmlCoordinate(lon, lat, alt) for lon, lat, alt in coords_air),
                         altitude_mode="absolute",
@@ -542,7 +551,7 @@ class DebrisTrajectoryCalculator:
             placemarks.append(
                 KmlPlacemark(
                     name="Ground run",
-                    style_url="#magentaTrackLine",
+                    style_url="#groundRunLine",
                     geometry=KmlLineString(
                         coordinates=tuple(KmlCoordinate(lon, lat, alt) for lon, lat, alt in coords_ground),
                         altitude_mode="clampToGround",

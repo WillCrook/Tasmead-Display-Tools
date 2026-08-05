@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Placemark>
+    <name>Externally styled route</name>
+    <styleUrl>https://example.com/styles.kml#route</styleUrl>
+    <LineString>
+      <coordinates>-0.7,51.2,100 -0.6,51.3,125</coordinates>
+    </LineString>
+  </Placemark>
+</kml>

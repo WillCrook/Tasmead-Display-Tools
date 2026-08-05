@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Placemark>
+    <name>Random styled route</name>
+    <Style>
+      <LineStyle>
+        <color>aa112233</color>
+        <colorMode>random</colorMode>
+      </LineStyle>
+    </Style>
+    <LineString>
+      <coordinates>-0.7,51.2,100 -0.6,51.3,125</coordinates>
+    </LineString>
+  </Placemark>
+</kml>

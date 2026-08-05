@@ -16,11 +16,11 @@ from .geodesy import (
     transpose_wgs84_enu_points,
 )
 from .kml_export import (
-    ATR_MAGENTA_TRACK_STYLE,
     KmlCoordinate,
     KmlDocument,
     KmlLineString,
     KmlPlacemark,
+    KmlStyle,
     export_kml,
 )
 from .kml_file_handling import KmlTrack, parse_kml_track
@@ -29,6 +29,7 @@ from .runway_alignment import RunwayReference
 
 MAX_OUTPUT_COMPONENT_LENGTH = 96
 MAX_OUTPUT_STEM_LENGTH = 200
+TRANSPOSITION_FALLBACK_LINE_COLOUR = "aa00ffff"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -364,8 +365,16 @@ def write_kml(
     *,
     overwrite=False,
     processing_warnings: Sequence[str] = (),
+    line_colour: str = TRANSPOSITION_FALLBACK_LINE_COLOUR,
 ):
     """Create a collision-safe, Google Earth-ready transposed KML output."""
+    line_colour = line_colour.lower()
+    track_style = KmlStyle(
+        style_id="transposedTrackLine",
+        line_colour=line_colour,
+        line_width=6,
+        poly_colour=f"33{line_colour[2:]}",
+    )
     warning_description = None
     if processing_warnings:
         warning_description = "Processing warnings:\n" + "\n".join(
@@ -373,11 +382,11 @@ def write_kml(
         )
     document = KmlDocument(
         name=f"{name_of_aircraft} Adjusted Coordinates",
-        styles=(ATR_MAGENTA_TRACK_STYLE,),
+        styles=(track_style,),
         placemarks=(
             KmlPlacemark(
                 name="Path",
-                style_url="#magentaTrackLine",
+                style_url="#transposedTrackLine",
                 geometry=KmlLineString(
                     coordinates=tuple(
                         KmlCoordinate(longitude=lon, latitude=lat, altitude_m=alt)
@@ -529,6 +538,10 @@ def _run_transposition_plan(
                 job.aircraft_name,
                 overwrite=job.overwrite_existing,
                 processing_warnings=processing_warnings,
+                line_colour=(
+                    track.source_line_colour
+                    or TRANSPOSITION_FALLBACK_LINE_COLOUR
+                ),
             )
         except FileExistsError as error:
             outcomes.append(

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <StyleMap id="first-map">
+      <Pair><key>normal</key><styleUrl>#second-map</styleUrl></Pair>
+    </StyleMap>
+    <StyleMap id="second-map">
+      <Pair><key>normal</key><styleUrl>#first-map</styleUrl></Pair>
+    </StyleMap>
+    <Placemark>
+      <name>Cyclic styled route</name>
+      <styleUrl>#first-map</styleUrl>
+      <LineString>
+        <coordinates>-0.7,51.2,100 -0.6,51.3,125</coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
+  <Document>
+    <Style id="normal-track">
+      <LineStyle><color>bb778899</color></LineStyle>
+    </Style>
+    <Style id="highlight-track">
+      <LineStyle><color>ffffffff</color></LineStyle>
+    </Style>
+    <StyleMap id="track-map">
+      <Pair><key>normal</key><styleUrl>#normal-track</styleUrl></Pair>
+      <Pair><key>highlight</key><styleUrl>#highlight-track</styleUrl></Pair>
+    </StyleMap>
+    <Placemark>
+      <name>Mapped track</name>
+      <styleUrl>#track-map</styleUrl>
+      <gx:Track>
+        <when>2026-01-01T00:00:00Z</when>
+        <gx:coord>-0.7 51.2 100</gx:coord>
+        <when>2026-01-01T00:00:01Z</when>
+        <gx:coord>-0.6 51.3 125</gx:coord>
+      </gx:Track>
+    </Placemark>
+  </Document>
+</kml>

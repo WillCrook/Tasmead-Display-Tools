@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml>
+  <Document>
+    <Style id="route-style">
+      <LineStyle><color>aa445566</color></LineStyle>
+    </Style>
+    <Placemark>
+      <name>Referenced styled route</name>
+      <styleUrl>#route-style</styleUrl>
+      <LineString>
+        <coordinates>-0.7,51.2,100 -0.6,51.3,125</coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>

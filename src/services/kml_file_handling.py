@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -12,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
 GX_NAMESPACE = "http://www.google.com/kml/ext/2.2"
+_COLOUR_RE = re.compile(r"[0-9a-fA-F]{8}\Z")
 
 
 class KmlParseError(ValueError):
@@ -48,11 +50,13 @@ class KmlTrack:
     geometry_kind: Literal["line_string", "gx_track"]
     placemark_name: str | None
     altitude_mode: str = "clampToGround"
+    source_line_colour: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _TrackCandidate:
     element: ET.Element
+    placemark: ET.Element
     geometry_kind: Literal["line_string", "gx_track"]
     placemark_name: str | None
 
@@ -75,6 +79,146 @@ def _placemark_name(placemark: ET.Element, namespace: str) -> str | None:
             name = child.text.strip()
             return name or None
     return None
+
+
+def _direct_children(element: ET.Element, tag: str) -> list[ET.Element]:
+    return [child for child in element if child.tag == tag]
+
+
+def _style_line_colour(
+    style: ET.Element,
+    namespace: str,
+) -> tuple[bool, str | None]:
+    """Return whether a line colour is declared and its deterministic value."""
+    line_styles = _direct_children(style, _qualified(namespace, "LineStyle"))
+    if not line_styles:
+        return False, None
+    if len(line_styles) != 1:
+        return True, None
+
+    line_style = line_styles[0]
+    colours = _direct_children(line_style, _qualified(namespace, "color"))
+    if not colours:
+        return False, None
+    if len(colours) != 1:
+        return True, None
+
+    colour_modes = _direct_children(line_style, _qualified(namespace, "colorMode"))
+    if len(colour_modes) > 1:
+        return True, None
+    if colour_modes:
+        mode = (colour_modes[0].text or "").strip()
+        if mode != "normal":
+            return True, None
+
+    colour = (colours[0].text or "").strip()
+    if _COLOUR_RE.fullmatch(colour) is None:
+        return True, None
+    return True, colour.lower()
+
+
+def _style_selectors_by_id(
+    root: ET.Element,
+    namespace: str,
+) -> dict[str, ET.Element | None]:
+    selector_tags = {
+        _qualified(namespace, "Style"),
+        _qualified(namespace, "StyleMap"),
+    }
+    selectors: dict[str, ET.Element | None] = {}
+    for element in root.iter():
+        if element.tag not in selector_tags:
+            continue
+        style_id = element.get("id")
+        if not style_id:
+            continue
+        selectors[style_id] = element if style_id not in selectors else None
+    return selectors
+
+
+def _local_style_id(style_url: ET.Element | None) -> str | None:
+    value = (style_url.text or "").strip() if style_url is not None else ""
+    if not value.startswith("#") or len(value) == 1 or "#" in value[1:]:
+        return None
+    return value[1:]
+
+
+def _resolve_style_selector_colour(
+    selector: ET.Element,
+    namespace: str,
+    selectors: dict[str, ET.Element | None],
+    visited: frozenset[str],
+) -> str | None:
+    _, local_name = _split_tag(selector.tag)
+    if local_name == "Style":
+        _, colour = _style_line_colour(selector, namespace)
+        return colour
+    if local_name != "StyleMap":
+        return None
+
+    normal_pairs = []
+    for pair in _direct_children(selector, _qualified(namespace, "Pair")):
+        keys = _direct_children(pair, _qualified(namespace, "key"))
+        if len(keys) == 1 and (keys[0].text or "").strip() == "normal":
+            normal_pairs.append(pair)
+    if len(normal_pairs) != 1:
+        return None
+
+    pair = normal_pairs[0]
+    inline_styles = _direct_children(pair, _qualified(namespace, "Style"))
+    if len(inline_styles) > 1:
+        return None
+    if inline_styles:
+        declared, colour = _style_line_colour(inline_styles[0], namespace)
+        if declared:
+            return colour
+
+    style_urls = _direct_children(pair, _qualified(namespace, "styleUrl"))
+    if len(style_urls) != 1:
+        return None
+    style_id = _local_style_id(style_urls[0])
+    if style_id is None or style_id in visited:
+        return None
+    referenced = selectors.get(style_id)
+    if referenced is None:
+        return None
+    return _resolve_style_selector_colour(
+        referenced,
+        namespace,
+        selectors,
+        visited | {style_id},
+    )
+
+
+def _placemark_line_colour(
+    root: ET.Element,
+    placemark: ET.Element,
+    namespace: str,
+) -> str | None:
+    inline_styles = _direct_children(placemark, _qualified(namespace, "Style"))
+    if len(inline_styles) > 1:
+        return None
+    if inline_styles:
+        declared, colour = _style_line_colour(inline_styles[0], namespace)
+        if declared:
+            return colour
+
+    style_urls = _direct_children(placemark, _qualified(namespace, "styleUrl"))
+    if len(style_urls) != 1:
+        return None
+    style_id = _local_style_id(style_urls[0])
+    if style_id is None:
+        return None
+    selectors = _style_selectors_by_id(root, namespace)
+    selector = selectors.get(style_id)
+    if selector is None:
+        return None
+    return _resolve_style_selector_colour(
+        selector,
+        namespace,
+        selectors,
+        frozenset({style_id}),
+    )
 
 
 def _context(
@@ -265,9 +409,9 @@ def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
         name = _placemark_name(placemark, namespace)
         for element in placemark.iter():
             if element.tag == line_string_tag:
-                candidates.append(_TrackCandidate(element, "line_string", name))
+                candidates.append(_TrackCandidate(element, placemark, "line_string", name))
             elif element.tag == gx_track_tag:
-                candidates.append(_TrackCandidate(element, "gx_track", name))
+                candidates.append(_TrackCandidate(element, placemark, "gx_track", name))
 
     if not candidates:
         raise KmlStructureError(
@@ -300,6 +444,7 @@ def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
         geometry_kind=candidate.geometry_kind,
         placemark_name=candidate.placemark_name,
         altitude_mode=_altitude_mode(path, candidate, namespace),
+        source_line_colour=_placemark_line_colour(root, candidate.placemark, namespace),
     )
 
 

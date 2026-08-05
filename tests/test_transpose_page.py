@@ -131,11 +131,47 @@ class TransposePageTests(unittest.TestCase):
         )
         self.assertEqual(self.page.file_list.item(0).toolTip(), str(first.resolve()))
 
+    def test_input_panel_uses_compact_top_aligned_natural_height(self):
+        self.page.file_list.addItems([f"display-{index}.kml" for index in range(6)])
+        self.page.resize(1000, 900)
+        self.page.show()
+        self.app.processEvents()
+
+        splitter_top = self.page.splitter.mapToGlobal(
+            self.page.splitter.rect().topLeft()
+        ).y()
+        panel_top = self.page.file_panel.mapToGlobal(
+            self.page.file_panel.rect().topLeft()
+        ).y()
+        self.assertEqual(panel_top, splitter_top)
+        self.assertLess(self.page.file_panel.height(), self.page.splitter.height() * 0.6)
+        self.assertGreaterEqual(
+            self.page.file_list.height(),
+            self.page.file_list.sizeHintForRow(0) * 5,
+        )
+
+    def test_preview_actions_host_transposition_and_future_preview_buttons(self):
+        self.page.show()
+        self.app.processEvents()
+
+        self.assertTrue(self.page.preview_host.isAncestorOf(self.page.run_btn))
+        self.assertTrue(self.page.preview_host.isAncestorOf(self.page.preview_btn))
+        self.assertLess(self.page.preview_btn.x(), self.page.run_btn.x())
+        self.assertEqual(self.page.run_btn.text(), "Transpose files")
+        self.assertEqual(self.page.run_btn.objectName(), "primaryButton")
+        self.assertEqual(self.page.preview_btn.text(), "View preview")
+        self.assertTrue(self.page.preview_btn.isEnabled())
+        self.assertEqual(
+            self.page.preview_btn.receivers(self.page.preview_btn.clicked),
+            0,
+        )
+
     def test_action_buttons_use_local_icons(self):
         for button in (
             self.page.add_files_btn,
             self.page.remove_files_btn,
             self.page.manage_airfields_btn,
+            self.page.preview_btn,
             self.page.source_card.details_button,
         ):
             with self.subTest(button=button.text()):

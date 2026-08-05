@@ -229,9 +229,14 @@ class TransposePage(QWidget):
         self._render_source_state(None)
 
     def _build_file_column(self) -> None:
-        panel = QFrame()
-        panel.setObjectName("workspacePanel")
-        layout = QVBoxLayout(panel)
+        column = QWidget()
+        column_layout = QVBoxLayout(column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(0)
+
+        self.file_panel = QFrame()
+        self.file_panel.setObjectName("workspacePanel")
+        layout = QVBoxLayout(self.file_panel)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
         heading_row = QHBoxLayout()
@@ -274,7 +279,13 @@ class TransposePage(QWidget):
         set_button_icon(self.manage_airfields_btn, AppIcon.LIST)
         self.manage_airfields_btn.clicked.connect(self.open_airfield_manager)
         layout.addWidget(self.manage_airfields_btn)
-        self.splitter.addWidget(panel)
+
+        column_layout.addWidget(
+            self.file_panel,
+            alignment=Qt.AlignmentFlag.AlignTop,
+        )
+        column_layout.addStretch()
+        self.splitter.addWidget(column)
 
     def _build_airfield_column(self) -> None:
         column = QWidget()
@@ -299,10 +310,6 @@ class TransposePage(QWidget):
         self.target_card.preset_apply_requested.connect(self._apply_target_preset)
         layout.addWidget(self.source_card)
         layout.addWidget(self.target_card)
-        self.run_btn = QPushButton("Transpose files")
-        self.run_btn.setObjectName("primaryButton")
-        self.run_btn.clicked.connect(self.run_transposition_ui)
-        layout.addWidget(self.run_btn)
         layout.addStretch()
         self.splitter.addWidget(column)
 
@@ -334,6 +341,16 @@ class TransposePage(QWidget):
         layout.addWidget(title)
         layout.addWidget(description)
         layout.addStretch()
+
+        actions = QHBoxLayout()
+        self.run_btn = QPushButton("Transpose files")
+        self.run_btn.setObjectName("primaryButton")
+        self.run_btn.clicked.connect(self.run_transposition_ui)
+        self.preview_btn = QPushButton("View preview")
+        set_button_icon(self.preview_btn, AppIcon.MONITOR)
+        actions.addWidget(self.preview_btn)
+        actions.addWidget(self.run_btn)
+        layout.addLayout(actions)
         self.splitter.addWidget(self.preview_host)
 
     def _load_presets(self, *, show_issues: bool = False) -> None:
