@@ -781,7 +781,7 @@ def infer_departure_runway(
         f"Aligned distance: {best.span_m:.0f} m",
         f"95% cross-track error: {best.cross_track_p95_m:.1f} m",
         f"Median heading dispersion: {best.heading_dispersion_deg:.1f}°",
-        f"Removed stationary jitter points: {discarded}",
+        f"Ignored stationary jitter points: {discarded}",
         (
             f"Altitude change through candidate: {best.climb_m:+.1f} m"
             if best.climb_m is not None

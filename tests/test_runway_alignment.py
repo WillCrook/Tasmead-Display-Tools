@@ -133,7 +133,7 @@ class DepartureInferenceTests(unittest.TestCase):
             2.0,
         )
         self.assertGreaterEqual(result.candidate.aligned_distance_m, 700.0)
-        self.assertIn("Removed stationary jitter points", result.candidate.evidence[3])
+        self.assertIn("Ignored stationary jitter points", result.candidate.evidence[3])
         self.assertIs(result.candidate.heading_confidence, RunwayConfidence.HIGH)
         self.assertIs(result.candidate.threshold_confidence, RunwayConfidence.HIGH)
 
