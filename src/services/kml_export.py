@@ -63,6 +63,7 @@ class KmlPlacemark:
     name: str
     style_url: str
     geometry: KmlGeometry
+    description: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +176,8 @@ def _validate_document(document: KmlDocument) -> set[str]:
         style_ids.add(style.style_id)
     for placemark in document.placemarks:
         _validate_xml_text(placemark.name, "placemark name")
+        if placemark.description is not None:
+            _validate_xml_text(placemark.description, "placemark description")
         if not placemark.style_url.startswith("#") or placemark.style_url[1:] not in style_ids:
             raise ValueError(f'Placemark "{placemark.name}" references an unknown KML style.')
         if isinstance(placemark.geometry, KmlLineString):
@@ -226,6 +229,8 @@ def render_kml(document: KmlDocument) -> str:
     for placemark in document.placemarks:
         placemark_element = ET.SubElement(document_element, _qualified("Placemark"))
         ET.SubElement(placemark_element, _qualified("name")).text = placemark.name
+        if placemark.description is not None:
+            ET.SubElement(placemark_element, _qualified("description")).text = placemark.description
         ET.SubElement(placemark_element, _qualified("styleUrl")).text = placemark.style_url
         _append_geometry(placemark_element, placemark.geometry)
     return ET.tostring(root, encoding="unicode", xml_declaration=True, short_empty_elements=False) + "\n"

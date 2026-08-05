@@ -81,6 +81,34 @@ class KmlExportTests(unittest.TestCase):
         self.assertEqual(line.find("kml:tessellate", NAMESPACE).text, "0")
         self.assertEqual(line.find("kml:coordinates", NAMESPACE).text.splitlines()[0], "0.0000000,51.2345679,100.124")
 
+    def test_optional_placemark_description_is_escaped_and_omitted_by_default(self):
+        document = track_document()
+        described = KmlDocument(
+            name=document.name,
+            styles=document.styles,
+            placemarks=(
+                KmlPlacemark(
+                    name=document.placemarks[0].name,
+                    style_url=document.placemarks[0].style_url,
+                    geometry=document.placemarks[0].geometry,
+                    description="Processing warnings:\n- Omitted 2 <source> coordinate(s) & continued.",
+                ),
+            ),
+        )
+
+        described_root = ET.fromstring(render_kml(described))
+        plain_root = ET.fromstring(render_kml(document))
+        self.assertEqual(
+            described_root.find(
+                "kml:Document/kml:Placemark/kml:description",
+                NAMESPACE,
+            ).text,
+            "Processing warnings:\n- Omitted 2 <source> coordinate(s) & continued.",
+        )
+        self.assertIsNone(
+            plain_root.find("kml:Document/kml:Placemark/kml:description", NAMESPACE)
+        )
+
     def test_polygon_ring_is_closed_once(self):
         root = ET.fromstring(render_kml(track_document(polygon=True)))
         coordinates = root.find(

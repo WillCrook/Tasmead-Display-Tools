@@ -131,7 +131,7 @@ class AirfieldCard(QFrame):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(10)
+        root.setSpacing(12)
 
         header = QHBoxLayout()
         titles = QVBoxLayout()

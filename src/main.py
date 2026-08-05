@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import QApplication
 
 from app_window import App
 from resource_paths import find_icon_path
+from theme import ThemeController
 
 
 def main():
@@ -17,7 +18,8 @@ def main():
     if app_icon:
         app.setWindowIcon(QIcon(app_icon))
 
-    window = App()
+    theme_controller = ThemeController(app, parent=app)
+    window = App(theme_controller)
     window.show()
     return app.exec()
 

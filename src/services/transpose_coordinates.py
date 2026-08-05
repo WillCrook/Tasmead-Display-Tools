@@ -97,6 +97,7 @@ class TranspositionFileOutcome:
     final_output_path: Path | None
     status: TranspositionFileStatus
     error: TranspositionError | None = None
+    warnings: tuple[str, ...] = ()
 
     @property
     def output_path(self) -> Path:
@@ -355,8 +356,20 @@ def rotate_route(waypoints, target_lat, target_lon, target_heading):
     )
 
 
-def write_kml(file_path, coordinates, name_of_aircraft, *, overwrite=False):
+def write_kml(
+    file_path,
+    coordinates,
+    name_of_aircraft,
+    *,
+    overwrite=False,
+    processing_warnings: Sequence[str] = (),
+):
     """Create a collision-safe, Google Earth-ready transposed KML output."""
+    warning_description = None
+    if processing_warnings:
+        warning_description = "Processing warnings:\n" + "\n".join(
+            f"- {warning}" for warning in processing_warnings
+        )
     document = KmlDocument(
         name=f"{name_of_aircraft} Adjusted Coordinates",
         styles=(ATR_MAGENTA_TRACK_STYLE,),
@@ -373,6 +386,7 @@ def write_kml(file_path, coordinates, name_of_aircraft, *, overwrite=False):
                     extrude_to_ground=True,
                     tessellate=False,
                 ),
+                description=warning_description,
             ),
         ),
     )
@@ -398,20 +412,20 @@ def read_config(config_file):
 def _waypoints_for_transposition(
     track: KmlTrack,
     source_runway: RunwayReference,
-) -> list[tuple[float, float, float]]:
+) -> tuple[list[tuple[float, float, float]], tuple[str, ...]]:
     """Convert encoded KML heights to output relative-to-ground heights."""
     if track.altitude_mode == "absolute" and source_runway.elevation_m is None:
         raise ValueError(
             "Source ground-reference elevation is required for a KML using absolute altitude."
         )
     waypoints: list[tuple[float, float, float]] = []
+    omitted_missing_altitudes = 0
     for point in track.points:
         if track.altitude_mode == "absolute":
-            altitude = (
-                point.altitude_m - source_runway.elevation_m
-                if point.altitude_m is not None
-                else 0.0
-            )
+            if point.altitude_m is None:
+                omitted_missing_altitudes += 1
+                continue
+            altitude = point.altitude_m - source_runway.elevation_m
         elif track.altitude_mode == "relativeToGround":
             altitude = point.altitude_m if point.altitude_m is not None else 0.0
         elif track.altitude_mode == "clampToGround":
@@ -422,7 +436,18 @@ def _waypoints_for_transposition(
                 "safely to relative-to-ground output."
             )
         waypoints.append((point.latitude, point.longitude, altitude))
-    return waypoints
+    if track.altitude_mode == "absolute" and len(waypoints) < 2:
+        raise ValueError(
+            f"Omitted {omitted_missing_altitudes} source coordinate(s) because "
+            "absolute altitude was missing; fewer than two valid coordinates remain."
+        )
+    processing_warnings = (
+        (
+            f"Omitted {omitted_missing_altitudes} source coordinate(s) because "
+            "absolute altitude was missing."
+        ),
+    ) if omitted_missing_altitudes else ()
+    return waypoints, processing_warnings
 
 
 def _failure_outcome(
@@ -479,7 +504,10 @@ def _run_transposition_plan(
                 raise ValueError(
                     "Source runway alignment has not been reviewed for this input."
                 )
-            waypoints = _waypoints_for_transposition(track, job.source_runway)
+            waypoints, processing_warnings = _waypoints_for_transposition(
+                track,
+                job.source_runway,
+            )
             adjusted_waypoints = transpose_geodesic_points(
                 waypoints,
                 job.source_runway,
@@ -497,6 +525,7 @@ def _run_transposition_plan(
                 adjusted_waypoints,
                 job.aircraft_name,
                 overwrite=job.overwrite_existing,
+                processing_warnings=processing_warnings,
             )
         except FileExistsError as error:
             outcomes.append(
@@ -522,6 +551,7 @@ def _run_transposition_plan(
                 planned_output_path=job.output_path,
                 final_output_path=output_path,
                 status=TranspositionFileStatus.SUCCEEDED,
+                warnings=processing_warnings,
             )
         )
         LOGGER.info("Transposition saved to %s", output_path)

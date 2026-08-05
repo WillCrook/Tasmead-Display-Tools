@@ -218,6 +218,93 @@ class TranspositionKmlTests(unittest.TestCase):
             ((51.2, -0.7, 0.0), (51.3, -0.6, 0.0)),
         )
 
+    def test_missing_absolute_altitudes_are_omitted_warned_and_embedded(self):
+        track = KmlTrack(
+            points=(
+                KmlPoint(51.0, -1.0, None),
+                KmlPoint(51.1, -0.9, 100.0),
+                KmlPoint(51.2, -0.8, None),
+                KmlPoint(51.3, -0.7, 125.0),
+                KmlPoint(51.4, -0.6, None),
+            ),
+            geometry_kind="line_string",
+            placemark_name="Mixed absolute altitude",
+            altitude_mode="absolute",
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch(
+                "services.transpose_coordinates.parse_kml_track",
+                return_value=track,
+            ),
+            patch(
+                "services.transpose_coordinates.transpose_geodesic_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
+            ),
+        ):
+            plan = create_transposition_plan(
+                [self.fixture("line_string_namespaced.kml")],
+                temp_dir,
+                "Field",
+            )
+            result = self.run_plan(plan, elevation=80.0)
+
+            self.assertTrue(result.succeeded)
+            self.assertEqual(
+                result.successful[0].warnings,
+                (
+                    "Omitted 3 source coordinate(s) because absolute altitude was missing.",
+                ),
+            )
+            root = ET.parse(result.successful[0].output_path).getroot()
+
+        namespace = {"kml": "http://www.opengis.net/kml/2.2"}
+        placemark = root.find("kml:Document/kml:Placemark", namespace)
+        self.assertEqual(
+            placemark.find("kml:description", namespace).text,
+            "Processing warnings:\n"
+            "- Omitted 3 source coordinate(s) because absolute altitude was missing.",
+        )
+        self.assertEqual(
+            placemark.find("kml:LineString/kml:coordinates", namespace).text.splitlines(),
+            ["-0.9000000,51.1000000,20.000", "-0.7000000,51.3000000,45.000"],
+        )
+
+    def test_too_few_absolute_altitudes_fail_without_writing(self):
+        track = KmlTrack(
+            points=(
+                KmlPoint(51.0, -1.0, None),
+                KmlPoint(51.1, -0.9, 100.0),
+                KmlPoint(51.2, -0.8, None),
+            ),
+            geometry_kind="line_string",
+            placemark_name="Insufficient absolute altitude",
+            altitude_mode="absolute",
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch(
+                "services.transpose_coordinates.parse_kml_track",
+                return_value=track,
+            ),
+            patch("services.transpose_coordinates.write_kml") as write,
+        ):
+            plan = create_transposition_plan(
+                [self.fixture("line_string_namespaced.kml")],
+                temp_dir,
+                "Field",
+            )
+            result = self.run_plan(plan, elevation=80.0)
+
+        self.assertTrue(result.failed)
+        self.assertEqual(
+            result.failed_outcomes[0].error.code,
+            TranspositionErrorCode.TRANSFORMATION,
+        )
+        self.assertIn("Omitted 2 source coordinate(s)", result.failed_outcomes[0].error.message)
+        self.assertIn("fewer than two valid coordinates remain", result.failed_outcomes[0].error.message)
+        write.assert_not_called()
+
     def test_parse_error_is_a_failed_outcome_without_rotation_or_write(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (

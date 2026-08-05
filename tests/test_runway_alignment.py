@@ -425,26 +425,47 @@ class AltitudeModeTests(unittest.TestCase):
             altitude_mode=mode,
         )
 
-    def test_absolute_altitude_uses_per_file_source_elevation(self):
+    def test_absolute_altitude_omits_missing_values_and_reports_count(self):
         source = RunwayReference(51, -1, 90, 80)
-        values = _waypoints_for_transposition(
-            self.points("absolute", (75.0, 100.0, None)),
+        values, warnings = _waypoints_for_transposition(
+            self.points("absolute", (None, 75.0, None, 100.0, None)),
             source,
         )
-        self.assertEqual([point[2] for point in values], [-5.0, 20.0, 0.0])
+        self.assertEqual(
+            values,
+            [(51.001, -1.0, -5.0), (51.003, -1.0, 20.0)],
+        )
+        self.assertEqual(
+            warnings,
+            (
+                "Omitted 3 source coordinate(s) because absolute altitude was missing.",
+            ),
+        )
+
+    def test_absolute_altitude_fails_when_fewer_than_two_valid_points_remain(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Omitted 2 source coordinate.*fewer than two valid coordinates remain",
+        ):
+            _waypoints_for_transposition(
+                self.points("absolute", (None, 100.0, None)),
+                RunwayReference(51, -1, 90, 80),
+            )
 
     def test_relative_and_clamped_altitudes_are_not_subtracted(self):
         source = RunwayReference(51, -1, 90, 80)
-        relative = _waypoints_for_transposition(
+        relative, relative_warnings = _waypoints_for_transposition(
             self.points("relativeToGround", (5.0, None)),
             source,
         )
-        clamped = _waypoints_for_transposition(
+        clamped, clamped_warnings = _waypoints_for_transposition(
             self.points("clampToGround", (100.0, 200.0)),
             source,
         )
         self.assertEqual([point[2] for point in relative], [5.0, 0.0])
         self.assertEqual([point[2] for point in clamped], [0.0, 0.0])
+        self.assertEqual(relative_warnings, ())
+        self.assertEqual(clamped_warnings, ())
 
     def test_absolute_altitude_requires_reviewed_elevation(self):
         with self.assertRaisesRegex(ValueError, "elevation is required"):

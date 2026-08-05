@@ -304,6 +304,9 @@ class TransposePageTests(unittest.TestCase):
             planned_output_path=output_dir / "first.kml",
             final_output_path=output_dir / "first.kml",
             status=TranspositionFileStatus.SUCCEEDED,
+            warnings=(
+                "Omitted 2 source coordinate(s) because absolute altitude was missing.",
+            ),
         )
         failure = TranspositionFileOutcome(
             input_path=failed,
@@ -334,6 +337,48 @@ class TransposePageTests(unittest.TestCase):
         self.assertIn(str(success.output_path), message)
         self.assertIn(str(failed), message)
         self.assertIn("invalid coordinate", message)
+        self.assertIn("first.kml:", message)
+        self.assertIn("Omitted 2 source coordinate(s)", message)
+
+    def test_success_with_processing_warnings_uses_warning_dialog(self):
+        source = self.root / "source.kml"
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        self.add_inferred_files(source)
+        self.configure_target()
+        result = TranspositionBatchResult(
+            outcomes=(
+                TranspositionFileOutcome(
+                    input_path=source,
+                    planned_output_path=output_dir / "source.kml",
+                    final_output_path=output_dir / "source.kml",
+                    status=TranspositionFileStatus.SUCCEEDED,
+                    warnings=(
+                        "Omitted 3 source coordinate(s) because absolute altitude was missing.",
+                    ),
+                ),
+            )
+        )
+
+        with (
+            patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
+            patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
+            patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
+            patch("pages.transpose_page.run_transposition", return_value=result),
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QMessageBox, "information") as information,
+        ):
+            self.page.run_transposition_ui()
+
+        warning.assert_called_once()
+        self.assertEqual(
+            warning.call_args.args[1],
+            "Transposition complete with warnings",
+        )
+        self.assertIn("source.kml:", warning.call_args.args[2])
+        self.assertIn("Omitted 3 source coordinate(s)", warning.call_args.args[2])
+        information.assert_not_called()
 
     def test_zero_success_uses_critical_dialog(self):
         source = self.root / "failed.kml"

@@ -75,9 +75,8 @@ TransposePage QFrame#previewHost,
 TransposePage QDialog#inferencePopup {
     background: palette(base);
     border: 1px solid palette(mid);
-    border-radius: 10px;
+    border-radius: 12px;
 }
-TransposePage QLabel#pageTitle,
 TransposePage QLabel#dialogTitle {
     font-size: 22px;
     font-weight: 700;
@@ -88,68 +87,13 @@ TransposePage QLabel#popupHeading {
     font-size: 15px;
     font-weight: 650;
 }
-TransposePage QLabel#mutedText {
-    color: palette(window-text);
-}
-TransposePage QLabel#warningText {
-    color: #a65f00;
-}
-TransposePage QLabel#errorText {
-    color: #b3261e;
-}
 TransposePage QFrame#statusPanel {
     background: palette(alternate-base);
     border: 1px solid palette(midlight);
-    border-radius: 7px;
+    border-radius: 8px;
 }
 TransposePage QLabel#statusBadge {
     font-weight: 650;
-}
-TransposePage QLineEdit,
-TransposePage QComboBox,
-TransposePage QListWidget,
-TransposePage QTableWidget {
-    min-height: 28px;
-    border: 1px solid palette(mid);
-    border-radius: 6px;
-    padding: 3px 7px;
-    background: palette(base);
-    color: palette(text);
-    selection-background-color: palette(highlight);
-    selection-color: palette(highlighted-text);
-}
-TransposePage QLineEdit:focus,
-TransposePage QComboBox:focus,
-TransposePage QListWidget:focus {
-    border: 2px solid palette(highlight);
-}
-TransposePage QLineEdit[nonstandard="true"] {
-    border: 2px solid #b26a00;
-}
-TransposePage QPushButton,
-TransposePage QToolButton {
-    min-height: 28px;
-    border: 1px solid palette(mid);
-    border-radius: 6px;
-    padding: 4px 10px;
-    background: palette(button);
-    color: palette(button-text);
-}
-TransposePage QPushButton:hover,
-TransposePage QToolButton:hover {
-    background: palette(midlight);
-}
-TransposePage QPushButton#primaryButton {
-    min-height: 38px;
-    background: palette(highlight);
-    color: palette(highlighted-text);
-    border-color: palette(highlight);
-    font-weight: 700;
-}
-TransposePage QSplitter::handle {
-    background: palette(midlight);
-    width: 3px;
-    margin: 8px 4px;
 }
 """
 
@@ -266,19 +210,8 @@ class TransposePage(QWidget):
         self.presets: dict[UUID, PresetRecord] = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 10, 14, 14)
-        root.setSpacing(10)
-        header = QVBoxLayout()
-        title = QLabel("Transpose flight paths")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel(
-            "Review each source alignment, choose a target runway, then create a collision-safe KML batch."
-        )
-        subtitle.setObjectName("mutedText")
-        subtitle.setWordWrap(True)
-        header.addWidget(title)
-        header.addWidget(subtitle)
-        root.addLayout(header)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
@@ -299,8 +232,8 @@ class TransposePage(QWidget):
         panel = QFrame()
         panel.setObjectName("workspacePanel")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(9)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         heading_row = QHBoxLayout()
         heading = QLabel("Input files")
         heading.setObjectName("panelTitle")
@@ -353,7 +286,7 @@ class TransposePage(QWidget):
         column = QWidget()
         layout = QVBoxLayout(column)
         layout.setContentsMargins(7, 0, 7, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
         self.source_card = AirfieldCard(
             "Original airfield",
             "Threshold, heading, and elevation are inferred from the selected KML when possible.",
@@ -950,17 +883,29 @@ class TransposePage(QWidget):
             QMessageBox.critical(self, "Error", f"Transposition failed: {error}")
             return
 
+        processing_warnings = "\n".join(
+            f"{outcome.input_path.name}:\n"
+            + "\n".join(f"- {warning}" for warning in outcome.warnings)
+            for outcome in result.successful
+            if outcome.warnings
+        )
         if result.succeeded:
             successful_paths = "\n".join(
                 str(output.output_path) for output in result.successful
             )
-            QMessageBox.information(
-                self,
-                "Success",
+            message = (
                 f"Transposition complete!\n"
                 f"Saved {len(result.successful)} KML file(s) to:\n{output_dir}\n\n"
-                f"Outputs:\n{successful_paths}",
+                f"Outputs:\n{successful_paths}"
             )
+            if processing_warnings:
+                QMessageBox.warning(
+                    self,
+                    "Transposition complete with warnings",
+                    f"{message}\n\nWarnings:\n{processing_warnings}",
+                )
+            else:
+                QMessageBox.information(self, "Success", message)
             return
 
         failed_paths = "\n".join(
@@ -977,12 +922,17 @@ class TransposePage(QWidget):
                 f"No KML files were produced.\n\nFailed inputs:\n{failed_paths}",
             )
             return
+        warning_section = (
+            f"\n\nWarnings:\n{processing_warnings}"
+            if processing_warnings
+            else ""
+        )
         QMessageBox.warning(
             self,
             "Transposition partially complete",
             f"Saved {result.success_count} of {result.total_count} KML file(s).\n\n"
             f"Successful outputs:\n{successful_paths}\n\n"
-            f"Failed inputs:\n{failed_paths}",
+            f"Failed inputs:\n{failed_paths}{warning_section}",
         )
 
     def capture_preset_data(self) -> dict[str, object]:

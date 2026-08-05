@@ -40,9 +40,8 @@ DebrisPage QDialog#debrisPresetManager,
 DebrisPage QDialog#debrisPreviewDialog {
     background: palette(base);
     border: 1px solid palette(mid);
-    border-radius: 10px;
+    border-radius: 12px;
 }
-DebrisPage QLabel#pageTitle,
 DebrisPage QLabel#dialogTitle {
     font-size: 22px;
     font-weight: 700;
@@ -56,98 +55,20 @@ DebrisPage QLabel#sectionTitle {
     font-weight: 650;
     padding-top: 4px;
 }
-DebrisPage QLabel#mutedText {
-    color: palette(window-text);
-}
 DebrisPage QFrame#statusPanel,
 DebrisPage QFrame#inputPanel {
     background: palette(alternate-base);
     border: 1px solid palette(midlight);
-    border-radius: 7px;
+    border-radius: 8px;
 }
 DebrisPage QFrame#dropZone {
     background: palette(alternate-base);
     border: 1px dashed palette(mid);
     border-radius: 8px;
 }
-DebrisPage QFrame#dropZone[status="ready"] {
-    border: 2px solid #2e7d32;
-}
-DebrisPage QFrame#dropZone[status="error"] {
-    border: 2px solid #b3261e;
-}
-DebrisPage QLabel[status="success"] {
-    color: #2e7d32;
-    font-weight: 650;
-}
-DebrisPage QLabel[status="warning"] {
-    color: #a65f00;
-    font-weight: 650;
-}
-DebrisPage QLabel[status="error"] {
-    color: #b3261e;
-    font-weight: 650;
-}
-DebrisPage QLineEdit,
-DebrisPage QComboBox,
-DebrisPage QListWidget {
-    min-height: 28px;
-    border: 1px solid palette(mid);
-    border-radius: 6px;
-    padding: 3px 7px;
-    background: palette(base);
-    color: palette(text);
-    selection-background-color: palette(highlight);
-    selection-color: palette(highlighted-text);
-}
-DebrisPage QLineEdit:focus,
-DebrisPage QComboBox:focus,
-DebrisPage QListWidget:focus {
-    border: 2px solid palette(highlight);
-}
-DebrisPage QPushButton {
-    min-height: 28px;
-    border: 1px solid palette(mid);
-    border-radius: 6px;
-    padding: 4px 10px;
-    background: palette(button);
-    color: palette(button-text);
-}
-DebrisPage QPushButton:hover {
-    background: palette(midlight);
-}
-DebrisPage QPushButton#primaryButton {
-    min-height: 38px;
-    background: palette(highlight);
-    color: palette(highlighted-text);
-    border-color: palette(highlight);
-    font-weight: 700;
-}
-DebrisPage QPushButton#dangerButton {
-    color: #b3261e;
-}
-DebrisPage QPushButton#dangerButton:disabled {
-    color: palette(mid);
-}
 DebrisPage QRadioButton {
     min-height: 28px;
     padding: 3px 6px;
-}
-DebrisPage QProgressBar {
-    min-height: 16px;
-    border: 1px solid palette(mid);
-    border-radius: 6px;
-    text-align: center;
-    background: palette(base);
-}
-DebrisPage QProgressBar::chunk {
-    background: palette(highlight);
-    border-radius: 5px;
-}
-DebrisPage QSplitter::handle {
-    background: palette(midlight);
-    width: 3px;
-    margin: 8px 4px;
 }
 DebrisPage QLabel#previewIcon {
     font-size: 54px;
@@ -156,7 +77,7 @@ DebrisPage QLabel#previewIcon {
 DebrisPage QLabel#previewPath {
     background: palette(alternate-base);
     border: 1px solid palette(midlight);
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 10px;
 }
 """
@@ -398,19 +319,8 @@ class DebrisPage(PresetUiMixin, QWidget):
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 10, 14, 14)
-        root.setSpacing(10)
-
-        title = QLabel("Debris trajectory")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel(
-            "Configure the debris model, define the flight state, then generate a "
-            "Google Earth-ready trajectory KML."
-        )
-        subtitle.setObjectName("mutedText")
-        subtitle.setWordWrap(True)
-        root.addWidget(title)
-        root.addWidget(subtitle)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
 
         self.presets_widget = QFrame()
         self.presets_widget.setObjectName("presetToolbar")
@@ -425,19 +335,19 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.config_widget.setObjectName("workspacePanel")
         config = QVBoxLayout(self.config_widget)
         config.setContentsMargins(18, 16, 18, 16)
-        config.setSpacing(10)
+        config.setSpacing(12)
         self.build_config(config)
 
         self.file_widget = QWidget()
         right = QVBoxLayout(self.file_widget)
         right.setContentsMargins(7, 0, 0, 0)
-        right.setSpacing(10)
+        right.setSpacing(12)
 
         self.flight_input_card = QFrame()
         self.flight_input_card.setObjectName("workspacePanel")
         file_panel = QVBoxLayout(self.flight_input_card)
         file_panel.setContentsMargins(18, 16, 18, 16)
-        file_panel.setSpacing(10)
+        file_panel.setSpacing(12)
         self.build_file_panel(file_panel)
         right.addWidget(self.flight_input_card)
 
@@ -445,7 +355,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.results_widget.setObjectName("resultsCard")
         results_layout = QVBoxLayout(self.results_widget)
         results_layout.setContentsMargins(18, 16, 18, 16)
-        results_layout.setSpacing(9)
+        results_layout.setSpacing(12)
         self.build_results_panel(results_layout)
         right.addWidget(self.results_widget)
         right.addStretch()
@@ -780,6 +690,13 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.kml_meta_pen_lon = QLabel("Penultimate longitude: —")
         self.kml_meta_fin_lat = QLabel("Final latitude: —")
         self.kml_meta_fin_lon = QLabel("Final longitude: —")
+        for coordinate_label in (
+            self.kml_meta_pen_lat,
+            self.kml_meta_pen_lon,
+            self.kml_meta_fin_lat,
+            self.kml_meta_fin_lon,
+        ):
+            coordinate_label.setProperty("dataRole", "coordinate")
 
         metadata_layout.addWidget(self.kml_meta_pen_lat, 0, 0)
         metadata_layout.addWidget(self.kml_meta_pen_lon, 0, 1)
