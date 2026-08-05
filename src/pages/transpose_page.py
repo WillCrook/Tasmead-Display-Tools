@@ -1,27 +1,170 @@
+from __future__ import annotations
+
 from collections.abc import Mapping
+from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
+from uuid import UUID
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QMessageBox, QPushButton, QSplitter, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QStyle,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
 from file_dialog_state import (
-    FileDialogDirection, FileDialogWorkflow, remember_directory,
-    remember_file_selection, remembered_directory,
+    FileDialogDirection,
+    FileDialogWorkflow,
+    remember_directory,
+    remember_file_selection,
+    remembered_directory,
+)
+from pages.airfield_ui import (
+    AirfieldCard,
+    AirfieldFormValues,
+    AirfieldPresetManagerDialog,
+    confirm_nonstandard_runways,
+    format_optional_number,
 )
 from resource_paths import app_data_path, resource_path
 from services import (
-    CoordinateInputError, PresetType, RunwayReference, apply_source_runways,
-    create_transposition_plan, customize_transposition_plan,
-    infer_departure_runway, parse_kml_track, run_transposition,
+    AirfieldPresetData,
+    AirfieldPresetError,
+    CoordinateInputError,
+    PresetImportExportService,
+    PresetRecord,
+    PresetRepository,
+    PresetType,
+    RunwayInferenceResult,
+    RunwayReference,
+    apply_source_runways,
+    create_transposition_plan,
+    customize_transposition_plan,
+    infer_departure_runway,
+    normalise_runway_designator,
+    parse_coordinate_pair,
+    parse_kml_track,
+    run_transposition,
 )
-from pages.coordinate_input import CoordinatePairInput
-from pages.preset_ui import PresetPanelLabels, PresetUiMixin
-from pages.unit_fields import MetreFeetFieldPair
+
+
+PAGE_STYLE = """
+TransposePage {
+    background: palette(window);
+}
+TransposePage QFrame#workspacePanel,
+TransposePage QFrame#airfieldCard,
+TransposePage QFrame#previewHost,
+TransposePage QDialog#inferencePopup {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 10px;
+}
+TransposePage QLabel#pageTitle,
+TransposePage QLabel#dialogTitle {
+    font-size: 22px;
+    font-weight: 700;
+}
+TransposePage QLabel#cardTitle,
+TransposePage QLabel#panelTitle,
+TransposePage QLabel#popupHeading {
+    font-size: 15px;
+    font-weight: 650;
+}
+TransposePage QLabel#mutedText {
+    color: palette(window-text);
+}
+TransposePage QLabel#warningText {
+    color: #a65f00;
+}
+TransposePage QLabel#errorText {
+    color: #b3261e;
+}
+TransposePage QFrame#statusPanel {
+    background: palette(alternate-base);
+    border: 1px solid palette(midlight);
+    border-radius: 7px;
+}
+TransposePage QLabel#statusBadge {
+    font-weight: 650;
+}
+TransposePage QLineEdit,
+TransposePage QComboBox,
+TransposePage QListWidget,
+TransposePage QTableWidget {
+    min-height: 28px;
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 3px 7px;
+    background: palette(base);
+    color: palette(text);
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+TransposePage QLineEdit:focus,
+TransposePage QComboBox:focus,
+TransposePage QListWidget:focus {
+    border: 2px solid palette(highlight);
+}
+TransposePage QLineEdit[nonstandard="true"] {
+    border: 2px solid #b26a00;
+}
+TransposePage QPushButton,
+TransposePage QToolButton {
+    min-height: 28px;
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 4px 10px;
+    background: palette(button);
+    color: palette(button-text);
+}
+TransposePage QPushButton:hover,
+TransposePage QToolButton:hover {
+    background: palette(midlight);
+}
+TransposePage QPushButton#primaryButton {
+    min-height: 38px;
+    background: palette(highlight);
+    color: palette(highlighted-text);
+    border-color: palette(highlight);
+    font-weight: 700;
+}
+TransposePage QSplitter::handle {
+    background: palette(midlight);
+    width: 3px;
+    margin: 8px 4px;
+}
+"""
+
+
+@dataclass(slots=True)
+class SourceAirfieldState:
+    path: Path
+    values: AirfieldFormValues = AirfieldFormValues()
+    auto_values: AirfieldFormValues | None = None
+    provenance: str = "Needs input"
+    analysed: bool = False
+    altitude_mode: str | None = None
+    inference: RunwayInferenceResult | None = None
+    parse_error: str | None = None
+    details: str = ""
 
 
 class TranspositionOutputDialog(QDialog):
@@ -70,7 +213,7 @@ class TranspositionOutputDialog(QDialog):
         layout.addWidget(table)
 
         self.error_label = QLabel()
-        self.error_label.setStyleSheet("color: #b00020;")
+        self.error_label.setObjectName("errorText")
         self.error_label.setWordWrap(True)
         self.error_label.setAccessibleName("Output filename error")
         layout.addWidget(self.error_label)
@@ -99,344 +242,301 @@ class TranspositionOutputDialog(QDialog):
         self.accept()
 
 
-class RunwayReviewDialog(QDialog):
-    """Require confirmation of one inferred departure alignment per input."""
-
-    def __init__(self, input_files, fallback_elevation_m=None, parent=None):
-        super().__init__(parent)
-        self.reviewed_runways = None
-        self._rows = []
-        self.setWindowTitle("Review Source Departure Runways")
-        self.resize(1120, min(680, 230 + len(input_files) * 62))
-
-        layout = QVBoxLayout(self)
-        instruction = QLabel(
-            "Review every inferred departure threshold, true heading, and source "
-            "ground-reference elevation. These are KML-derived suggestions, not "
-            "surveyed or confirmed runway data."
-        )
-        instruction.setWordWrap(True)
-        layout.addWidget(instruction)
-
-        table = QTableWidget(len(input_files), 7, self)
-        table.setHorizontalHeaderLabels(
-            (
-                "Input KML",
-                "Threshold latitude",
-                "Threshold longitude",
-                "True heading (°)",
-                "Ground reference elevation (m)",
-                "Heading / threshold confidence",
-                "Evidence / warnings",
-            )
-        )
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setAlternatingRowColors(True)
-
-        for row, input_file in enumerate(input_files):
-            path = Path(input_file)
-            input_item = QTableWidgetItem(path.name)
-            input_item.setToolTip(str(path))
-            input_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            table.setItem(row, 0, input_item)
-
-            parsed_track = None
-            inference = None
-            parse_error = None
-            try:
-                parsed_track = parse_kml_track(path)
-                inference = infer_departure_runway(
-                    parsed_track,
-                    fallback_elevation_m=fallback_elevation_m,
-                )
-            except Exception as error:
-                parse_error = str(error)
-
-            candidate = inference.candidate if inference is not None else None
-            reference = candidate.reference if candidate is not None else None
-            edits = []
-            initial_values = (
-                f"{reference.latitude:.8f}" if reference else "",
-                f"{reference.longitude:.8f}" if reference else "",
-                f"{reference.true_heading_deg:.2f}" if reference else "",
-                (
-                    f"{reference.elevation_m:.2f}"
-                    if reference is not None and reference.elevation_m is not None
-                    else f"{fallback_elevation_m:.2f}"
-                    if parsed_track is not None
-                    and parsed_track.altitude_mode == "absolute"
-                    and fallback_elevation_m is not None
-                    else ""
-                ),
-            )
-            for column, value in enumerate(initial_values, start=1):
-                edit = QLineEdit(value)
-                edit.setAccessibleName(
-                    f"{table.horizontalHeaderItem(column).text()} for {path.name}"
-                )
-                if parse_error is not None:
-                    edit.setEnabled(False)
-                table.setCellWidget(row, column, edit)
-                edits.append(edit)
-
-            if parse_error is not None:
-                confidence_text = "Unavailable"
-                notes = parse_error
-            elif candidate is None:
-                confidence_text = "Manual entry required"
-                notes = inference.error or "No runway candidate was inferred."
-                if inference.warnings:
-                    notes += " " + " ".join(inference.warnings)
-            else:
-                confidence_text = (
-                    f"Heading: {candidate.heading_confidence.value.title()}; "
-                    f"threshold: {candidate.threshold_confidence.value.title()}"
-                )
-                notes = "; ".join(candidate.evidence + candidate.warnings)
-            confidence_item = QTableWidgetItem(confidence_text)
-            confidence_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            table.setItem(row, 5, confidence_item)
-            notes_item = QTableWidgetItem(notes)
-            notes_item.setToolTip(notes)
-            notes_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            table.setItem(row, 6, notes_item)
-            self._rows.append(
-                {
-                    "path": path,
-                    "edits": tuple(edits),
-                    "altitude_mode": (
-                        parsed_track.altitude_mode if parsed_track is not None else None
-                    ),
-                    "parse_error": parse_error,
-                }
-            )
-
-        table.resizeColumnsToContents()
-        layout.addWidget(table)
-
-        self.error_label = QLabel()
-        self.error_label.setStyleSheet("color: #b00020;")
-        self.error_label.setWordWrap(True)
-        self.error_label.setAccessibleName("Runway review error")
-        layout.addWidget(self.error_label)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
-            "Confirm Runway Alignments"
-        )
-        buttons.accepted.connect(self._validate_and_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _validate_and_accept(self):
-        reviewed = []
-        for row in self._rows:
-            if row["parse_error"] is not None:
-                reviewed.append(None)
-                continue
-            path = row["path"]
-            latitude_edit, longitude_edit, heading_edit, elevation_edit = row["edits"]
-            try:
-                latitude = float(latitude_edit.text())
-                longitude = float(longitude_edit.text())
-                heading = float(heading_edit.text())
-                elevation_text = elevation_edit.text().strip()
-                elevation = float(elevation_text) if elevation_text else None
-                if row["altitude_mode"] == "absolute" and elevation is None:
-                    raise ValueError(
-                        "source elevation is required for absolute-altitude KML"
-                    )
-                reference = RunwayReference(
-                    latitude=latitude,
-                    longitude=longitude,
-                    true_heading_deg=heading,
-                    elevation_m=elevation,
-                )
-            except ValueError as error:
-                self.error_label.setText(f"{path.name}: {error}")
-                return
-            reviewed.append(reference)
-        self.error_label.clear()
-        self.reviewed_runways = tuple(reviewed)
-        self.accept()
-
-
-class TransposePage(PresetUiMixin, QWidget):
+class TransposePage(QWidget):
+    """Three-column workspace for reviewed runway-to-runway transposition."""
 
     def __init__(self):
         super().__init__()
-        layout = QHBoxLayout(self)
+        self.setObjectName("TransposePage")
+        self.setStyleSheet(PAGE_STYLE)
+        self.input_files: list[str] = []
+        self.source_states: dict[str, SourceAirfieldState] = {}
+        self._current_source_path: str | None = None
+        self._rendering_source = False
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("""
-            QSplitter::handle {
-                background-color: black;
-                width: 6px;
-            }
-        """)
-        layout.addWidget(splitter)
-
-        presets_widget = QWidget()
-        config_widget = QWidget()
-        file_widget = QWidget()
-
-        presets_layout = QVBoxLayout(presets_widget)
-        config_layout = QVBoxLayout(config_widget)
-        file_layout = QVBoxLayout(file_widget)
-
-        splitter.addWidget(presets_widget)
-        splitter.addWidget(config_widget)
-        splitter.addWidget(file_widget)
-
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 2)
-
-        # Presets
-        self.initialize_preset_management(
-            preset_type=PresetType.AIRFIELD,
-            managed_directory=app_data_path("presets/airfield"),
-            legacy_managed_directory=app_data_path("airfields"),
-            legacy_readonly_directory=resource_path("data/airfields"),
+        self.preset_repository = PresetRepository(
+            app_data_path("presets/airfield"),
+            PresetType.AIRFIELD,
+            legacy_managed_directories=(app_data_path("airfields"),),
+            legacy_readonly_directories=(resource_path("data/airfields"),),
             backup_directory=app_data_path("presets/legacy-backup/airfield"),
         )
-        self.build_preset_panel(
-            presets_layout,
-            PresetPanelLabels(
-                title="Airfield Presets",
-                save="Save Preset",
-                load="Load Preset",
-                rename="Rename Preset",
-                delete="Delete Preset",
-                export="Export Preset",
-            ),
+        self.preset_store = self.preset_repository
+        self.preset_transfer = PresetImportExportService(self.preset_repository)
+        self.presets: dict[UUID, PresetRecord] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 10, 14, 14)
+        root.setSpacing(10)
+        header = QVBoxLayout()
+        title = QLabel("Transpose flight paths")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Review each source alignment, choose a target runway, then create a collision-safe KML batch."
         )
-        self.load_presets_from_disk()
+        subtitle.setObjectName("mutedText")
+        subtitle.setWordWrap(True)
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        root.addLayout(header)
 
-        # Config (Lat, Lon, Heading)
-        self.build_config_panel(config_layout)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        root.addWidget(self.splitter, 1)
 
-        # File Drop & Run
-        self.input_files = []
-        self.build_file_panel(file_layout)
+        self._build_file_column()
+        self._build_airfield_column()
+        self._build_preview_column()
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setSizes((235, 430, 285))
 
-    def build_config_panel(self, layout):
-        # Backward-compatible fallback for legacy airfield presets.
-        orig_title = QLabel("Source Runway Fallback")
-        orig_title.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(orig_title)
+        self._load_presets(show_issues=True)
+        self._render_source_state(None)
 
-        self.orig_height_input = QLineEdit()
-        self.orig_height_input.setPlaceholderText("Elevation (m)")
+    def _build_file_column(self) -> None:
+        panel = QFrame()
+        panel.setObjectName("workspacePanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(9)
+        heading_row = QHBoxLayout()
+        heading = QLabel("Input files")
+        heading.setObjectName("panelTitle")
+        self.file_count_label = QLabel("0 files")
+        self.file_count_label.setObjectName("mutedText")
+        heading_row.addWidget(heading)
+        heading_row.addStretch()
+        heading_row.addWidget(self.file_count_label)
+        layout.addLayout(heading_row)
+        hint = QLabel("Drop KML files here or add them from disk.")
+        hint.setObjectName("mutedText")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
-        m_layout = QVBoxLayout()
-        m_layout.addWidget(QLabel("Fallback Elevation (m)"))
-        m_layout.addWidget(self.orig_height_input)
-
-        self.orig_height_ft_input = QLineEdit()
-        self.orig_height_ft_input.setPlaceholderText("Elevation (ft)")
-
-        ft_layout = QVBoxLayout()
-        ft_layout.addWidget(QLabel("Fallback Elevation (ft)"))
-        ft_layout.addWidget(self.orig_height_ft_input)
-        
-        # Container for both
-        h_layout = QHBoxLayout()
-        h_layout.addLayout(m_layout)
-        h_layout.addLayout(ft_layout)
-
-        layout.addLayout(h_layout)
-
-        self._orig_height_units = MetreFeetFieldPair(
-            self.orig_height_input,
-            self.orig_height_ft_input,
-        )
-        
-        layout.addSpacing(20)
-
-        # Target Airfield Section
-        title = QLabel("Target Airfield")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(title)
-
-        self.airfield_name_input = QLineEdit()
-        self.airfield_name_input.setPlaceholderText("Airfield Name")
-        layout.addWidget(QLabel("Airfield Name"))
-        layout.addWidget(self.airfield_name_input)
-
-        self.coordinate_input = CoordinatePairInput(
-            "Target departure runway threshold coordinates"
-        )
-        layout.addWidget(QLabel("Departure Threshold (Latitude, Longitude)"))
-        layout.addWidget(self.coordinate_input)
-
-        self.heading_input = QLineEdit()
-        self.heading_input.setPlaceholderText("True heading (0–360°)")
-        layout.addWidget(QLabel("Target Runway True Heading (°)"))
-        layout.addWidget(self.heading_input)
-
-        layout.addStretch()
-
-    def build_file_panel(self, layout):
-        title = QLabel("Transposition")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(title)
-
-        # Replace QLabel with QListWidget for file list
         self.file_list = QListWidget()
-        self.file_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.file_list.setMinimumHeight(120)
+        self.file_list.setAccessibleName("Input KML files")
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list.setAcceptDrops(True)
-        self.file_list.setDragDropMode(QListWidget.DragDropMode.DropOnly)
-        
-        # Override drop event on the list widget
+        self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.file_list.dragEnterEvent = self.drag_enter
         self.file_list.dragMoveEvent = self.drag_move
         self.file_list.dropEvent = self.drop_event
+        self.file_list.currentItemChanged.connect(self._current_file_changed)
+        layout.addWidget(self.file_list, 1)
 
-        layout.addWidget(self.file_list)
+        file_actions = QHBoxLayout()
+        self.add_files_btn = QPushButton("Add files")
+        self.add_files_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder)
+        )
+        self.remove_files_btn = QPushButton("Remove")
+        self.remove_files_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        )
+        self.add_files_btn.clicked.connect(self.browse_files)
+        self.remove_files_btn.clicked.connect(self.remove_selected_files)
+        file_actions.addWidget(self.add_files_btn)
+        file_actions.addWidget(self.remove_files_btn)
+        layout.addLayout(file_actions)
 
-        # Buttons for file management
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Add Files")
-        remove_btn = QPushButton("Remove Selected")
-        
-        add_btn.clicked.connect(self.browse_files)
-        remove_btn.clicked.connect(self.remove_selected_files)
-        
-        btn_layout.addWidget(add_btn)
-        btn_layout.addWidget(remove_btn)
-        layout.addLayout(btn_layout)
+        self.manage_airfields_btn = QPushButton("Manage airfields…")
+        self.manage_airfields_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        )
+        self.manage_airfields_btn.clicked.connect(self.open_airfield_manager)
+        layout.addWidget(self.manage_airfields_btn)
+        self.splitter.addWidget(panel)
 
-        self.run_btn = QPushButton("Run Transposition")
+    def _build_airfield_column(self) -> None:
+        column = QWidget()
+        layout = QVBoxLayout(column)
+        layout.setContentsMargins(7, 0, 7, 0)
+        layout.setSpacing(10)
+        self.source_card = AirfieldCard(
+            "Original airfield",
+            "Threshold, heading, and elevation are inferred from the selected KML when possible.",
+            include_elevation=True,
+            show_inference=True,
+        )
+        self.target_card = AirfieldCard(
+            "Target airfield",
+            "Choose a preset or enter the target runway manually.",
+            include_elevation=False,
+            show_inference=False,
+        )
+        self.source_card.user_edited.connect(self._source_form_edited)
+        self.source_card.restore_auto_requested.connect(self._restore_auto_source)
+        self.source_card.preset_apply_requested.connect(self._apply_source_preset)
+        self.target_card.preset_apply_requested.connect(self._apply_target_preset)
+        layout.addWidget(self.source_card)
+        layout.addWidget(self.target_card)
+        self.run_btn = QPushButton("Transpose files")
+        self.run_btn.setObjectName("primaryButton")
         self.run_btn.clicked.connect(self.run_transposition_ui)
         layout.addWidget(self.run_btn)
-
         layout.addStretch()
+        self.splitter.addWidget(column)
 
-    def drag_enter(self, event):
+        # Stable aliases for extensions that used the former target widgets.
+        self.airfield_name_input = self.target_card.name_input
+        self.coordinate_input = self.target_card.coordinate_input
+        self.heading_input = self.target_card.heading_input
+        self.target_runway_input = self.target_card.runway_input
+        self.orig_height_input = self.source_card.elevation_m_input
+        self.orig_height_ft_input = self.source_card.elevation_ft_input
+
+    def _build_preview_column(self) -> None:
+        self.preview_host = QFrame()
+        self.preview_host.setObjectName("previewHost")
+        layout = QVBoxLayout(self.preview_host)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.addStretch()
+        icon = QLabel("◫")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet("font-size: 42px; color: palette(mid);")
+        title = QLabel("3D preview")
+        title.setObjectName("panelTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        description = QLabel("Reserved for the future Google Maps preview.")
+        description.setObjectName("mutedText")
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        description.setWordWrap(True)
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addStretch()
+        self.splitter.addWidget(self.preview_host)
+
+    def _load_presets(self, *, show_issues: bool = False) -> None:
+        self.presets = self.preset_repository.load_all()
+        if show_issues and self.preset_repository.issues:
+            issues = list(dict.fromkeys(self.preset_repository.issues))
+            QMessageBox.warning(
+                self,
+                "Preset files need attention",
+                "Some airfield presets could not be loaded or migrated:\n\n"
+                + "\n".join(f"• {issue}" for issue in issues[:8]),
+            )
+            self.preset_repository.issues.clear()
+        for card in (self.source_card, self.target_card):
+            selected = card.preset_combo.currentData(Qt.ItemDataRole.UserRole)
+            card.preset_combo.clear()
+            card.preset_combo.addItem("Choose an airfield preset", None)
+            for record in sorted(
+                self.presets.values(), key=lambda item: item.preset.name.casefold()
+            ):
+                card.preset_combo.addItem(record.preset.name, str(record.preset.id))
+            if selected:
+                index = card.preset_combo.findData(selected, Qt.ItemDataRole.UserRole)
+                if index >= 0:
+                    card.preset_combo.setCurrentIndex(index)
+
+    def open_airfield_manager(self) -> None:
+        dialog = AirfieldPresetManagerDialog(
+            self.preset_repository,
+            self.preset_transfer,
+            self,
+        )
+        dialog.exec()
+        self._load_presets()
+
+    def _selected_preset(self, card: AirfieldCard) -> PresetRecord | None:
+        raw_id = card.preset_combo.currentData(Qt.ItemDataRole.UserRole)
+        if not raw_id:
+            card.set_error("Choose an airfield preset first.")
+            return None
+        try:
+            preset_id = UUID(str(raw_id))
+        except ValueError:
+            card.set_error("The selected preset has an invalid identity.")
+            return None
+        record = self.presets.get(preset_id)
+        if record is None:
+            card.set_error("The selected preset is no longer available.")
+        return record
+
+    @staticmethod
+    def _values_from_preset(payload: AirfieldPresetData) -> AirfieldFormValues:
+        threshold = ""
+        if payload.threshold_latitude is not None and payload.threshold_longitude is not None:
+            threshold = (
+                f"{format_optional_number(payload.threshold_latitude)}, "
+                f"{format_optional_number(payload.threshold_longitude)}"
+            )
+        return AirfieldFormValues(
+            airfield_name=payload.airfield_name,
+            runway=payload.runway,
+            threshold=threshold,
+            true_heading=format_optional_number(payload.true_heading_deg),
+            elevation_m=format_optional_number(payload.elevation_m, 2),
+        )
+
+    def _decode_selected_preset(
+        self, card: AirfieldCard
+    ) -> tuple[AirfieldPresetData, tuple[str, ...]] | None:
+        record = self._selected_preset(card)
+        if record is None:
+            return None
+        try:
+            return AirfieldPresetData.from_mapping(record.preset.data)
+        except AirfieldPresetError as error:
+            card.set_error(str(error))
+            return None
+
+    def _apply_source_preset(self) -> None:
+        if self._current_source_path is None:
+            self.source_card.set_error("Select an input KML file first.")
+            return
+        decoded = self._decode_selected_preset(self.source_card)
+        if decoded is None:
+            return
+        payload, warnings = decoded
+        state = self.source_states[self._current_source_path]
+        state.values = self._values_from_preset(payload)
+        state.provenance = "Preset"
+        preset_notes = "\n".join(warnings)
+        if preset_notes:
+            state.details = "\n\n".join(filter(None, (state.details, preset_notes)))
+        self._render_source_state(state)
+
+    def _apply_target_preset(self) -> None:
+        decoded = self._decode_selected_preset(self.target_card)
+        if decoded is None:
+            return
+        payload, warnings = decoded
+        values = self._values_from_preset(payload)
+        self.target_card.set_values(
+            AirfieldFormValues(
+                airfield_name=values.airfield_name,
+                runway=values.runway,
+                threshold=values.threshold,
+                true_heading=values.true_heading,
+            )
+        )
+        if warnings:
+            self.target_card.set_error(" ".join(warnings))
+
+    def drag_enter(self, event) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-    
-    def drag_move(self, event):
+
+    def drag_move(self, event) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    def drop_event(self, event):
-        urls = event.mimeData().urls()
-        if urls:
-            new_files = [
-                url.toLocalFile()
-                for url in urls
-                if url.toLocalFile().lower().endswith(".kml")
-            ]
-            self.add_files_to_list(new_files)
+    def drop_event(self, event) -> None:
+        files = [
+            url.toLocalFile()
+            for url in event.mimeData().urls()
+            if url.toLocalFile().lower().endswith(".kml")
+        ]
+        if files:
+            self.add_files_to_list(files)
+            event.acceptProposedAction()
 
-    def browse_files(self, event=None):
+    def browse_files(self, _event=None) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select KML Files",
@@ -446,139 +546,374 @@ class TransposePage(PresetUiMixin, QWidget):
             ),
             "KML Files (*.kml)",
         )
-        if files:
-            remember_file_selection(
-                FileDialogWorkflow.TRANSPOSITION,
-                FileDialogDirection.INPUT,
-                files[0],
-            )
-            self.add_files_to_list(files)
-
-    def add_files_to_list(self, files):
-        existing_files = {self.file_list.item(i).text() for i in range(self.file_list.count())}
-        for f in files:
-            if f not in existing_files:
-                self.file_list.addItem(f)
-                self.input_files.append(f)
-
-    def remove_selected_files(self):
-        for item in self.file_list.selectedItems():
-            row = self.file_list.row(item)
-            self.file_list.takeItem(row)
-            if item.text() in self.input_files:
-                self.input_files.remove(item.text())
-
-    def update_file_label(self):
-        # Deprecated, logic moved to list widget
-        pass
-
-    def save_preset(self):
-        try:
-            preset = self.capture_preset_data()
-        except CoordinateInputError as error:
-            QMessageBox.warning(self, "Invalid coordinate", str(error))
+        if not files:
             return
-        default_name = self.airfield_name_input.text()
-        name, ok = QInputDialog.getText(self, "Save Preset", "Enter preset name:", text=default_name)
-        if not ok or not name:
-            return
-
-        self.save_preset_data(
-            name,
-            preset,
-            error_title="Error",
-        )
-
-    def capture_preset_data(self) -> dict[str, object]:
-        latitude, longitude = self.coordinate_input.preset_components()
-        return {
-            "name": self.airfield_name_input.text(),
-            "latitude": latitude,
-            "longitude": longitude,
-            "heading": self.heading_input.text(),
-            "original_elevation_m": self.orig_height_input.text(),
-        }
-
-    def load_preset_from_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load Preset",
-            remembered_directory(
-                FileDialogWorkflow.AIRFIELD_PRESET,
-                FileDialogDirection.INPUT,
-            ),
-            "JSON Files (*.json);;All Files (*)",
-        )
-        if not path:
-            return
-
         remember_file_selection(
-            FileDialogWorkflow.AIRFIELD_PRESET,
+            FileDialogWorkflow.TRANSPOSITION,
             FileDialogDirection.INPUT,
-            path,
+            files[0],
+        )
+        self.add_files_to_list(files)
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+    def add_files_to_list(self, files) -> None:
+        existing = {self._path_key(path) for path in self.input_files}
+        first_new: QListWidgetItem | None = None
+        for raw_path in files:
+            path = str(Path(raw_path).resolve(strict=False))
+            key = self._path_key(path)
+            if key in existing:
+                continue
+            item = QListWidgetItem(Path(path).name)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            item.setData(
+                Qt.ItemDataRole.AccessibleDescriptionRole,
+                f"Full path: {path}",
+            )
+            self.file_list.addItem(item)
+            self.input_files.append(path)
+            self.source_states[path] = SourceAirfieldState(Path(path))
+            existing.add(key)
+            if first_new is None:
+                first_new = item
+        self._update_file_count()
+        if self.file_list.currentItem() is None and first_new is not None:
+            self.file_list.setCurrentItem(first_new)
+
+    def remove_selected_files(self) -> None:
+        self._commit_current_source()
+        items = list(self.file_list.selectedItems())
+        for item in items:
+            path = str(item.data(Qt.ItemDataRole.UserRole))
+            self.source_states.pop(path, None)
+            if path in self.input_files:
+                self.input_files.remove(path)
+            self.file_list.takeItem(self.file_list.row(item))
+        self._update_file_count()
+        if self.file_list.currentItem() is None and self.file_list.count():
+            self.file_list.setCurrentRow(0)
+        elif not self.file_list.count():
+            self._current_source_path = None
+            self._render_source_state(None)
+
+    def _update_file_count(self) -> None:
+        count = len(self.input_files)
+        self.file_count_label.setText(f"{count} file" if count == 1 else f"{count} files")
+
+    def update_file_label(self) -> None:
+        """Compatibility hook retained for extensions; the list is always current."""
+        self._update_file_count()
+
+    def _current_file_changed(
+        self,
+        current: QListWidgetItem | None,
+        _previous: QListWidgetItem | None,
+    ) -> None:
+        self._commit_current_source()
+        self._current_source_path = (
+            str(current.data(Qt.ItemDataRole.UserRole)) if current is not None else None
+        )
+        if self._current_source_path is None:
+            self._render_source_state(None)
+            return
+        state = self.source_states.setdefault(
+            self._current_source_path,
+            SourceAirfieldState(Path(self._current_source_path)),
+        )
+        if not state.analysed:
+            self._analyse_source(state)
+        self._render_source_state(state)
+
+    def _analyse_source(self, state: SourceAirfieldState) -> None:
+        state.analysed = True
+        try:
+            track = parse_kml_track(state.path)
+            state.altitude_mode = track.altitude_mode
+            inference = infer_departure_runway(track)
+            state.inference = inference
+        except Exception as error:
+            state.parse_error = str(error)
+            state.provenance = "File error"
+            state.details = str(error)
+            return
+
+        candidate = inference.candidate
+        warnings = list(inference.warnings)
+        if candidate is None:
+            state.provenance = "Needs input"
+            state.details = "\n".join(
+                filter(None, (inference.error or "", *warnings))
+            )
+            return
+        reference = candidate.reference
+        auto_values = AirfieldFormValues(
+            threshold=(
+                f"{format_optional_number(reference.latitude)}, "
+                f"{format_optional_number(reference.longitude)}"
+            ),
+            true_heading=format_optional_number(reference.true_heading_deg, 2),
+            elevation_m=format_optional_number(reference.elevation_m, 2),
+        )
+        state.auto_values = auto_values
+        state.values = auto_values
+        state.provenance = "Auto-detected"
+        evidence = ["Evidence:", *candidate.evidence]
+        combined_warnings = list(dict.fromkeys((*warnings, *candidate.warnings)))
+        if combined_warnings:
+            evidence.extend(("", "Warnings:", *combined_warnings))
+        state.details = "\n".join(evidence)
+
+    def _commit_current_source(self) -> None:
+        if self._rendering_source or self._current_source_path is None:
+            return
+        state = self.source_states.get(self._current_source_path)
+        if state is not None and state.parse_error is None:
+            state.values = self.source_card.values()
+
+    def _source_form_edited(self) -> None:
+        if self._rendering_source or self._current_source_path is None:
+            return
+        state = self.source_states.get(self._current_source_path)
+        if state is None or state.parse_error is not None:
+            return
+        state.values = self.source_card.values()
+        state.provenance = "Manual override"
+        self._render_source_status(state)
+
+    def _restore_auto_source(self) -> None:
+        if self._current_source_path is None:
+            return
+        state = self.source_states.get(self._current_source_path)
+        if state is None or state.auto_values is None:
+            return
+        state.values = state.auto_values
+        state.provenance = "Auto-detected"
+        self._render_source_state(state)
+
+    def _render_source_state(self, state: SourceAirfieldState | None) -> None:
+        self._rendering_source = True
+        try:
+            if state is None:
+                self.source_card.clear_values()
+                self.source_card.set_fields_enabled(False)
+                self.source_card.set_status("Waiting for a KML file")
+                self.source_card.set_error("")
+                return
+            self.source_card.set_values(state.values)
+            self.source_card.set_fields_enabled(state.parse_error is None)
+            self.source_card.set_error(state.parse_error or "")
+            self._render_source_status(state)
+        finally:
+            self._rendering_source = False
+
+    def _render_source_status(self, state: SourceAirfieldState) -> None:
+        confidence = ""
+        candidate = state.inference.candidate if state.inference is not None else None
+        if candidate is not None:
+            confidence = (
+                f"Heading {candidate.heading_confidence.value.title()} · "
+                f"Threshold {candidate.threshold_confidence.value.title()}"
+            )
+        self.source_card.set_status(
+            state.provenance,
+            confidence=confidence,
+            details=state.details,
+            can_restore=(
+                state.auto_values is not None and state.values != state.auto_values
+            ),
         )
 
-        record = self.import_preset_path(path, error_title="Error")
-        if record is not None:
-            self.apply_preset_data(record.preset.data)
+    def _ensure_source_states(self) -> None:
+        for raw_path in self.input_files:
+            path = str(Path(raw_path).resolve(strict=False))
+            if path != raw_path:
+                index = self.input_files.index(raw_path)
+                self.input_files[index] = path
+            self.source_states.setdefault(path, SourceAirfieldState(Path(path)))
 
-    def apply_preset_data(self, data: Mapping[str, object]) -> None:
-        """Apply tolerant airfield settings from a validated preset envelope."""
-        self.airfield_name_input.setText(data.get("name", ""))
-        self.coordinate_input.set_components(
-            data.get("latitude", ""),
-            data.get("longitude", ""),
+    @staticmethod
+    def _reference_from_values(
+        values: AirfieldFormValues,
+        *,
+        label: str,
+        elevation_required: bool,
+    ) -> RunwayReference:
+        try:
+            coordinate = parse_coordinate_pair(values.threshold)
+        except CoordinateInputError as error:
+            raise ValueError(f"{label} departure threshold: {error}") from error
+        try:
+            heading = float(values.true_heading)
+            if not math.isfinite(heading):
+                raise ValueError
+        except ValueError as error:
+            raise ValueError(f"{label} true heading must be a finite number.") from error
+        elevation = None
+        if values.elevation_m.strip():
+            try:
+                elevation = float(values.elevation_m)
+                if not math.isfinite(elevation):
+                    raise ValueError
+            except ValueError as error:
+                raise ValueError(f"{label} elevation must be a finite number.") from error
+        if elevation_required and elevation is None:
+            raise ValueError(
+                f"{label} elevation is required because this KML uses absolute altitude."
+            )
+        try:
+            return RunwayReference(
+                coordinate.latitude,
+                coordinate.longitude,
+                heading,
+                elevation,
+            )
+        except ValueError as error:
+            raise ValueError(f"{label}: {error}") from error
+
+    def _select_source_path(self, path: str) -> None:
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            if str(item.data(Qt.ItemDataRole.UserRole)) == path:
+                self.file_list.setCurrentItem(item)
+                break
+
+    def _review_source_runways(self, _fallback_elevation_m=None):
+        """Return one inline-reviewed reference per input; no modal review is used."""
+        self._commit_current_source()
+        self._ensure_source_states()
+        reviewed: list[RunwayReference | None] = []
+        for path in self.input_files:
+            state = self.source_states[path]
+            if not state.analysed:
+                self._analyse_source(state)
+            if state.parse_error is not None:
+                reviewed.append(None)
+                continue
+            try:
+                reference = self._reference_from_values(
+                    state.values,
+                    label=Path(path).name,
+                    elevation_required=state.altitude_mode == "absolute",
+                )
+            except ValueError as error:
+                self._select_source_path(path)
+                self.source_card.set_error(str(error))
+                QMessageBox.warning(self, "Original airfield needs attention", str(error))
+                return None
+            state.values = AirfieldFormValues(
+                airfield_name=state.values.airfield_name,
+                runway=state.values.runway,
+                threshold=(
+                    f"{format_optional_number(reference.latitude)}, "
+                    f"{format_optional_number(reference.longitude)}"
+                ),
+                true_heading=format_optional_number(reference.true_heading_deg),
+                elevation_m=format_optional_number(reference.elevation_m, 2),
+            )
+            reviewed.append(reference)
+        if self._current_source_path:
+            self._render_source_state(self.source_states[self._current_source_path])
+        return tuple(reviewed)
+
+    def _validated_target(self) -> RunwayReference | None:
+        values = self.target_card.values()
+        if not values.airfield_name.strip():
+            self.target_card.set_error("Enter the target airfield name.")
+            self.target_card.name_input.setFocus()
+            return None
+        designator = normalise_runway_designator(values.runway)
+        if not designator.value:
+            self.target_card.set_error("Enter the target runway identifier.")
+            self.target_card.runway_input.setFocus()
+            return None
+        if designator.conventional:
+            self.target_card.runway_input.setText(designator.value)
+        try:
+            reference = self._reference_from_values(
+                values,
+                label="Target airfield",
+                elevation_required=False,
+            )
+        except ValueError as error:
+            self.target_card.set_error(str(error))
+            QMessageBox.warning(self, "Target airfield needs attention", str(error))
+            return None
+        self.target_card.coordinate_input.setText(
+            f"{format_optional_number(reference.latitude)}, "
+            f"{format_optional_number(reference.longitude)}"
         )
-        self.heading_input.setText(data.get("heading", ""))
-        self.orig_height_input.setText(data.get("original_elevation_m", ""))
+        self.target_card.heading_input.setText(
+            format_optional_number(reference.true_heading_deg)
+        )
+        self.target_card.set_error("")
+        return reference
 
-    def run_transposition_ui(self):
+    def _nonstandard_runways(self):
+        entries: list[tuple[str, str, QWidget, str | None]] = []
+        for path in self.input_files:
+            state = self.source_states.get(path)
+            if state is None or state.parse_error is not None:
+                continue
+            designator = normalise_runway_designator(state.values.runway)
+            if designator.conventional:
+                if designator.value != state.values.runway:
+                    state.values = AirfieldFormValues(
+                        airfield_name=state.values.airfield_name,
+                        runway=designator.value,
+                        threshold=state.values.threshold,
+                        true_heading=state.values.true_heading,
+                        elevation_m=state.values.elevation_m,
+                    )
+                continue
+            if designator.value:
+                entries.append(
+                    (
+                        f"Original — {Path(path).name}",
+                        designator.value,
+                        self.source_card.runway_input,
+                        path,
+                    )
+                )
+        target = normalise_runway_designator(self.target_card.runway_input.text())
+        if target.value and not target.conventional:
+            entries.append(
+                (
+                    "Target airfield",
+                    target.value,
+                    self.target_card.runway_input,
+                    None,
+                )
+            )
+        return entries
+
+    def _confirm_runway_overrides(self) -> bool:
+        entries = self._nonstandard_runways()
+        if confirm_nonstandard_runways(
+            self,
+            tuple((context, value, widget) for context, value, widget, _ in entries),
+            action="transpose these files",
+        ):
+            return True
+        if entries and entries[0][3] is not None:
+            self._select_source_path(entries[0][3])
+            self.source_card.runway_input.setFocus()
+        return False
+
+    def run_transposition_ui(self) -> None:
         if not self.input_files:
             QMessageBox.warning(self, "No Files", "Please select at least one KML file.")
             return
-
-        try:
-            coordinate = self.coordinate_input.coordinates()
-        except CoordinateInputError as error:
-            QMessageBox.warning(self, "Invalid coordinate", str(error))
+        target_runway = self._validated_target()
+        if target_runway is None:
             return
-        try:
-            heading = float(self.heading_input.text())
-            if not math.isfinite(heading):
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(
-                self,
-                "Invalid Input",
-                "Please enter a finite numeric target runway true heading.",
-            )
-            return
-
-        # Get Original Height
-        try:
-            orig_height_text = self.orig_height_input.text()
-            if not orig_height_text:
-                orig_height = None
-            else:
-                orig_height = float(orig_height_text)
-                if not math.isfinite(orig_height):
-                    raise ValueError
-        except ValueError:
-            QMessageBox.warning(
-                self,
-                "Invalid Input",
-                "Please enter a finite numeric fallback source elevation.",
-            )
-            return
-
-        target_runway = RunwayReference(
-            latitude=coordinate.latitude,
-            longitude=coordinate.longitude,
-            true_heading_deg=heading,
-        )
-        self.heading_input.setText(f"{target_runway.true_heading_deg:g}")
-        reviewed_runways = self._review_source_runways(orig_height)
+        reviewed_runways = self._review_source_runways(None)
         if reviewed_runways is None:
+            return
+        if not self._confirm_runway_overrides():
             return
 
         output_dir = QFileDialog.getExistingDirectory(
@@ -598,7 +933,7 @@ class TransposePage(PresetUiMixin, QWidget):
             plan = create_transposition_plan(
                 input_files=self.input_files,
                 output_directory=output_dir,
-                target_airfield=self.airfield_name_input.text(),
+                target_airfield=self.target_card.name_input.text(),
             )
             plan = apply_source_runways(plan, reviewed_runways)
         except Exception as error:
@@ -610,10 +945,7 @@ class TransposePage(PresetUiMixin, QWidget):
             return
 
         try:
-            result = run_transposition(
-                plan=plan,
-                target_runway=target_runway,
-            )
+            result = run_transposition(plan=plan, target_runway=target_runway)
         except Exception as error:
             QMessageBox.critical(self, "Error", f"Transposition failed: {error}")
             return
@@ -642,8 +974,7 @@ class TransposePage(PresetUiMixin, QWidget):
             QMessageBox.critical(
                 self,
                 "Transposition failed",
-                f"No KML files were produced.\n\n"
-                f"Failed inputs:\n{failed_paths}",
+                f"No KML files were produced.\n\nFailed inputs:\n{failed_paths}",
             )
             return
         QMessageBox.warning(
@@ -654,27 +985,55 @@ class TransposePage(PresetUiMixin, QWidget):
             f"Failed inputs:\n{failed_paths}",
         )
 
+    def capture_preset_data(self) -> dict[str, object]:
+        """Return canonical target data; target elevation is intentionally absent."""
+        values = self.target_card.values()
+        coordinate = self.target_card.coordinate_input.coordinates()
+        try:
+            heading = float(values.true_heading)
+        except ValueError as error:
+            raise AirfieldPresetError("True heading must be numeric.") from error
+        return AirfieldPresetData(
+            airfield_name=values.airfield_name.strip(),
+            runway=normalise_runway_designator(values.runway).value,
+            threshold_latitude=coordinate.latitude,
+            threshold_longitude=coordinate.longitude,
+            true_heading_deg=heading,
+            elevation_m=None,
+        ).to_mapping()
+
+    def apply_preset_data(self, data: Mapping[str, object]) -> None:
+        """Compatibility hook: apply an airfield payload to the target card."""
+        payload, warnings = AirfieldPresetData.from_mapping(data)
+        values = self._values_from_preset(payload)
+        self.target_card.set_values(
+            AirfieldFormValues(
+                airfield_name=values.airfield_name,
+                runway=values.runway,
+                threshold=values.threshold,
+                true_heading=values.true_heading,
+            )
+        )
+        self.target_card.set_error(" ".join(warnings))
+
+    def save_preset(self) -> None:
+        """Compatibility hook now routes preset creation through the manager."""
+        self.open_airfield_manager()
+
+    def load_preset_from_file(self) -> None:
+        """Compatibility hook now routes imports through the manager."""
+        self.open_airfield_manager()
+
     def _initial_output_directory(self):
         return remembered_directory(
             FileDialogWorkflow.TRANSPOSITION,
             FileDialogDirection.OUTPUT,
         )
 
-    def _review_source_runways(self, fallback_elevation_m):
-        dialog = RunwayReviewDialog(
-            self.input_files,
-            fallback_elevation_m=fallback_elevation_m,
-            parent=self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        return dialog.reviewed_runways
-
     def _edit_output_plan(self, plan):
         dialog = TranspositionOutputDialog(plan, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-
         candidate = dialog.validated_plan
         if candidate is None:
             return None
@@ -683,7 +1042,6 @@ class TransposePage(PresetUiMixin, QWidget):
         )
         if not existing_paths:
             return candidate
-
         filenames = "\n".join(f"• {path.name}" for path in existing_paths)
         answer = QMessageBox.question(
             self,
@@ -695,9 +1053,11 @@ class TransposePage(PresetUiMixin, QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return None
-
         return customize_transposition_plan(
             candidate,
             tuple(job.output_path.name for job in candidate.jobs),
             approved_overwrites=existing_paths,
         )
+
+
+__all__ = ["SourceAirfieldState", "TransposePage", "TranspositionOutputDialog"]

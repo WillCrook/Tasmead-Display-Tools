@@ -1,5 +1,12 @@
 """Reusable application services."""
 
+from .airfield_presets import (
+    AirfieldPresetData,
+    AirfieldPresetError,
+    RunwayDesignator,
+    normalise_runway_designator,
+)
+
 from .coordinate_input import (
     CoordinateInputError,
     CoordinatePair,
@@ -90,6 +97,8 @@ from .transpose_coordinates import (
 )
 
 __all__ = [
+    "AirfieldPresetData",
+    "AirfieldPresetError",
     "CURRENT_FORMAT_VERSION",
     "ATR_MAGENTA_TRACK_STYLE",
     "CoordinateInputError",
@@ -129,6 +138,7 @@ __all__ = [
     "PresetValidationError",
     "RunwayCandidate",
     "RunwayConfidence",
+    "RunwayDesignator",
     "RunwayInferenceResult",
     "RunwayReference",
     "SimulationCancelled",
@@ -156,6 +166,7 @@ __all__ = [
     "infer_departure_runway",
     "inverse_distance_bearing",
     "load_last_two_points_from_kml",
+    "normalise_runway_designator",
     "parse_kml",
     "parse_kml_track",
     "parse_coordinate_pair",
