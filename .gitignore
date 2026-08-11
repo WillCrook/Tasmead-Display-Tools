@@ -30,9 +30,5 @@ dist/
 build/
 *.spec
 
-#app icon
-app.icns
-app.ico
-
 #Other files
 .DS_Store

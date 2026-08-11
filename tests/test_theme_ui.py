@@ -13,9 +13,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPalette
-from PyQt6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QLabel
+from PyQt6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QLabel, QLineEdit
 
 from app_window import App
+from google_maps_settings import GOOGLE_MAPS_API_KEY_SETTING
 from settings_dialog import SettingsDialog
 from theme import (
     DARK_TOKENS,
@@ -213,9 +214,10 @@ class SettingsDialogTests(unittest.TestCase):
         self.app.setStyleSheet(self.original_stylesheet)
 
     def test_tabs_about_content_and_live_theme_selector(self):
-        self.assertEqual(self.dialog.tabs.count(), 2)
+        self.assertEqual(self.dialog.tabs.count(), 3)
         self.assertEqual(self.dialog.tabs.tabText(0), "Appearance")
-        self.assertEqual(self.dialog.tabs.tabText(1), "About")
+        self.assertEqual(self.dialog.tabs.tabText(1), "Google Maps")
+        self.assertEqual(self.dialog.tabs.tabText(2), "About")
         self.assertTrue(self.dialog.theme_buttons[ThemeMode.SYSTEM].isChecked())
 
         self.dialog.theme_buttons[ThemeMode.DARK].click()
@@ -223,11 +225,33 @@ class SettingsDialogTests(unittest.TestCase):
         self.assertEqual(self.settings.values[THEME_SETTING_KEY], "dark")
 
         about_text = " ".join(
-            label.text() for label in self.dialog.tabs.widget(1).findChildren(QLabel)
+            label.text() for label in self.dialog.tabs.widget(2).findChildren(QLabel)
         )
         self.assertIn("Tasmead Display Tools", about_text)
         self.assertIn("Will Crook", about_text)
         self.assertIn("rich.pillans@tasmead.com", about_text)
+
+    def test_google_maps_key_is_masked_saved_and_cleared(self):
+        self.assertEqual(
+            self.dialog.maps_api_key_input.echoMode(),
+            QLineEdit.EchoMode.Password,
+        )
+        self.dialog.maps_api_key_input.setText("  test-browser-key  ")
+        self.dialog.save_maps_key_button.click()
+        self.assertEqual(
+            self.settings.values[GOOGLE_MAPS_API_KEY_SETTING],
+            "test-browser-key",
+        )
+        self.dialog.show_maps_key_button.click()
+        self.assertEqual(
+            self.dialog.maps_api_key_input.echoMode(),
+            QLineEdit.EchoMode.Normal,
+        )
+        self.dialog.clear_maps_key_button.click()
+        self.assertEqual(
+            self.settings.values[GOOGLE_MAPS_API_KEY_SETTING],
+            "",
+        )
 
 
 class ModernHeaderTests(unittest.TestCase):
@@ -340,8 +364,8 @@ class ModernHeaderTests(unittest.TestCase):
 
     def test_only_top_level_cards_receive_reactive_restrained_shadows(self):
         top_level_cards = (
-            self.window.transpose_page.preview_host,
             self.window.transpose_page.source_card,
+            self.window.transpose_page.target_card,
             self.window.debris_page.config_widget,
             self.window.debris_page.results_widget,
         )
@@ -371,6 +395,122 @@ class ModernHeaderTests(unittest.TestCase):
 
         self.assertFalse(button.icon().isNull())
         self.assertNotEqual(light_icon_key, button.icon().cacheKey())
+
+    def test_preview_replaces_the_whole_workspace_and_cancel_restores_it(self):
+        owner = self.window.transpose_page
+        scene = object()
+
+        def start_visible_preview(_scene, _key):
+            self.assertIs(
+                self.window.workspace_stack.currentWidget(),
+                self.window.map_preview,
+            )
+            self.assertTrue(self.window.map_preview.isVisible())
+            return True
+
+        with (
+            patch.object(self.window, "_ensure_maps_api_key", return_value="key"),
+            patch.object(
+                self.window.map_preview,
+                "set_scene",
+                side_effect=start_visible_preview,
+            ) as set_scene,
+        ):
+            opened = self.window.open_map_preview(owner, scene)
+
+        self.assertTrue(opened)
+        set_scene.assert_called_once_with(scene, "key")
+        self.assertIs(
+            self.window.workspace_stack.currentWidget(),
+            self.window.map_preview,
+        )
+        self.assertIs(self.window._preview_owner, owner)
+
+        self.window.close_map_preview()
+
+        self.assertIs(
+            self.window.workspace_stack.currentWidget(),
+            self.window.normal_workspace,
+        )
+        self.assertIsNone(self.window._preview_owner)
+
+    def test_preview_initialisation_failure_restores_the_previous_workspace(self):
+        owner = self.window.transpose_page
+        previous_workspace = self.window.workspace_stack.currentWidget()
+        with (
+            patch.object(self.window, "_ensure_maps_api_key", return_value="key"),
+            patch.object(self.window.map_preview, "set_scene", return_value=False),
+            patch.object(self.window.map_preview, "shutdown") as shutdown,
+            patch("app_window.QMessageBox.critical") as critical,
+        ):
+            opened = self.window.open_map_preview(owner, object())
+
+        self.assertFalse(opened)
+        self.assertIs(
+            self.window.workspace_stack.currentWidget(),
+            previous_workspace,
+        )
+        self.assertIsNone(self.window._preview_owner)
+        self.assertIsNone(self.window._window_state_before_preview)
+        self.assertIsNone(self.window._window_geometry_before_preview)
+        shutdown.assert_called_once_with()
+        critical.assert_called_once()
+
+    def test_exiting_preview_fullscreen_restores_a_maximized_window(self):
+        self.window.workspace_stack.setCurrentWidget(self.window.map_preview)
+        self.window._window_state_before_preview = Qt.WindowState.WindowMaximized
+        with (
+            patch.object(self.window, "showMaximized") as maximize,
+            patch.object(self.window, "showNormal") as normal,
+        ):
+            self.window._set_map_preview_fullscreen(False)
+
+        maximize.assert_called_once_with()
+        normal.assert_not_called()
+
+    def test_missing_key_settings_save_retries_the_original_preview(self):
+        settings_button = object()
+        prompt = object()
+        with patch("app_window.QMessageBox") as message_box:
+            instance = message_box.return_value
+            instance.addButton.side_effect = [settings_button, object()]
+            instance.clickedButton.return_value = settings_button
+
+            def save_key(_section):
+                self.window.maps_settings.set_api_key("saved-browser-key")
+
+            with (
+                patch.object(self.window, "open_settings", side_effect=save_key) as settings,
+                patch.object(self.window.map_preview, "set_scene") as set_scene,
+            ):
+                opened = self.window.open_map_preview(
+                    self.window.transpose_page,
+                    prompt,
+                )
+
+        self.assertTrue(opened)
+        settings.assert_called_once_with("Google Maps")
+        set_scene.assert_called_once_with(prompt, "saved-browser-key")
+        self.window.close_map_preview()
+
+    def test_escape_leaves_preview_fullscreen_before_closing_preview(self):
+        self.window.workspace_stack.setCurrentWidget(self.window.map_preview)
+        self.window._window_state_before_preview = Qt.WindowState.WindowNoState
+        with (
+            patch.object(self.window, "isFullScreen", return_value=True),
+            patch.object(self.window, "_set_map_preview_fullscreen") as fullscreen,
+            patch.object(self.window, "close_map_preview") as close,
+        ):
+            self.window._escape_map_preview()
+        fullscreen.assert_called_once_with(False)
+        close.assert_not_called()
+
+        with (
+            patch.object(self.window, "isFullScreen", return_value=False),
+            patch.object(self.window, "close_map_preview") as close,
+        ):
+            self.window._escape_map_preview()
+        close.assert_called_once_with()
 
 
 if __name__ == "__main__":

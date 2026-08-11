@@ -11,12 +11,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from pages.debris_page import DebrisPage
-from pages.debris_ui import DebrisPresetManagerDialog, DebrisPreviewDialog
-from services import DebrisSimulationResult
+from pages.debris_ui import DebrisPresetManagerDialog
+from services import (
+    DebrisSimulationResult,
+    KmlCoordinate,
+    KmlDocument,
+    KmlLineString,
+    KmlPlacemark,
+    KmlStyle,
+    PreviewScene,
+    TraceAdjustment,
+)
 from workers import SimulationFailure
 
 
@@ -49,6 +58,38 @@ class DebrisUiTestCase(unittest.TestCase):
 
 
 class DebrisWorkspaceTests(DebrisUiTestCase):
+    @staticmethod
+    def result(output_file=None):
+        anchor = KmlCoordinate(-1.0, 51.0, 120.0)
+        document = KmlDocument(
+            name=None,
+            styles=(KmlStyle("air", "aaff0000", 6.0),),
+            placemarks=(
+                KmlPlacemark(
+                    "Airborne",
+                    "#air",
+                    KmlLineString(
+                        (
+                            anchor,
+                            KmlCoordinate(-0.999, 51.001, 100.0),
+                        ),
+                        "absolute",
+                        extrude_to_ground=True,
+                    ),
+                ),
+            ),
+        )
+        return DebrisSimulationResult(
+            heading=90.0,
+            air_distance_m=10.0,
+            ground_distance_m=2.0,
+            total_distance_m=12.0,
+            impacts=1,
+            output_file=str(output_file) if output_file is not None else None,
+            document=document,
+            anchor=anchor,
+        )
+
     def test_modern_two_column_workspace_and_compact_preset_toolbar(self):
         self.assertEqual(self.page.objectName(), "DebrisPage")
         self.assertEqual(self.page.splitter.count(), 2)
@@ -88,20 +129,14 @@ class DebrisWorkspaceTests(DebrisUiTestCase):
 
     def test_success_enables_preview_and_later_failure_keeps_last_output(self):
         output = self.root / "trajectory.kml"
-        result = DebrisSimulationResult(
-            heading=90.0,
-            air_distance_m=10.0,
-            ground_distance_m=2.0,
-            total_distance_m=12.0,
-            impacts=1,
-            output_file=str(output),
-        )
+        result = self.result(output)
         self.page._terminal_outcome = ("success", result)
         with patch.object(QMessageBox, "information"):
             self.page._on_simulation_thread_finished()
 
         self.assertTrue(self.page.preview_btn.isEnabled())
         self.assertEqual(self.page._last_successful_output, str(output))
+        self.assertIs(self.page._last_successful_result, result)
 
         self.page._terminal_outcome = (
             "failure",
@@ -113,32 +148,82 @@ class DebrisWorkspaceTests(DebrisUiTestCase):
         self.assertTrue(self.page.preview_btn.isEnabled())
         self.assertEqual(self.page._last_successful_output, str(output))
 
-    def test_preview_action_opens_fullscreen_shell_for_last_output(self):
-        output = self.root / "trajectory.kml"
-        self.page._last_successful_output = str(output)
+    def test_preview_action_emits_shared_scene_for_last_result(self):
+        self.page._last_successful_result = self.result()
         self.page.preview_btn.setEnabled(True)
-        with patch("pages.debris_page.DebrisPreviewDialog") as dialog_class:
-            self.page.preview_btn.click()
+        emitted = QSignalSpy(self.page.preview_requested)
 
-        dialog_class.assert_called_once_with(str(output), self.page)
-        dialog_class.return_value.showFullScreen.assert_called_once_with()
+        self.page.preview_btn.click()
 
+        self.assertEqual(len(emitted), 1)
+        scene = emitted[0][0]
+        self.assertIsInstance(scene, PreviewScene)
+        self.assertEqual(scene.traces[0].trace_id, "debris")
+        self.assertEqual(scene.traces[0].anchor_altitude_mode, "absolute")
 
-class DebrisPreviewDialogTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
+    def test_export_uses_the_exact_document_accepted_from_preview(self):
+        self.page._last_successful_result = self.result()
+        adjusted_trace = self.page._current_debris_trace().with_adjustment(
+            TraceAdjustment(east_m=12.3, north_m=-4.5, up_m=6.7, yaw_deg=8.9)
+        )
+        self.page.accept_preview_scene(PreviewScene((adjusted_trace,)))
+        destination = self.root / "adjusted.kml"
 
-    def test_dialog_identifies_output_and_escape_closes_it(self):
-        dialog = DebrisPreviewDialog("/tmp/generated trajectory.kml")
-        self.assertEqual(dialog.output_path, Path("/tmp/generated trajectory.kml"))
-        self.assertFalse(dialog.close_button.icon().isNull())
-        dialog.showFullScreen()
-        self.app.processEvents()
-        self.assertTrue(dialog.isFullScreen())
-        QTest.keyClick(dialog, Qt.Key.Key_Escape)
-        self.app.processEvents()
-        self.assertFalse(dialog.isVisible())
+        with (
+            patch.object(
+                QFileDialog,
+                "getSaveFileName",
+                return_value=(str(destination), ""),
+            ),
+            patch("pages.debris_page.export_kml") as export,
+            patch.object(QMessageBox, "information"),
+        ):
+            self.page.export_committed_scene()
+
+        export.assert_called_once_with(
+            str(destination),
+            adjusted_trace.adjusted_document,
+            overwrite=False,
+        )
+
+    def test_stale_export_recalculates_before_opening_the_picker(self):
+        self.page._last_successful_result = self.result()
+        adjustment = TraceAdjustment(east_m=25.0)
+        self.page._committed_adjustment = adjustment
+        self.page._mark_result_stale()
+
+        with (
+            patch.object(self.page, "run_simulation", return_value=True) as run,
+            patch.object(QFileDialog, "getSaveFileName") as picker,
+        ):
+            self.page.export_committed_scene()
+
+        run.assert_called_once_with()
+        picker.assert_not_called()
+        self.assertEqual(self.page._pending_result_action, "export")
+        self.assertEqual(self.page._pending_result_adjustment, adjustment)
+
+    def test_stale_recalculation_preserves_offsets_for_followup_export(self):
+        adjustment = TraceAdjustment(east_m=25.0, up_m=3.0)
+        self.page._pending_result_action = "export"
+        self.page._pending_result_adjustment = adjustment
+        self.page._terminal_outcome = ("success", self.result())
+
+        with (
+            patch("pages.debris_page.QTimer.singleShot") as single_shot,
+            patch.object(QMessageBox, "information") as information,
+        ):
+            self.page._on_simulation_thread_finished()
+
+        self.assertEqual(self.page._committed_adjustment, adjustment)
+        self.assertFalse(self.page._last_result_stale)
+        information.assert_not_called()
+        self.assertEqual(single_shot.call_count, 1)
+        self.assertEqual(single_shot.call_args.args[0], 0)
+        self.assertEqual(
+            single_shot.call_args.args[1],
+            self.page.export_committed_scene,
+        )
 
 
 class DebrisPresetManagerTests(DebrisUiTestCase):

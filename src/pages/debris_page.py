@@ -1,10 +1,11 @@
 import os
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from uuid import UUID
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
     QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
@@ -20,11 +21,12 @@ from icon_utils import AppIcon, set_button_icon
 from resource_paths import app_data_path, resource_path
 from services import (
     CoordinateInputError, DebrisSimulationRequest, DebrisSimulationResult,
-    PresetType, SimulationProgress, parse_kml_track,
+    KmlLineString, PreparedTrace, PreviewScene, PresetType,
+    SimulationProgress, TraceAdjustment, export_kml, parse_kml_track,
 )
 from workers import CancellationToken, DebrisSimulationWorker, SimulationFailure
 from pages.coordinate_input import CoordinatePairInput
-from pages.debris_ui import DebrisPresetManagerDialog, DebrisPreviewDialog
+from pages.debris_ui import DebrisPresetManagerDialog
 from pages.preset_ui import PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
 
@@ -36,9 +38,7 @@ DebrisPage {
 DebrisPage QFrame#workspacePanel,
 DebrisPage QFrame#presetToolbar,
 DebrisPage QFrame#resultsCard,
-DebrisPage QFrame#previewHost,
-DebrisPage QDialog#debrisPresetManager,
-DebrisPage QDialog#debrisPreviewDialog {
+DebrisPage QDialog#debrisPresetManager {
     background: palette(base);
     border: 1px solid palette(mid);
     border-radius: 12px;
@@ -71,16 +71,6 @@ DebrisPage QRadioButton {
     min-height: 28px;
     padding: 3px 6px;
 }
-DebrisPage QLabel#previewIcon {
-    font-size: 54px;
-    color: palette(mid);
-}
-DebrisPage QLabel#previewPath {
-    background: palette(alternate-base);
-    border: 1px solid palette(midlight);
-    border-radius: 8px;
-    padding: 10px;
-}
 """
 
 
@@ -91,6 +81,7 @@ class DebrisKmlState:
     path: str = ""
     coordinates: tuple[float, float, float, float] | None = None
     final_altitude_m: float | None = None
+    fingerprint: tuple[int, int, str] | None = None
     error: str | None = None
 
     @property
@@ -106,6 +97,7 @@ class SimulationUiState(str, Enum):
 
 class DebrisPage(PresetUiMixin, QWidget):
     simulation_busy_changed = pyqtSignal(bool)
+    preview_requested = pyqtSignal(object)
     worker_class = DebrisSimulationWorker
 
     @property
@@ -180,13 +172,150 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.refresh_preset_list(select_id=selected_id)
 
     def open_preview(self):
-        if not self._last_successful_output:
+        if not self._ensure_selected_kml_fresh():
             return
-        self._preview_dialog = DebrisPreviewDialog(
-            self._last_successful_output,
-            self,
+        if self._last_result_stale:
+            self._recalculate_for_result_action("preview")
+            return
+        trace = self._current_debris_trace()
+        if trace is None:
+            return
+        self.preview_requested.emit(PreviewScene((trace,)))
+
+    def _current_debris_trace(self):
+        result = self._last_successful_result
+        if (
+            result is None
+            or result.document is None
+            or result.anchor is None
+        ):
+            return None
+        anchor_mode = "clampToGround"
+        for placemark in result.document.placemarks:
+            geometry = placemark.geometry
+            coordinates = (
+                geometry.coordinates
+                if isinstance(geometry, KmlLineString)
+                else geometry.outer_ring
+            )
+            if coordinates:
+                anchor_mode = geometry.altitude_mode
+                break
+        return PreparedTrace(
+            trace_id="debris",
+            label="Debris trajectory",
+            anchor=result.anchor,
+            base_document=result.document,
+            adjustment=self._committed_adjustment,
+            anchor_altitude_mode=anchor_mode,
         )
-        self._preview_dialog.showFullScreen()
+
+    def accept_preview_scene(self, scene):
+        if not isinstance(scene, PreviewScene) or len(scene.traces) != 1:
+            return
+        trace = scene.traces[0]
+        if trace.trace_id != "debris":
+            return
+        self._committed_adjustment = trace.adjustment
+        if self._last_result_stale:
+            self._accepted_debris_document = None
+            self.simulation_status_label.setText(
+                "Offsets retained, but the calculation inputs have changed. "
+                "Preview or export will recalculate the trajectory first."
+            )
+            self._set_widget_status(self.simulation_status_label, "warning")
+            return
+        self._accepted_debris_document = trace.adjusted_document
+        self.simulation_status_label.setText(
+            "Preview offsets applied; export will use the exact displayed geometry."
+        )
+        self._set_widget_status(self.simulation_status_label, "success")
+
+    def export_committed_scene(self):
+        if not self._ensure_selected_kml_fresh():
+            return
+        if self._last_result_stale:
+            self._recalculate_for_result_action("export")
+            return
+        trace = self._current_debris_trace()
+        if trace is None:
+            QMessageBox.warning(
+                self,
+                "No debris result",
+                "Run the debris simulation successfully before exporting KML.",
+            )
+            return
+        document = (
+            self._accepted_debris_document
+            if self._accepted_debris_document is not None and not self._last_result_stale
+            else trace.adjusted_document
+        )
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export debris trajectory KML",
+            suggested_save_path(
+                FileDialogWorkflow.DEBRIS,
+                "debris_trajectory.kml",
+            ),
+            "KML Files (*.kml)",
+        )
+        if not save_path:
+            return
+        save_path = ensure_extension(save_path, ".kml")
+        if os.path.exists(save_path):
+            answer = QMessageBox.question(
+                self,
+                "Replace existing output file?",
+                f'"{os.path.basename(save_path)}" already exists. Replace it?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        remember_file_selection(
+            FileDialogWorkflow.DEBRIS,
+            FileDialogDirection.OUTPUT,
+            save_path,
+        )
+        try:
+            export_kml(
+                save_path,
+                document,
+                overwrite=os.path.exists(save_path),
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "KML export failed",
+                str(error) or "The debris KML could not be exported.",
+            )
+            return
+        self._last_successful_output = save_path
+        self.simulation_status_label.setText(f"KML exported to {save_path}")
+        self._set_widget_status(self.simulation_status_label, "success")
+        QMessageBox.information(
+            self,
+            "KML exported",
+            f"Debris trajectory saved to:\n{save_path}",
+        )
+
+    def _recalculate_for_result_action(self, action: str) -> bool:
+        if action not in {"preview", "export"}:
+            raise ValueError("Unknown debris result action.")
+        if self.has_active_simulation():
+            return False
+        self._pending_result_action = action
+        self._pending_result_adjustment = self._committed_adjustment
+        self.simulation_status_label.setText(
+            "Recalculating current inputs before "
+            + ("opening the preview…" if action == "preview" else "export…")
+        )
+        self._set_widget_status(self.simulation_status_label, "warning")
+        if self.run_simulation():
+            return True
+        self._pending_result_action = None
+        self._pending_result_adjustment = None
+        return False
 
     def render_kml_state(self):
         """Render the complete KML state without retaining metadata from another path."""
@@ -252,7 +381,13 @@ class DebrisPage(PresetUiMixin, QWidget):
             return False
 
         try:
+            fingerprint_before = self._kml_file_fingerprint(selected_path)
             track = parse_kml_track(selected_path)
+            fingerprint_after = self._kml_file_fingerprint(selected_path)
+            if fingerprint_before is None or fingerprint_after != fingerprint_before:
+                raise ValueError(
+                    "The selected KML changed while it was being read. Try loading it again."
+                )
         except Exception as error:
             message = str(error) or error.__class__.__name__
             self._kml_state = DebrisKmlState(path=selected_path, error=message)
@@ -272,6 +407,7 @@ class DebrisPage(PresetUiMixin, QWidget):
             path=selected_path,
             coordinates=coordinates,
             final_altitude_m=final.altitude_m,
+            fingerprint=fingerprint_after,
         )
 
         if final.altitude_m is not None:
@@ -287,6 +423,37 @@ class DebrisPage(PresetUiMixin, QWidget):
                 "The final KML coordinate has no altitude. Enter the altitude in metres before running the simulation.",
             )
         return True
+
+    @staticmethod
+    def _kml_file_fingerprint(path) -> tuple[int, int, str] | None:
+        source = os.fspath(path)
+        try:
+            stat = os.stat(source)
+            digest = hashlib.sha256()
+            with open(source, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime_ns, digest.hexdigest()
+
+    def _ensure_selected_kml_fresh(self) -> bool:
+        if self.flight_mode != "kml" or not self.kml_input_path:
+            return True
+        state = self._kml_state
+        if not state.ready:
+            return True
+        current = self._kml_file_fingerprint(state.path)
+        if current == state.fingerprint and current is not None:
+            return True
+        fallback = self.alt_m.text()
+        refreshed = self.select_and_parse_kml(
+            state.path,
+            altitude_fallback=fallback,
+        )
+        if self._last_successful_result is not None:
+            self._mark_result_stale()
+        return refreshed
 
     def reload_selected_kml(self):
         if not self.kml_input_path:
@@ -309,7 +476,12 @@ class DebrisPage(PresetUiMixin, QWidget):
         self._terminal_outcome = None
         self._suppress_terminal_dialogs = False
         self._last_successful_output = None
-        self._preview_dialog = None
+        self._last_successful_result = None
+        self._committed_adjustment = TraceAdjustment()
+        self._accepted_debris_document = None
+        self._last_result_stale = False
+        self._pending_result_action = None
+        self._pending_result_adjustment = None
 
         self.initialize_preset_management(
             preset_type=PresetType.DEBRIS,
@@ -368,6 +540,36 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.splitter.setSizes((410, 490))
 
         self.load_presets_from_disk()
+        self._install_result_invalidation()
+
+    def _install_result_invalidation(self):
+        editors = (
+            *self.inputs.values(),
+            self.coordinate1_input,
+            self.coordinate2_input,
+            self.bearing_coordinate_input,
+            self.azimuth_input,
+            self.alt_m,
+            self.terrain_m,
+        )
+        for editor in editors:
+            editor.textChanged.connect(self._mark_result_stale)
+        self.surface_combo.currentIndexChanged.connect(self._mark_result_stale)
+        self.include_ground_drag.toggled.connect(self._mark_result_stale)
+        for button in self.mode_group.buttons():
+            button.toggled.connect(self._mark_result_stale)
+
+    def _mark_result_stale(self, *_args):
+        if self._last_successful_result is None or self.has_active_simulation():
+            return
+        self._last_result_stale = True
+        self._accepted_debris_document = None
+        self.simulation_status_label.setText(
+            "Current inputs differ from the last completed simulation. Preview "
+            "or export will recalculate first and retain the committed offsets."
+        )
+        self._set_widget_status(self.simulation_status_label, "warning")
+        self._update_result_actions()
 
     def _build_preset_toolbar(self, layout):
         layout.setContentsMargins(14, 10, 14, 10)
@@ -818,6 +1020,10 @@ class DebrisPage(PresetUiMixin, QWidget):
         )
         self.preview_btn.clicked.connect(self.open_preview)
         header.addWidget(self.preview_btn)
+        self.export_btn = QPushButton("Export KML…")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_committed_scene)
+        header.addWidget(self.export_btn)
         layout.addLayout(header)
 
         self.run_btn = QPushButton("Run Simulation")
@@ -948,12 +1154,15 @@ class DebrisPage(PresetUiMixin, QWidget):
 
     def run_simulation(self):
         if self.has_active_simulation():
-            return
+            return False
 
         if self.flight_mode == "kml":
             if not self.kml_input_path:
                 QMessageBox.warning(self, "Missing input", "Please load a KML file first.")
-                return
+                return False
+
+            if not self._ensure_selected_kml_fresh():
+                return False
 
             if not self._kml_state.ready:
                 if self._kml_state.error:
@@ -962,33 +1171,33 @@ class DebrisPage(PresetUiMixin, QWidget):
                         "Invalid KML",
                         "The selected KML could not be loaded. Choose another file or reload it after correcting the error.",
                     )
-                    return
+                    return False
                 if not self.select_and_parse_kml(
                     self.kml_input_path,
                     altitude_fallback=self.alt_m.text(),
                 ):
-                    return
+                    return False
 
         # Validate altitude input
         try:
             altitude_m = float(self.alt_m.text())
         except (ValueError, AttributeError):
             QMessageBox.warning(self, "Invalid input", "Please enter a valid altitude in metres.")
-            return
+            return False
 
         # Validate terrain input
         try:
             terrain_m = float(self.terrain_m.text())
         except (ValueError, AttributeError):
             QMessageBox.warning(self, "Invalid input", "Please enter a valid terrain height in metres.")
-            return
+            return False
 
         # Validate config inputs
         try:
             config = {k: float(v.text()) for k, v in self.inputs.items() if v.text() != ""}
         except ValueError:
             QMessageBox.warning(self, "Invalid input", "Please enter valid numerical values in config fields.")
-            return
+            return False
 
         config["include_ground_drag"] = self.include_ground_drag.isChecked()
         config["surface"] = self.surface_combo.currentText()
@@ -1004,7 +1213,7 @@ class DebrisPage(PresetUiMixin, QWidget):
                 coordinate2 = self.coordinate2_input.coordinates()
             except CoordinateInputError as error:
                 QMessageBox.warning(self, "Invalid coordinate", str(error))
-                return
+                return False
 
             input_coords = (
                 coordinate1.latitude,
@@ -1019,12 +1228,12 @@ class DebrisPage(PresetUiMixin, QWidget):
                 coordinate = self.bearing_coordinate_input.coordinates()
             except CoordinateInputError as error:
                 QMessageBox.warning(self, "Invalid coordinate", str(error))
-                return
+                return False
             try:
                 azimuth = float(self.azimuth_input.text())
             except ValueError:
                 QMessageBox.warning(self, "Invalid input", "Please enter a valid Track.")
-                return
+                return False
 
             input_coords = None
             input_bearing = (
@@ -1034,30 +1243,12 @@ class DebrisPage(PresetUiMixin, QWidget):
             )
         else:
             QMessageBox.warning(self, "Invalid mode", "Unknown flight input mode selected.")
-            return
+            return False
 
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save output KML",
-            suggested_save_path(
-                FileDialogWorkflow.DEBRIS,
-                "debris_trajectory.kml",
-            ),
-            "KML Files (*.kml)"
-        )
-        if not save_path:
-            return
-        save_path = ensure_extension(save_path, ".kml")
-        remember_file_selection(
-            FileDialogWorkflow.DEBRIS,
-            FileDialogDirection.OUTPUT,
-            save_path,
-        )
-
-        self.run_debris_calculator(
+        return self.run_debris_calculator(
             input_coords_hook=input_coords,
             input_bearing_hook=input_bearing,
-            output_kml=save_path,
+            output_kml=None,
             config=config,
             altitude_m_hook=altitude_m,
             terrain_m_hook=terrain_m,
@@ -1089,9 +1280,9 @@ class DebrisPage(PresetUiMixin, QWidget):
                 "Invalid input",
                 f"The simulation request is incomplete: {error}",
             )
-            return
+            return False
 
-        self._start_simulation(request)
+        return self._start_simulation(request)
 
     def has_active_simulation(self):
         return self._simulation_state is not SimulationUiState.IDLE
@@ -1170,9 +1361,7 @@ class DebrisPage(PresetUiMixin, QWidget):
             widget.setEnabled(inputs_enabled)
         self.file_label.setAcceptDrops(inputs_enabled)
         self.run_btn.setEnabled(inputs_enabled)
-        self.preview_btn.setEnabled(
-            inputs_enabled and bool(self._last_successful_output)
-        )
+        self._update_result_actions()
 
         self.cancel_simulation_btn.setVisible(busy)
         self.cancel_simulation_btn.setEnabled(
@@ -1192,6 +1381,24 @@ class DebrisPage(PresetUiMixin, QWidget):
             self.update_preset_actions()
         if previous_busy != busy:
             self.simulation_busy_changed.emit(busy)
+
+    def _update_result_actions(self):
+        if not hasattr(self, "preview_btn"):
+            return
+        available = self._current_debris_trace() is not None
+        enabled = not self.has_active_simulation() and available
+        self.preview_btn.setEnabled(enabled)
+        self.export_btn.setEnabled(enabled)
+        self.preview_btn.setText(
+            "Recalculate & open 3D preview"
+            if available and self._last_result_stale
+            else "Open 3D preview"
+        )
+        self.export_btn.setText(
+            "Recalculate & export KML…"
+            if available and self._last_result_stale
+            else "Export KML…"
+        )
 
     def _on_simulation_progress(self, progress):
         if not isinstance(progress, SimulationProgress):
@@ -1234,6 +1441,9 @@ class DebrisPage(PresetUiMixin, QWidget):
         self._set_simulation_state(SimulationUiState.IDLE)
 
         kind, payload = outcome
+        pending_action = self._pending_result_action
+        pending_adjustment = self._pending_result_adjustment
+        refreshed_result_ready = False
         if kind == "success" and isinstance(payload, DebrisSimulationResult):
             self.summary_heading.setText(f"Track used (deg): {payload.heading:.1f}")
             self.summary_air.setText(
@@ -1251,24 +1461,41 @@ class DebrisPage(PresetUiMixin, QWidget):
             self.simulation_progress_bar.setValue(100)
             self.simulation_status_label.setText("Simulation complete.")
             self._set_widget_status(self.simulation_status_label, "success")
-            self._last_successful_output = payload.output_file
-            self.preview_btn.setEnabled(True)
-            if not self._suppress_terminal_dialogs:
+            if payload.document is not None and payload.anchor is not None:
+                self._last_successful_result = payload
+                self._last_successful_output = payload.output_file
+                self._committed_adjustment = (
+                    pending_adjustment
+                    if pending_action is not None
+                    and isinstance(pending_adjustment, TraceAdjustment)
+                    else TraceAdjustment()
+                )
+                self._accepted_debris_document = None
+                self._last_result_stale = False
+                refreshed_result_ready = True
+                self._update_result_actions()
+            if not self._suppress_terminal_dialogs and pending_action is None:
                 QMessageBox.information(
                     self,
                     "Simulation Complete",
-                    "Debris trajectory simulation completed successfully.",
+                    "Debris trajectory simulation completed. Preview it in 3D or export it to KML.",
                 )
+            if pending_action is not None:
+                self.simulation_status_label.setText(
+                    "Trajectory recalculated with the committed offsets. "
+                    "The refreshed geometry has not yet been previewed."
+                )
+                self._set_widget_status(self.simulation_status_label, "warning")
         elif kind == "cancelled":
             self.simulation_status_label.setText(
-                "Simulation cancelled; the output file was not changed."
+                "Simulation cancelled; no KML was exported."
             )
             self._set_widget_status(self.simulation_status_label, "warning")
             if not self._suppress_terminal_dialogs:
                 QMessageBox.information(
                     self,
                     "Simulation Cancelled",
-                    "The simulation was cancelled and the output file was not changed.",
+                    "The simulation was cancelled and no KML was exported.",
                 )
         else:
             failure = payload
@@ -1289,4 +1516,11 @@ class DebrisPage(PresetUiMixin, QWidget):
                     dialog.setDetailedText(failure.traceback)
                 dialog.exec()
 
+        self._pending_result_action = None
+        self._pending_result_adjustment = None
         self._suppress_terminal_dialogs = False
+        self._update_result_actions()
+        if refreshed_result_ready and pending_action == "preview":
+            QTimer.singleShot(0, self.open_preview)
+        elif refreshed_result_ready and pending_action == "export":
+            QTimer.singleShot(0, self.export_committed_scene)

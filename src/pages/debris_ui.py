@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from uuid import UUID
 
 from PyQt6.QtCore import Qt
@@ -10,7 +9,6 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -28,80 +26,8 @@ from file_dialog_state import (
     remember_file_selection,
     remembered_directory,
 )
-from icon_utils import AppIcon, set_button_icon
 from pages.preset_ui import PresetUiMixin
 from services import PresetImportExportService, PresetRecord, PresetRepository
-
-
-class DebrisPreviewDialog(QDialog):
-    """Fullscreen integration shell for a generated debris KML preview."""
-
-    def __init__(self, output_path: str | Path, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.output_path = Path(output_path)
-        self.setObjectName("debrisPreviewDialog")
-        self.setWindowTitle("Debris trajectory 3D preview")
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 24)
-        root.setSpacing(16)
-
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        title = QLabel("Google Earth preview")
-        title.setObjectName("dialogTitle")
-        subtitle = QLabel("Last successfully generated debris trajectory")
-        subtitle.setObjectName("mutedText")
-        titles.addWidget(title)
-        titles.addWidget(subtitle)
-        header.addLayout(titles, 1)
-        self.close_button = QPushButton("Close preview")
-        set_button_icon(self.close_button, AppIcon.X)
-        self.close_button.clicked.connect(self.close)
-        header.addWidget(self.close_button)
-        root.addLayout(header)
-
-        preview_host = QFrame()
-        preview_host.setObjectName("previewHost")
-        preview_layout = QVBoxLayout(preview_host)
-        preview_layout.setContentsMargins(32, 32, 32, 32)
-        preview_layout.addStretch()
-
-        icon = QLabel("◫")
-        icon.setObjectName("previewIcon")
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(icon)
-
-        heading = QLabel("3D preview integration space")
-        heading.setObjectName("panelTitle")
-        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(heading)
-
-        explanation = QLabel(
-            "This fullscreen workspace is reserved for a future embedded Google "
-            "Earth viewer. The generated KML remains available for use in Google "
-            "Earth or another compatible mapping tool."
-        )
-        explanation.setObjectName("mutedText")
-        explanation.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        explanation.setWordWrap(True)
-        explanation.setMaximumWidth(620)
-        explanation.setMinimumHeight(72)
-        preview_layout.addWidget(explanation, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        path_label = QLabel(str(self.output_path))
-        path_label.setObjectName("previewPath")
-        path_label.setAccessibleName("Generated debris trajectory KML path")
-        path_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-            | Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
-        path_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        path_label.setWordWrap(True)
-        preview_layout.addWidget(path_label)
-        preview_layout.addStretch()
-        root.addWidget(preview_host, 1)
-
 
 class DebrisPresetManagerDialog(QDialog, PresetUiMixin):
     """Search and manage debris presets without duplicating the page form."""

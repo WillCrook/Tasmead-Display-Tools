@@ -10,21 +10,33 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from google_maps_settings import GoogleMapsSettings
 from theme import ThemeController, ThemeMode
 
 
 class SettingsDialog(QDialog):
     """Application settings with appearance and about tabs."""
 
-    def __init__(self, theme_controller: ThemeController, parent=None) -> None:
+    def __init__(
+        self,
+        theme_controller: ThemeController,
+        parent=None,
+        *,
+        maps_settings: GoogleMapsSettings | None = None,
+    ) -> None:
         super().__init__(parent)
         self.theme_controller = theme_controller
+        self.maps_settings = maps_settings or GoogleMapsSettings(
+            settings=theme_controller.settings,
+            parent=self,
+        )
         self.setWindowTitle("Settings")
         self.setModal(True)
         self.resize(680, 470)
@@ -40,6 +52,8 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.setAccessibleName("Settings sections")
         self.tabs.addTab(self._build_appearance_tab(), "Appearance")
+        self.maps_tab = self._build_maps_tab()
+        self.tabs.addTab(self.maps_tab, "Google Maps")
         self.tabs.addTab(self._build_about_tab(), "About")
         root.addWidget(self.tabs, 1)
 
@@ -49,6 +63,68 @@ class SettingsDialog(QDialog):
 
         self.theme_controller.mode_changed.connect(self._sync_theme_buttons)
         self._sync_theme_buttons(self.theme_controller.mode)
+
+    def _build_maps_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+
+        title = QLabel("Google Maps 3D preview")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        explanation = QLabel(
+            "Enter your Google Maps JavaScript API key. The project must have "
+            "billing enabled and the Maps JavaScript API available. Restrict the "
+            "key to that API and to http://127.0.0.1/* where possible."
+        )
+        explanation.setObjectName("mutedText")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        key_row = QHBoxLayout()
+        self.maps_api_key_input = QLineEdit(self.maps_settings.api_key)
+        self.maps_api_key_input.setObjectName("mapsApiKeyInput")
+        self.maps_api_key_input.setAccessibleName("Google Maps API key")
+        self.maps_api_key_input.setPlaceholderText("Paste API key")
+        self.maps_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        key_row.addWidget(self.maps_api_key_input, 1)
+
+        self.show_maps_key_button = QPushButton("Show")
+        self.show_maps_key_button.setCheckable(True)
+        self.show_maps_key_button.setAccessibleName("Show Google Maps API key")
+        self.show_maps_key_button.toggled.connect(self._toggle_maps_key_visibility)
+        key_row.addWidget(self.show_maps_key_button)
+        layout.addLayout(key_row)
+
+        actions = QHBoxLayout()
+        self.save_maps_key_button = QPushButton("Save key")
+        self.save_maps_key_button.setObjectName("primaryButton")
+        self.clear_maps_key_button = QPushButton("Clear key")
+        self.save_maps_key_button.clicked.connect(self._save_maps_key)
+        self.clear_maps_key_button.clicked.connect(self._clear_maps_key)
+        actions.addWidget(self.save_maps_key_button)
+        actions.addWidget(self.clear_maps_key_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.maps_key_status = QLabel()
+        self.maps_key_status.setObjectName("mutedText")
+        self.maps_key_status.setWordWrap(True)
+        layout.addWidget(self.maps_key_status)
+
+        storage_note = QLabel(
+            "The key is stored in your operating-system application settings. "
+            "It is masked here, but browser API keys are not secrets and are "
+            "visible in requests made to Google. Keys are never included in KML, "
+            "presets, logs, or error details."
+        )
+        storage_note.setObjectName("mutedText")
+        storage_note.setWordWrap(True)
+        layout.addWidget(storage_note)
+        layout.addStretch()
+        return page
 
     def _build_appearance_tab(self) -> QWidget:
         page = QWidget()
@@ -163,3 +239,33 @@ class SettingsDialog(QDialog):
     def _sync_theme_buttons(self, mode: ThemeMode) -> None:
         for candidate, button in self.theme_buttons.items():
             button.setChecked(candidate == mode)
+
+    def _toggle_maps_key_visibility(self, visible: bool) -> None:
+        self.maps_api_key_input.setEchoMode(
+            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        )
+        self.show_maps_key_button.setText("Hide" if visible else "Show")
+
+    def _save_maps_key(self) -> None:
+        key = self.maps_api_key_input.text().strip()
+        if not key:
+            self.maps_key_status.setText("Enter a key, or choose Clear key.")
+            return
+        self.maps_settings.set_api_key(key)
+        self.maps_api_key_input.setText(key)
+        self.maps_key_status.setText("Google Maps API key saved locally.")
+
+    def _clear_maps_key(self) -> None:
+        self.maps_settings.clear()
+        self.maps_api_key_input.clear()
+        self.maps_key_status.setText("Google Maps API key cleared.")
+
+    def select_tab(self, name: str) -> None:
+        """Select a settings section by stable, case-insensitive name."""
+        wanted = name.strip().casefold()
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index).casefold() == wanted:
+                self.tabs.setCurrentIndex(index)
+                if wanted == "google maps":
+                    self.maps_api_key_input.setText(self.maps_settings.api_key)
+                return

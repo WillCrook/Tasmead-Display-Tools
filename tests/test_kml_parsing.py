@@ -991,46 +991,29 @@ class DebrisKmlTests(unittest.TestCase):
         save_dialog.assert_not_called()
         calculator.assert_not_called()
 
-    def test_output_picker_uses_remembered_folder_and_keeps_custom_filename(self):
+    def test_run_computes_in_memory_without_opening_an_output_picker(self):
         self.page.select_and_parse_kml(
             self.fixture("line_string_namespaced.kml"),
             notify=False,
         )
         self.page.terrain_m.setText("0")
-        initial = str(Path(self.temp_dir.name) / "debris_trajectory.kml")
-        selected = str(Path(self.temp_dir.name) / "My custom result")
         self.remember_selection.reset_mock()
         with (
             patch(
                 "pages.debris_page.suggested_save_path",
-                return_value=initial,
             ) as suggestion,
             patch.object(
                 QFileDialog,
                 "getSaveFileName",
-                return_value=(selected, ""),
             ) as save_dialog,
             patch.object(self.page, "run_debris_calculator") as calculator,
         ):
             self.page.run_simulation()
 
-        suggestion.assert_called_once_with(
-            FileDialogWorkflow.DEBRIS,
-            "debris_trajectory.kml",
-        )
-        save_dialog.assert_called_once_with(
-            self.page,
-            "Save output KML",
-            initial,
-            "KML Files (*.kml)",
-        )
-        expected = f"{selected}.kml"
-        self.remember_selection.assert_called_once_with(
-            FileDialogWorkflow.DEBRIS,
-            FileDialogDirection.OUTPUT,
-            expected,
-        )
-        self.assertEqual(calculator.call_args.kwargs["output_kml"], expected)
+        suggestion.assert_not_called()
+        save_dialog.assert_not_called()
+        self.remember_selection.assert_not_called()
+        self.assertIsNone(calculator.call_args.kwargs["output_kml"])
 
 
 if __name__ == "__main__":

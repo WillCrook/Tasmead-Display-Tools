@@ -15,6 +15,7 @@ from .kml_export import (
     KmlStyle,
     export_kml,
 )
+from .geodesy import EnuCoordinate, LocalEnuFrame
 
 
 CANCELLATION_CHECK_INTERVAL = 256
@@ -42,7 +43,7 @@ class DebrisSimulationRequest:
     altitude_m: float
     input_coords: tuple[float, float, float, float] | None
     input_bearing: tuple[float, float, float] | None
-    output_file: str
+    output_file: str | os.PathLike[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,17 +61,28 @@ class DebrisSimulationResult:
     ground_distance_m: float
     total_distance_m: float
     impacts: int
-    output_file: str
+    output_file: str | None = None
+    document: KmlDocument | None = None
+    anchor: KmlCoordinate | None = None
 
     @classmethod
-    def from_summary(cls, summary, output_file):
+    def from_summary(
+        cls,
+        summary,
+        output_file=None,
+        *,
+        document=None,
+        anchor=None,
+    ):
         return cls(
             heading=float(summary["heading"]),
             air_distance_m=float(summary["air_dist_xy_m"]),
             ground_distance_m=float(summary["ground_dist_xy_m"]),
             total_distance_m=float(summary["total_dist_xy_m"]),
             impacts=int(summary["impacts"]),
-            output_file=os.fspath(output_file),
+            output_file=(os.fspath(output_file) if output_file is not None else None),
+            document=document,
+            anchor=anchor,
         )
 
 
@@ -124,7 +136,7 @@ class DebrisTrajectoryCalculator:
                 altitude_m,
                 input_coords,
                 input_bearing,
-                output_file
+                output_file=None,
                 ):
 
         #CONFIG INPUTS
@@ -386,11 +398,12 @@ class DebrisTrajectoryCalculator:
         )
         return summary, df
 
-    def run_debris_trajectory_simulation(
+    def prepare_debris_trajectory(
         self, *, progress_callback=None, cancellation_check=None
     ):
+        """Calculate an immutable KML document without publishing a file."""
         reporter = _ProgressReporter(progress_callback)
-        
+
         summary, df = self.simulate_3d(
             m=self.mass_kg, A=self.area_m2, Cd=self.Cd, rho=self.rho, g=self.g, dt=self.dt,
             alt_m=self.alt_m_relative, ktas=self.ktas, angle_deg=0.0, surface=self.surface,
@@ -398,7 +411,7 @@ class DebrisTrajectoryCalculator:
             progress_callback=progress_callback, cancellation_check=cancellation_check,
         )
 
-        R = 6371000.0
+        local_frame = LocalEnuFrame(self.final_lat, self.final_lon)
         coords_air = [(self.final_lon, self.final_lat, self.altitude_m)]
         coords_ground = []
 
@@ -426,11 +439,9 @@ class DebrisTrajectoryCalculator:
             east = x * math.sin(self.az_rad) + y * math.sin(self.az_rad + math.pi/2.0)
             north = x * math.cos(self.az_rad) + y * math.cos(self.az_rad + math.pi/2.0)
 
-            dlat = (north / R) * 180.0 / math.pi
-            dlon = (east / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
-
-            lat = self.final_lat + dlat
-            lon = self.final_lon + dlon
+            lat, lon = local_frame.to_wgs84(
+                EnuCoordinate(east_m=east, north_m=north, up_m=0.0)
+            )
             
             #add terrain elevation back in for google earth
             alt_real = z + self.terrain_m
@@ -439,15 +450,6 @@ class DebrisTrajectoryCalculator:
                 coords_air.append((lon, lat, alt_real))
             else:
                 coords_ground.append((lon, lat, alt_real))
-
-        _raise_if_cancelled(cancellation_check)
-        reporter.report(
-            SimulationPhase.PROJECTING,
-            projection_total,
-            projection_total,
-            "KML coordinate projection complete.",
-            force=True,
-        )
 
         teardrop_points = []
         if coords_ground:
@@ -462,6 +464,8 @@ class DebrisTrajectoryCalculator:
             half_width_max = 0.06 * L  # Max width is 0.12 * L, so half-width is 0.06 * L
 
             for i in range(n_points + 1):
+                if i % 16 == 0:
+                    _raise_if_cancelled(cancellation_check)
                 frac = i / n_points
                 current_dist = frac * L
                     
@@ -502,15 +506,23 @@ class DebrisTrajectoryCalculator:
                 east_inner = x_local * math.sin(self.az_rad) + y_local_inner * math.cos(self.az_rad)
                 north_inner = x_local * math.cos(self.az_rad) - y_local_inner * math.sin(self.az_rad)
 
-                # Convert to Lat/Lon
-                dlat_outer = (north_outer / R) * 180.0 / math.pi
-                dlon_outer = (east_outer / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
-                    
-                dlat_inner = (north_inner / R) * 180.0 / math.pi
-                dlon_inner = (east_inner / (R * math.cos(math.radians(self.final_lat)))) * 180.0 / math.pi
+                lat_outer, lon_outer = local_frame.to_wgs84(
+                    EnuCoordinate(
+                        east_m=east_outer,
+                        north_m=north_outer,
+                        up_m=0.0,
+                    )
+                )
+                lat_inner, lon_inner = local_frame.to_wgs84(
+                    EnuCoordinate(
+                        east_m=east_inner,
+                        north_m=north_inner,
+                        up_m=0.0,
+                    )
+                )
 
-                teardrop_outer.append((self.final_lon + dlon_outer, self.final_lat + dlat_outer, self.terrain_m))
-                teardrop_inner.insert(0, (self.final_lon + dlon_inner, self.final_lat + dlat_inner, self.terrain_m))
+                teardrop_outer.append((lon_outer, lat_outer, self.terrain_m))
+                teardrop_inner.insert(0, (lon_inner, lat_inner, self.terrain_m))
 
             teardrop_points = teardrop_outer + teardrop_inner
 
@@ -569,13 +581,56 @@ class DebrisTrajectoryCalculator:
                     ),
                 )
             )
-        document = KmlDocument(name=None, styles=tuple(styles), placemarks=tuple(placemarks))
-        written_air_points = len(coords_air) if len(coords_air) >= 2 else 0
-        written_ground_points = len(coords_ground) if len(coords_ground) >= 2 else 0
-        write_total = max(
-            written_air_points + written_ground_points + (len(teardrop_points) if written_ground_points else 0),
-            1,
+        document = KmlDocument(
+            name=None,
+            styles=tuple(styles),
+            placemarks=tuple(placemarks),
         )
+        _raise_if_cancelled(cancellation_check)
+        reporter.report(
+            SimulationPhase.PROJECTING,
+            projection_total,
+            projection_total,
+            "KML coordinate projection complete.",
+            force=True,
+        )
+        anchor = self._first_plotted_coordinate(document)
+        return summary, document, anchor
+
+    @staticmethod
+    def _first_plotted_coordinate(document):
+        for placemark in document.placemarks:
+            geometry = placemark.geometry
+            coordinates = (
+                geometry.coordinates
+                if isinstance(geometry, KmlLineString)
+                else geometry.outer_ring
+            )
+            if coordinates:
+                return coordinates[0]
+        raise ValueError("The simulation produced no plottable trajectory coordinates.")
+
+    @staticmethod
+    def _document_coordinate_count(document):
+        return sum(
+            len(placemark.geometry.coordinates)
+            if isinstance(placemark.geometry, KmlLineString)
+            else len(placemark.geometry.outer_ring)
+            for placemark in document.placemarks
+        )
+
+    def _write_debris_document(
+        self,
+        document,
+        *,
+        progress_callback=None,
+        cancellation_check=None,
+    ):
+        if self.output_file is None:
+            return
+
+        reporter = _ProgressReporter(progress_callback)
+        write_total = max(self._document_coordinate_count(document), 1)
         write_completed = 0
         reporter.report(
             SimulationPhase.WRITING,
@@ -615,7 +670,20 @@ class DebrisTrajectoryCalculator:
             "Output KML committed.",
             force=True,
         )
-        
+
+    def run_debris_trajectory_simulation(
+        self, *, progress_callback=None, cancellation_check=None
+    ):
+        """Compatibility entry point that writes only when an output path exists."""
+        summary, document, _ = self.prepare_debris_trajectory(
+            progress_callback=progress_callback,
+            cancellation_check=cancellation_check,
+        )
+        self._write_debris_document(
+            document,
+            progress_callback=progress_callback,
+            cancellation_check=cancellation_check,
+        )
         return summary
 
 
@@ -643,11 +711,21 @@ def run_debris_simulation_request(
         input_bearing=request.input_bearing,
         output_file=request.output_file,
     )
-    summary = simulation.run_debris_trajectory_simulation(
+    summary, document, anchor = simulation.prepare_debris_trajectory(
         progress_callback=progress_callback,
         cancellation_check=cancellation_check,
     )
-    return DebrisSimulationResult.from_summary(summary, request.output_file)
+    simulation._write_debris_document(
+        document,
+        progress_callback=progress_callback,
+        cancellation_check=cancellation_check,
+    )
+    return DebrisSimulationResult.from_summary(
+        summary,
+        request.output_file,
+        document=document,
+        anchor=anchor,
+    )
 
 
 if __name__ == "__main__":

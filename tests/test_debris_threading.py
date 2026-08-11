@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,10 @@ from pages.debris_page import DebrisPage, SimulationUiState
 from services import (
     DebrisSimulationRequest,
     DebrisSimulationResult,
+    DebrisTrajectoryCalculator,
+    KmlLineString,
+    KmlPolygon,
+    LocalEnuFrame,
     SimulationCancelled,
     SimulationPhase,
     SimulationProgress,
@@ -47,7 +52,9 @@ def make_request(output_file, **overrides):
         "altitude_m": 20.0,
         "input_coords": None,
         "input_bearing": (51.0, -1.0, 90.0),
-        "output_file": os.fspath(output_file),
+        "output_file": (
+            os.fspath(output_file) if output_file is not None else None
+        ),
     }
     values.update(overrides)
     return DebrisSimulationRequest(**values)
@@ -60,11 +67,114 @@ def make_result(output_file):
         ground_distance_m=2.0,
         total_distance_m=12.0,
         impacts=1,
-        output_file=os.fspath(output_file),
+        output_file=(
+            os.fspath(output_file) if output_file is not None else None
+        ),
     )
 
 
 class DebrisSimulationServiceTests(unittest.TestCase):
+    def test_compute_only_returns_immutable_document_and_first_plotted_anchor(self):
+        progress = []
+
+        result = run_debris_simulation_request(
+            make_request(None),
+            progress_callback=progress.append,
+        )
+
+        self.assertIsNone(result.output_file)
+        self.assertIsNotNone(result.document)
+        self.assertIsNotNone(result.anchor)
+        first_geometry = result.document.placemarks[0].geometry
+        self.assertIsInstance(first_geometry, KmlLineString)
+        self.assertEqual(result.anchor, first_geometry.coordinates[0])
+        self.assertEqual(result.anchor.longitude, -1.0)
+        self.assertEqual(result.anchor.latitude, 51.0)
+        self.assertEqual(result.anchor.altitude_m, 20.0)
+        self.assertNotIn(
+            SimulationPhase.WRITING,
+            [item.phase for item in progress],
+        )
+        self.assertEqual(progress[-1].phase, SimulationPhase.PROJECTING)
+        with self.assertRaises(FrozenInstanceError):
+            result.document.name = "changed"
+
+    def test_track_and_debris_zone_use_shared_wgs84_enu_projection(self):
+        summary = {
+            "heading": 90.0,
+            "air_dist_xy_m": 10.0,
+            "ground_dist_xy_m": 20.0,
+            "total_dist_xy_m": 30.0,
+            "impacts": 1,
+        }
+        frame_rows = pd.DataFrame(
+            [
+                {"x": 0.0, "y": 0.0, "z": 20.0, "phase": "air"},
+                {"x": 10.0, "y": 0.0, "z": 10.0, "phase": "air"},
+                {"x": 20.0, "y": 0.0, "z": 0.0, "phase": "slide"},
+                {"x": 30.0, "y": 0.0, "z": 0.0, "phase": "slide"},
+            ]
+        )
+        simulation = DebrisTrajectoryCalculator(
+            mass_kg=10.0,
+            area_m2=0.1,
+            Cd=0.5,
+            rho=1.225,
+            g=9.81,
+            dt=0.01,
+            ktas=50.0,
+            surface="concrete",
+            slide_physics=0.5,
+            include_ground_drag=True,
+            terrain_m=25.0,
+            altitude_m=45.0,
+            input_coords=None,
+            input_bearing=(72.0, 179.9995, 90.0),
+        )
+
+        with patch.object(
+            simulation,
+            "simulate_3d",
+            return_value=(summary, frame_rows),
+        ):
+            _, document, anchor = simulation.prepare_debris_trajectory()
+
+        self.assertEqual(anchor.longitude, 179.9995)
+        self.assertEqual(anchor.latitude, 72.0)
+        self.assertEqual(anchor.altitude_m, 45.0)
+        paths = {placemark.name: placemark.geometry for placemark in document.placemarks}
+        self.assertIsInstance(paths["Airborne"], KmlLineString)
+        self.assertIsInstance(paths["Ground run"], KmlLineString)
+        self.assertIsInstance(paths["Debris zone"], KmlPolygon)
+        self.assertEqual(
+            paths["Debris zone"].outer_ring[0],
+            paths["Debris zone"].outer_ring[-1],
+        )
+
+        local_frame = LocalEnuFrame(anchor.latitude, anchor.longitude)
+        airborne_end = paths["Airborne"].coordinates[-1]
+        airborne_enu = local_frame.to_enu(
+            airborne_end.latitude,
+            airborne_end.longitude,
+        )
+        self.assertAlmostEqual(airborne_enu.east_m, 10.0, delta=0.001)
+        self.assertAlmostEqual(airborne_enu.north_m, 0.0, delta=0.001)
+
+        ground_end = paths["Ground run"].coordinates[-1]
+        ground_enu = local_frame.to_enu(ground_end.latitude, ground_end.longitude)
+        self.assertLess(ground_end.longitude, 0.0)
+        self.assertAlmostEqual(ground_enu.east_m, 30.0, delta=0.001)
+        self.assertAlmostEqual(ground_enu.north_m, 0.0, delta=0.001)
+
+        zone_midpoint = paths["Debris zone"].outer_ring[60]
+        zone_enu = local_frame.to_enu(
+            zone_midpoint.latitude,
+            zone_midpoint.longitude,
+        )
+        expected_half_width = 0.06 * 30.0 * (1.0 - 0.25**2) ** 0.5
+        self.assertAlmostEqual(zone_enu.east_m, 15.0, delta=0.001)
+        self.assertAlmostEqual(zone_enu.north_m, -expected_half_width, delta=0.001)
+
     def test_request_is_frozen_and_success_reports_ordered_phases(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "trajectory.kml"
@@ -80,6 +190,8 @@ class DebrisSimulationServiceTests(unittest.TestCase):
             )
 
             self.assertEqual(result.output_file, str(output))
+            self.assertIsNotNone(result.document)
+            self.assertIsNotNone(result.anchor)
             self.assertTrue(output.read_text(encoding="utf-8").endswith("</kml>\n"))
             phases = [item.phase for item in progress]
             self.assertEqual(phases[0], SimulationPhase.SIMULATING)
@@ -194,9 +306,9 @@ class DebrisSimulationWorkerTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def run_worker(self, runner):
+    def run_worker(self, runner, *, request=None):
         token = CancellationToken()
-        request = make_request("unused.kml")
+        request = request or make_request("unused.kml")
         thread = QThread()
         worker = DebrisSimulationWorker(request, token, runner=runner)
         worker.moveToThread(thread)
@@ -226,6 +338,22 @@ class DebrisSimulationWorkerTests(unittest.TestCase):
 
         self.assertNotEqual(worker_thread_ids, [threading.get_ident()])
         self.assertEqual(len(succeeded), 1)
+        self.assertEqual(len(cancelled), 0)
+        self.assertEqual(len(failed), 0)
+        self.assertIsNotNone(worker)
+
+    def test_compute_only_result_document_is_forwarded(self):
+        _, _, worker, succeeded, cancelled, failed, finished = self.run_worker(
+            run_debris_simulation_request,
+            request=make_request(None),
+        )
+        self.wait_for(finished)
+
+        self.assertEqual(len(succeeded), 1)
+        result = succeeded[0][0]
+        self.assertIsNone(result.output_file)
+        self.assertIsNotNone(result.document)
+        self.assertIsNotNone(result.anchor)
         self.assertEqual(len(cancelled), 0)
         self.assertEqual(len(failed), 0)
         self.assertIsNotNone(worker)
@@ -365,7 +493,7 @@ class DebrisSimulationUiTests(unittest.TestCase):
         self.assertTrue(self.page.presets_widget.isEnabled())
         self.assertTrue(self.page.config_widget.isEnabled())
         self.assertFalse(self.page.cancel_simulation_btn.isVisible())
-        self.assertIn("not changed", self.page.simulation_status_label.text())
+        self.assertIn("no KML was exported", self.page.simulation_status_label.text())
         information.assert_called_once()
 
     def test_only_success_updates_summary_and_failure_keeps_it_unchanged(self):
@@ -507,9 +635,14 @@ class ResponsivePageLayoutTests(unittest.TestCase):
 
     def test_default_minimum_size_and_scrollable_debris_page(self):
         self.assertEqual(self.window.minimumSize().width(), 900)
-        self.assertEqual(self.window.minimumSize().height(), 500)
-        self.assertEqual(self.window.size().width(), 900)
-        self.assertEqual(self.window.size().height(), 500)
+        self.assertEqual(self.window.minimumSize().height(), 600)
+        self.assertLessEqual(self.window.width(), 1100)
+        self.assertLessEqual(self.window.height(), 900)
+
+        self.assertEqual(
+            self.window._initial_window_size(QRect(0, 0, 1000, 700)),
+            (960, 660),
+        )
 
         self._switch_to_debris()
         scroll = self.window.page_scrolls[self.window.debris_page]
@@ -541,9 +674,19 @@ class ResponsivePageLayoutTests(unittest.TestCase):
         transpose_scroll = self.window.page_scrolls[self.window.transpose_page]
         debris_scroll = self.window.page_scrolls[self.window.debris_page]
 
-        for width, height in ((900, 500), (1024, 768), (1440, 900)):
+        for width, height in ((900, 600), (1000, 700), (1280, 768), (1440, 900)):
             self.window.resize(width, height)
             self.app.processEvents()
+            if width < self.window.COMPACT_HEADER_BREAKPOINT:
+                self.assertEqual(self.window.mode_switch.width(), 360)
+                self.assertEqual(self.window.header.height(), 64)
+            else:
+                self.assertEqual(self.window.mode_switch.width(), 440)
+                self.assertEqual(self.window.header.height(), 80)
+            self.assertEqual(
+                self.window.mode_selection.width(),
+                (self.window.mode_switch.width() - 8) // 2,
+            )
             self.assertLessEqual(self.window.transpose_page.width(), transpose_scroll.viewport().width())
 
             self._switch_to_debris()

@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -24,6 +25,7 @@ from .kml_export import (
     export_kml,
 )
 from .kml_file_handling import KmlTrack, parse_kml_track
+from .map_preview import PreparedTrace
 from .runway_alignment import RunwayReference
 
 
@@ -151,6 +153,70 @@ class TranspositionBatchResult:
     @property
     def failed(self) -> bool:
         return self.total_count > 0 and self.success_count == 0
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTranspositionFile:
+    """One successfully prepared input, ready for preview or later export."""
+
+    input_path: Path
+    aircraft_name: str
+    trace: PreparedTrace
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def document(self) -> KmlDocument:
+        """Return the exact quantized document used by preview and export."""
+        return self.trace.adjusted_document
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTranspositionFailure:
+    """A safe per-input preparation failure that does not assume an output path."""
+
+    input_path: Path
+    code: TranspositionErrorCode
+    message: str
+    exception_type: str | None = None
+
+
+PreparedTranspositionItem = (
+    PreparedTranspositionFile | PreparedTranspositionFailure
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTranspositionBatch:
+    """Ordered in-memory preparation results for a transposition batch."""
+
+    target_runway: RunwayReference
+    items: tuple[PreparedTranspositionItem, ...]
+
+    @property
+    def prepared(self) -> tuple[PreparedTranspositionFile, ...]:
+        return tuple(
+            item for item in self.items
+            if isinstance(item, PreparedTranspositionFile)
+        )
+
+    @property
+    def failed_items(self) -> tuple[PreparedTranspositionFailure, ...]:
+        return tuple(
+            item for item in self.items
+            if isinstance(item, PreparedTranspositionFailure)
+        )
+
+    @property
+    def total_count(self) -> int:
+        return len(self.items)
+
+    @property
+    def prepared_count(self) -> int:
+        return len(self.prepared)
+
+    @property
+    def failure_count(self) -> int:
+        return len(self.failed_items)
 
 
 def _slug_component(value: str, fallback: str) -> str:
@@ -358,16 +424,14 @@ def rotate_route(waypoints, target_lat, target_lon, target_heading):
     )
 
 
-def write_kml(
-    file_path,
-    coordinates,
-    name_of_aircraft,
+def _transposition_document(
+    coordinates: Sequence[tuple[float, float, float]],
+    name_of_aircraft: str,
     *,
-    overwrite=False,
     processing_warnings: Sequence[str] = (),
     line_colour: str = TRANSPOSITION_FALLBACK_LINE_COLOUR,
-):
-    """Create a collision-safe, Google Earth-ready transposed KML output."""
+) -> KmlDocument:
+    """Build the canonical document shared by preview and file export."""
     line_colour = line_colour.lower()
     track_style = KmlStyle(
         style_id="transposedTrackLine",
@@ -380,7 +444,7 @@ def write_kml(
         warning_description = "Processing warnings:\n" + "\n".join(
             f"- {warning}" for warning in processing_warnings
         )
-    document = KmlDocument(
+    return KmlDocument(
         name=f"{name_of_aircraft} Adjusted Coordinates",
         styles=(track_style,),
         placemarks=(
@@ -399,6 +463,25 @@ def write_kml(
                 description=warning_description,
             ),
         ),
+    )
+
+
+def write_kml(
+    file_path,
+    coordinates,
+    name_of_aircraft,
+    *,
+    overwrite=False,
+    processing_warnings: Sequence[str] = (),
+    line_colour: str = TRANSPOSITION_FALLBACK_LINE_COLOUR,
+    _document: KmlDocument | None = None,
+):
+    """Create a collision-safe, Google Earth-ready transposed KML output."""
+    document = _document or _transposition_document(
+        coordinates,
+        name_of_aircraft,
+        processing_warnings=processing_warnings,
+        line_colour=line_colour,
     )
     export_kml(file_path, document, overwrite=overwrite)
 
@@ -492,56 +575,224 @@ def _failure_outcome(
     )
 
 
-def _run_transposition_plan(
-    plan: TranspositionPlan,
-    target_runway: RunwayReference,
-) -> TranspositionBatchResult:
-    outcomes: list[TranspositionFileOutcome] = []
+def _preparation_failure(
+    input_path: Path,
+    code: TranspositionErrorCode,
+    error: Exception,
+) -> PreparedTranspositionFailure:
+    if isinstance(error, (ValueError, OSError)):
+        message = str(error).strip() or "The file could not be transposed."
+    else:
+        message = "An unexpected error occurred while processing this file."
+    LOGGER.warning(
+        "Transposition preparation failed for %s (%s): %s",
+        input_path,
+        code.value,
+        message,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    return PreparedTranspositionFailure(
+        input_path=input_path,
+        code=code,
+        message=message,
+        exception_type=error.__class__.__name__,
+    )
 
-    for job in plan.jobs:
-        output_path = job.output_path
-        LOGGER.info("Transposing %s", job.input_path)
+
+def prepare_transposition(
+    plan: TranspositionPlan | None = None,
+    target_runway: RunwayReference | None = None,
+    *,
+    input_files: Sequence[str | os.PathLike[str]] | None = None,
+    source_runways: Sequence[RunwayReference | None] | None = None,
+) -> PreparedTranspositionBatch:
+    """Prepare transposed KML documents in memory without writing files.
+
+    Existing callers can provide a reviewed plan. Preview-first callers can
+    provide ordered inputs and source runways before selecting an output folder.
+    """
+    if target_runway is None:
+        raise TypeError("target_runway is required.")
+    if plan is not None:
+        if input_files is not None or source_runways is not None:
+            raise TypeError(
+                "Do not mix a TranspositionPlan with input_files or source_runways."
+            )
+        if not plan.jobs:
+            raise ValueError("A transposition plan must contain at least one job.")
+        sources = tuple(
+            (job.input_path, job.aircraft_name, job.source_runway)
+            for job in plan.jobs
+        )
+    else:
+        if input_files is None or source_runways is None:
+            raise TypeError(
+                "Preview-first preparation requires input_files and source_runways."
+            )
+        if not input_files:
+            raise ValueError("At least one input KML file is required.")
+        if len(input_files) != len(source_runways):
+            raise ValueError(
+                "Provide exactly one source runway review for each input KML file."
+            )
+        sources = tuple(
+            (Path(input_path), Path(input_path).stem, source_runway)
+            for input_path, source_runway in zip(
+                input_files, source_runways, strict=True
+            )
+        )
+
+    anchor = KmlCoordinate(
+        longitude=target_runway.longitude,
+        latitude=target_runway.latitude,
+        altitude_m=0.0,
+    )
+    items: list[PreparedTranspositionItem] = []
+    label_counts = Counter(aircraft_name for _, aircraft_name, _ in sources)
+
+    for index, (input_path, aircraft_name, reviewed_source) in enumerate(sources):
+        LOGGER.info("Preparing transposition for %s", input_path)
         try:
-            track = parse_kml_track(job.input_path)
+            track = parse_kml_track(input_path)
         except Exception as error:
-            outcomes.append(
-                _failure_outcome(job, output_path, TranspositionErrorCode.INPUT_KML, error)
+            items.append(
+                _preparation_failure(
+                    input_path, TranspositionErrorCode.INPUT_KML, error
+                )
             )
             continue
 
         try:
-            if job.source_runway is None:
+            if reviewed_source is None:
                 raise ValueError(
                     "Source runway alignment has not been reviewed for this input."
                 )
             waypoints, processing_warnings = _waypoints_for_transposition(
                 track,
-                job.source_runway,
+                reviewed_source,
             )
             adjusted_waypoints = transpose_wgs84_enu_points(
                 waypoints,
-                (job.source_runway.latitude, job.source_runway.longitude),
+                (reviewed_source.latitude, reviewed_source.longitude),
                 (target_runway.latitude, target_runway.longitude),
                 target_runway.true_heading_deg
-                - job.source_runway.true_heading_deg,
+                - reviewed_source.true_heading_deg,
             )
-        except Exception as error:
-            outcomes.append(
-                _failure_outcome(job, output_path, TranspositionErrorCode.TRANSFORMATION, error)
-            )
-            continue
-
-        try:
-            write_kml(
-                output_path,
+            document = _transposition_document(
                 adjusted_waypoints,
-                job.aircraft_name,
-                overwrite=job.overwrite_existing,
+                aircraft_name,
                 processing_warnings=processing_warnings,
                 line_colour=(
                     track.source_line_colour
                     or TRANSPOSITION_FALLBACK_LINE_COLOUR
                 ),
+            )
+            trace = PreparedTrace(
+                trace_id=f"transposition-{index}",
+                label=(
+                    aircraft_name
+                    if label_counts[aircraft_name] == 1
+                    else f"{aircraft_name} — {input_path.parent}"
+                ),
+                anchor=anchor,
+                base_document=document,
+            )
+        except Exception as error:
+            items.append(
+                _preparation_failure(
+                    input_path,
+                    TranspositionErrorCode.TRANSFORMATION,
+                    error,
+                )
+            )
+            continue
+
+        items.append(
+            PreparedTranspositionFile(
+                input_path=input_path,
+                aircraft_name=aircraft_name,
+                trace=trace,
+                warnings=processing_warnings,
+            )
+        )
+
+    return PreparedTranspositionBatch(
+        target_runway=target_runway,
+        items=tuple(items),
+    )
+
+
+def _prepared_failure_outcome(
+    job: TranspositionJob,
+    failure: PreparedTranspositionFailure,
+) -> TranspositionFileOutcome:
+    return TranspositionFileOutcome(
+        input_path=job.input_path,
+        planned_output_path=job.output_path,
+        final_output_path=None,
+        status=TranspositionFileStatus.FAILED,
+        error=TranspositionError(
+            code=failure.code,
+            message=failure.message,
+            input_path=job.input_path,
+            intended_output_path=job.output_path,
+            exception_type=failure.exception_type,
+        ),
+    )
+
+
+def _document_waypoints(
+    document: KmlDocument,
+) -> tuple[tuple[float, float, float], ...]:
+    lines = tuple(
+        placemark.geometry
+        for placemark in document.placemarks
+        if isinstance(placemark.geometry, KmlLineString)
+    )
+    if len(lines) != 1:
+        raise ValueError(
+            "A prepared transposition document must contain exactly one LineString."
+        )
+    return tuple(
+        (coordinate.latitude, coordinate.longitude, coordinate.altitude_m)
+        for coordinate in lines[0].coordinates
+    )
+
+
+def export_prepared_transposition(
+    prepared_batch: PreparedTranspositionBatch,
+    plan: TranspositionPlan,
+) -> TranspositionBatchResult:
+    """Write prepared documents with the supplied output plan."""
+    _validate_transposition_plan(plan)
+    if len(prepared_batch.items) != len(plan.jobs):
+        raise ValueError(
+            "The prepared batch and output plan must contain the same inputs."
+        )
+    for item, job in zip(prepared_batch.items, plan.jobs, strict=True):
+        prepared_input = item.input_path.resolve(strict=False)
+        planned_input = job.input_path.resolve(strict=False)
+        if prepared_input != planned_input:
+            raise ValueError(
+                "Prepared inputs must match the output plan in the same order."
+            )
+
+    outcomes: list[TranspositionFileOutcome] = []
+    for item, job in zip(prepared_batch.items, plan.jobs, strict=True):
+        output_path = job.output_path
+        if isinstance(item, PreparedTranspositionFailure):
+            outcomes.append(_prepared_failure_outcome(job, item))
+            continue
+
+        LOGGER.info("Exporting prepared transposition for %s", job.input_path)
+        try:
+            write_kml(
+                output_path,
+                _document_waypoints(item.document),
+                job.aircraft_name,
+                overwrite=job.overwrite_existing,
+                processing_warnings=item.warnings,
+                _document=item.document,
             )
         except FileExistsError as error:
             outcomes.append(
@@ -567,7 +818,7 @@ def _run_transposition_plan(
                 planned_output_path=job.output_path,
                 final_output_path=output_path,
                 status=TranspositionFileStatus.SUCCEEDED,
-                warnings=processing_warnings,
+                warnings=item.warnings,
             )
         )
         LOGGER.info("Transposition saved to %s", output_path)
@@ -732,7 +983,11 @@ def run_transposition(
             float(target_heading),
         )
     _validate_transposition_plan(active_plan)
-    return _run_transposition_plan(active_plan, resolved_target)
+    prepared_batch = prepare_transposition(
+        plan=active_plan,
+        target_runway=resolved_target,
+    )
+    return export_prepared_transposition(prepared_batch, active_plan)
 
 
 if __name__ == "__main__":

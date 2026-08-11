@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import os
+import hashlib
 from pathlib import Path
 from uuid import UUID
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -52,16 +53,19 @@ from services import (
     PresetRecord,
     PresetRepository,
     PresetType,
+    PreviewScene,
+    PreparedTranspositionFile,
     RunwayInferenceResult,
     RunwayReference,
     apply_source_runways,
     create_transposition_plan,
     customize_transposition_plan,
+    export_prepared_transposition,
     infer_departure_runway,
     normalise_runway_designator,
     parse_coordinate_pair,
     parse_kml_track,
-    run_transposition,
+    prepare_transposition,
 )
 
 
@@ -71,7 +75,6 @@ TransposePage {
 }
 TransposePage QFrame#workspacePanel,
 TransposePage QFrame#airfieldCard,
-TransposePage QFrame#previewHost,
 TransposePage QDialog#inferencePopup {
     background: palette(base);
     border: 1px solid palette(mid);
@@ -187,7 +190,9 @@ class TranspositionOutputDialog(QDialog):
 
 
 class TransposePage(QWidget):
-    """Three-column workspace for reviewed runway-to-runway transposition."""
+    """Two-column workspace for reviewed runway-to-runway transposition."""
+
+    preview_requested = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -197,6 +202,10 @@ class TransposePage(QWidget):
         self.source_states: dict[str, SourceAirfieldState] = {}
         self._current_source_path: str | None = None
         self._rendering_source = False
+        self._prepared_batch = None
+        self._prepared_signature = None
+        self._accepted_signature = None
+        self._committed_adjustments = {}
 
         self.preset_repository = PresetRepository(
             app_data_path("presets/airfield"),
@@ -219,11 +228,9 @@ class TransposePage(QWidget):
 
         self._build_file_column()
         self._build_airfield_column()
-        self._build_preview_column()
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
-        self.splitter.setStretchFactor(2, 1)
-        self.splitter.setSizes((235, 430, 285))
+        self.splitter.setSizes((235, 715))
 
         self._load_presets(show_issues=True)
         self._render_source_state(None)
@@ -289,7 +296,7 @@ class TransposePage(QWidget):
 
     def _build_airfield_column(self) -> None:
         column = QWidget()
-        layout = QVBoxLayout(column)
+        layout = QHBoxLayout(column)
         layout.setContentsMargins(7, 0, 7, 0)
         layout.setSpacing(12)
         self.source_card = AirfieldCard(
@@ -308,10 +315,20 @@ class TransposePage(QWidget):
         self.source_card.restore_auto_requested.connect(self._restore_auto_source)
         self.source_card.preset_apply_requested.connect(self._apply_source_preset)
         self.target_card.preset_apply_requested.connect(self._apply_target_preset)
-        layout.addWidget(self.source_card)
-        layout.addWidget(self.target_card)
-        layout.addStretch()
+        layout.addWidget(self.source_card, 1, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self.target_card, 1, Qt.AlignmentFlag.AlignTop)
         self.splitter.addWidget(column)
+
+        actions = QHBoxLayout()
+        self.run_btn = QPushButton("Transpose files")
+        self.run_btn.setObjectName("primaryButton")
+        self.run_btn.clicked.connect(self.run_transposition_ui)
+        self.preview_btn = QPushButton("View preview")
+        set_button_icon(self.preview_btn, AppIcon.MONITOR)
+        self.preview_btn.clicked.connect(self.open_preview)
+        actions.addWidget(self.preview_btn)
+        actions.addWidget(self.run_btn)
+        self.target_card.layout().addLayout(actions)
 
         # Stable aliases for extensions that used the former target widgets.
         self.airfield_name_input = self.target_card.name_input
@@ -320,38 +337,6 @@ class TransposePage(QWidget):
         self.target_runway_input = self.target_card.runway_input
         self.orig_height_input = self.source_card.elevation_m_input
         self.orig_height_ft_input = self.source_card.elevation_ft_input
-
-    def _build_preview_column(self) -> None:
-        self.preview_host = QFrame()
-        self.preview_host.setObjectName("previewHost")
-        layout = QVBoxLayout(self.preview_host)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.addStretch()
-        icon = QLabel("◫")
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet("font-size: 42px; color: palette(mid);")
-        title = QLabel("3D preview")
-        title.setObjectName("panelTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        description = QLabel("Reserved for the future Google Maps preview.")
-        description.setObjectName("mutedText")
-        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        description.setWordWrap(True)
-        layout.addWidget(icon)
-        layout.addWidget(title)
-        layout.addWidget(description)
-        layout.addStretch()
-
-        actions = QHBoxLayout()
-        self.run_btn = QPushButton("Transpose files")
-        self.run_btn.setObjectName("primaryButton")
-        self.run_btn.clicked.connect(self.run_transposition_ui)
-        self.preview_btn = QPushButton("View preview")
-        set_button_icon(self.preview_btn, AppIcon.MONITOR)
-        actions.addWidget(self.preview_btn)
-        actions.addWidget(self.run_btn)
-        layout.addLayout(actions)
-        self.splitter.addWidget(self.preview_host)
 
     def _load_presets(self, *, show_issues: bool = False) -> None:
         self.presets = self.preset_repository.load_all()
@@ -534,6 +519,7 @@ class TransposePage(QWidget):
         for item in items:
             path = str(item.data(Qt.ItemDataRole.UserRole))
             self.source_states.pop(path, None)
+            self._committed_adjustments.pop(self._path_key(path), None)
             if path in self.input_files:
                 self.input_files.remove(path)
             self.file_list.takeItem(self.file_list.row(item))
@@ -593,6 +579,7 @@ class TransposePage(QWidget):
                 filter(None, (inference.error or "", *warnings))
             )
             return
+
         reference = candidate.reference
         auto_values = AirfieldFormValues(
             threshold=(
@@ -847,17 +834,205 @@ class TransposePage(QWidget):
             self.source_card.runway_input.setFocus()
         return False
 
-    def run_transposition_ui(self) -> None:
+    def _validated_transposition_inputs(self):
         if not self.input_files:
             QMessageBox.warning(self, "No Files", "Please select at least one KML file.")
-            return
+            return None
         target_runway = self._validated_target()
         if target_runway is None:
-            return
+            return None
         reviewed_runways = self._review_source_runways(None)
         if reviewed_runways is None:
-            return
+            return None
         if not self._confirm_runway_overrides():
+            return None
+        return target_runway, reviewed_runways
+
+    def _current_preview_signature(self, target_runway, reviewed_runways):
+        fingerprints = []
+        for raw_path in self.input_files:
+            path = Path(raw_path).resolve(strict=False)
+            file_signature = self._source_fingerprint(path)
+            fingerprints.append((self._path_key(path), file_signature))
+        runway_signature = tuple(
+            None
+            if runway is None
+            else (
+                runway.latitude,
+                runway.longitude,
+                runway.true_heading_deg,
+                runway.elevation_m,
+            )
+            for runway in reviewed_runways
+        )
+
+    @staticmethod
+    def _source_fingerprint(path: str | Path):
+        """Return a content-backed identity for stale-scene and offset checks."""
+
+        source = Path(path)
+        try:
+            stat = source.stat()
+            digest = hashlib.sha256()
+            with source.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime_ns, digest.hexdigest()
+        target_values = self.target_card.values()
+        return (
+            tuple(fingerprints),
+            runway_signature,
+            (
+                target_runway.latitude,
+                target_runway.longitude,
+                target_runway.true_heading_deg,
+                target_values.airfield_name.strip(),
+                target_values.runway.strip(),
+            ),
+        )
+
+    def _apply_committed_adjustments(self, batch):
+        items = []
+        for item in batch.items:
+            if isinstance(item, PreparedTranspositionFile):
+                path_key = self._path_key(item.input_path)
+                committed = self._committed_adjustments.get(path_key)
+                fingerprint = self._source_fingerprint(item.input_path)
+                if committed is not None and committed[0] == fingerprint:
+                    item = replace(
+                        item,
+                        trace=item.trace.with_adjustment(committed[1]),
+                    )
+                elif committed is not None:
+                    # A file at the same path can be a materially different
+                    # trace.  Never carry its old offset onto the replacement.
+                    self._committed_adjustments.pop(path_key, None)
+            items.append(item)
+        return replace(batch, items=tuple(items))
+
+    def _prepare_current_batch(self, target_runway, reviewed_runways, signature):
+        if (
+            self._prepared_batch is not None
+            and self._accepted_signature == signature
+            and self._prepared_signature == signature
+        ):
+            return self._prepared_batch
+        batch = prepare_transposition(
+            input_files=self.input_files,
+            source_runways=reviewed_runways,
+            target_runway=target_runway,
+        )
+        batch = self._apply_committed_adjustments(batch)
+        self._prepared_batch = batch
+        self._prepared_signature = signature
+        return batch
+
+    def open_preview(self) -> None:
+        validated = self._validated_transposition_inputs()
+        if validated is None:
+            return
+        target_runway, reviewed_runways = validated
+        signature = self._current_preview_signature(target_runway, reviewed_runways)
+        try:
+            batch = prepare_transposition(
+                input_files=self.input_files,
+                source_runways=reviewed_runways,
+                target_runway=target_runway,
+            )
+            batch = self._apply_committed_adjustments(batch)
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Preview preparation failed",
+                str(error) or "The transposition preview could not be prepared.",
+            )
+            return
+        if not batch.prepared:
+            failures = "\n".join(
+                f"• {item.input_path.name}: {item.message}"
+                for item in batch.failed_items
+            )
+            QMessageBox.critical(
+                self,
+                "No traces could be previewed",
+                failures or "No valid trace geometry was produced.",
+            )
+            return
+        if batch.failed_items:
+            failures = "\n".join(
+                f"• {item.input_path.name}: {item.message}"
+                for item in batch.failed_items
+            )
+            QMessageBox.warning(
+                self,
+                "Some traces could not be prepared",
+                "The valid traces will still be shown:\n\n" + failures,
+            )
+        self._prepared_batch = batch
+        self._prepared_signature = signature
+        self.preview_requested.emit(
+            PreviewScene(tuple(item.trace for item in batch.prepared))
+        )
+
+    def accept_preview_scene(self, scene) -> None:
+        if self._prepared_batch is None or not isinstance(scene, PreviewScene):
+            return
+        traces = {trace.trace_id: trace for trace in scene.traces}
+        items = []
+        for item in self._prepared_batch.items:
+            if isinstance(item, PreparedTranspositionFile):
+                trace = traces.get(item.trace.trace_id)
+                if trace is not None:
+                    item = replace(item, trace=trace)
+                    self._committed_adjustments[
+                        self._path_key(item.input_path)
+                    ] = (
+                        self._source_fingerprint(item.input_path),
+                        trace.adjustment,
+                    )
+            items.append(item)
+        self._prepared_batch = replace(
+            self._prepared_batch,
+            items=tuple(items),
+        )
+        self._accepted_signature = self._prepared_signature
+
+    def export_committed_scene(self) -> None:
+        self.run_transposition_ui()
+
+    def run_transposition_ui(self) -> None:
+        validated = self._validated_transposition_inputs()
+        if validated is None:
+            return
+        target_runway, reviewed_runways = validated
+        signature = self._current_preview_signature(target_runway, reviewed_runways)
+        try:
+            prepared_batch = self._prepare_current_batch(
+                target_runway,
+                reviewed_runways,
+                signature,
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Could not prepare transposition: {error}",
+            )
+            return
+
+        if not prepared_batch.prepared:
+            failures = "\n".join(
+                f"• {item.input_path.name}: {item.message}"
+                for item in prepared_batch.failed_items
+            )
+            QMessageBox.critical(
+                self,
+                "Transposition failed",
+                "No KML files can be exported because preparation failed for "
+                f"every input.\n\n{failures}",
+            )
             return
 
         output_dir = QFileDialog.getExistingDirectory(
@@ -884,12 +1059,18 @@ class TransposePage(QWidget):
             QMessageBox.critical(self, "Error", f"Could not plan outputs: {error}")
             return
 
-        plan = self._edit_output_plan(plan)
+        plan = self._edit_output_plan(
+            plan,
+            writable_inputs={
+                item.input_path.resolve(strict=False)
+                for item in prepared_batch.prepared
+            },
+        )
         if plan is None:
             return
 
         try:
-            result = run_transposition(plan=plan, target_runway=target_runway)
+            result = export_prepared_transposition(prepared_batch, plan)
         except Exception as error:
             QMessageBox.critical(self, "Error", f"Transposition failed: {error}")
             return
@@ -991,7 +1172,7 @@ class TransposePage(QWidget):
             FileDialogDirection.OUTPUT,
         )
 
-    def _edit_output_plan(self, plan):
+    def _edit_output_plan(self, plan, *, writable_inputs=None):
         dialog = TranspositionOutputDialog(plan, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
@@ -999,7 +1180,13 @@ class TransposePage(QWidget):
         if candidate is None:
             return None
         existing_paths = tuple(
-            job.output_path for job in candidate.jobs if job.output_path.exists()
+            job.output_path
+            for job in candidate.jobs
+            if job.output_path.exists()
+            and (
+                writable_inputs is None
+                or job.input_path.resolve(strict=False) in writable_inputs
+            )
         )
         if not existing_paths:
             return candidate

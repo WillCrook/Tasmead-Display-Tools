@@ -2,6 +2,12 @@
 
 import sys
 
+from webengine_runtime import configure_webengine_runtime
+
+
+# This must run before importing app_window, which imports Qt WebEngine.
+configure_webengine_runtime()
+
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 

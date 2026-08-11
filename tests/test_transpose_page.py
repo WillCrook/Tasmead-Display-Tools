@@ -36,7 +36,9 @@ from services import (
     TranspositionErrorCode,
     TranspositionFileOutcome,
     TranspositionFileStatus,
+    TraceAdjustment,
     create_transposition_plan,
+    prepare_transposition,
 )
 
 
@@ -98,6 +100,17 @@ class TransposePageTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def add_inferred_files(self, *paths):
+        valid_kml = """<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><LineString>
+<altitudeMode>absolute</altitudeMode><coordinates>
+-1.0,51.0,30 -0.99,51.01,50
+</coordinates></LineString></Placemark></kml>
+"""
+        for raw_path in paths:
+            path = Path(raw_path)
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(valid_kml, encoding="utf-8")
         with (
             patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
@@ -110,7 +123,7 @@ class TransposePageTests(unittest.TestCase):
         self.page.target_card.coordinate_input.setText("51.0, -1.0")
         self.page.target_card.heading_input.setText("240")
 
-    def test_three_column_workspace_and_filename_only_items(self):
+    def test_two_column_workspace_and_filename_only_items(self):
         first = self.root / "one" / "display.kml"
         second = self.root / "two" / "display.kml"
         first.parent.mkdir()
@@ -120,8 +133,7 @@ class TransposePageTests(unittest.TestCase):
 
         self.add_inferred_files(first, second, first)
 
-        self.assertEqual(self.page.splitter.count(), 3)
-        self.assertIsNotNone(self.page.preview_host)
+        self.assertEqual(self.page.splitter.count(), 2)
         self.assertEqual(self.page.file_list.count(), 2)
         self.assertEqual(self.page.file_list.item(0).text(), "display.kml")
         self.assertEqual(self.page.file_list.item(1).text(), "display.kml")
@@ -131,9 +143,19 @@ class TransposePageTests(unittest.TestCase):
         )
         self.assertEqual(self.page.file_list.item(0).toolTip(), str(first.resolve()))
 
+    def test_original_and_target_airfields_are_side_by_side(self):
+        self.page.resize(1100, 900)
+        self.page.show()
+        self.app.processEvents()
+
+        source_bounds = self.page.source_card.geometry()
+        target_bounds = self.page.target_card.geometry()
+        self.assertLess(source_bounds.right(), target_bounds.left())
+        self.assertFalse(source_bounds.intersects(target_bounds))
+
     def test_input_panel_uses_compact_top_aligned_natural_height(self):
         self.page.file_list.addItems([f"display-{index}.kml" for index in range(6)])
-        self.page.resize(1000, 900)
+        self.page.resize(1100, 900)
         self.page.show()
         self.app.processEvents()
 
@@ -150,12 +172,12 @@ class TransposePageTests(unittest.TestCase):
             self.page.file_list.sizeHintForRow(0) * 5,
         )
 
-    def test_preview_actions_host_transposition_and_future_preview_buttons(self):
+    def test_target_airfield_hosts_transposition_and_connected_preview_buttons(self):
         self.page.show()
         self.app.processEvents()
 
-        self.assertTrue(self.page.preview_host.isAncestorOf(self.page.run_btn))
-        self.assertTrue(self.page.preview_host.isAncestorOf(self.page.preview_btn))
+        self.assertTrue(self.page.target_card.isAncestorOf(self.page.run_btn))
+        self.assertTrue(self.page.target_card.isAncestorOf(self.page.preview_btn))
         self.assertLess(self.page.preview_btn.x(), self.page.run_btn.x())
         self.assertEqual(self.page.run_btn.text(), "Transpose files")
         self.assertEqual(self.page.run_btn.objectName(), "primaryButton")
@@ -163,7 +185,7 @@ class TransposePageTests(unittest.TestCase):
         self.assertTrue(self.page.preview_btn.isEnabled())
         self.assertEqual(
             self.page.preview_btn.receivers(self.page.preview_btn.clicked),
-            0,
+            1,
         )
 
     def test_action_buttons_use_local_icons(self):
@@ -234,6 +256,39 @@ class TransposePageTests(unittest.TestCase):
         self.page._restore_auto_source()
         self.assertEqual(self.page.source_card.name_input.text(), "")
         self.assertEqual(self.page.source_card.status_label.text(), "Auto-detected")
+
+    def test_materially_replaced_source_drops_its_committed_adjustment(self):
+        source = self.root / "source.kml"
+        self.add_inferred_files(source)
+        source_runway = RunwayReference(51.0, -1.0, 90.0, 30.0)
+        target_runway = RunwayReference(51.1, -0.8, 120.0)
+        batch = prepare_transposition(
+            input_files=(source,),
+            source_runways=(source_runway,),
+            target_runway=target_runway,
+        )
+        key = self.page._path_key(source)
+        adjustment = TraceAdjustment(east_m=20.0)
+        self.page._committed_adjustments[key] = (
+            self.page._source_fingerprint(source),
+            adjustment,
+        )
+        adjusted = self.page._apply_committed_adjustments(batch)
+        self.assertEqual(adjusted.prepared[0].trace.adjustment, adjustment)
+
+        source.write_text(
+            source.read_text(encoding="utf-8").replace("-0.99,51.01", "-0.98,51.02"),
+            encoding="utf-8",
+        )
+        replacement = prepare_transposition(
+            input_files=(source,),
+            source_runways=(source_runway,),
+            target_runway=target_runway,
+        )
+        reapplied = self.page._apply_committed_adjustments(replacement)
+
+        self.assertTrue(reapplied.prepared[0].trace.adjustment.is_zero)
+        self.assertNotIn(key, self.page._committed_adjustments)
 
     def test_source_and_target_preset_application_have_different_elevation_semantics(self):
         source = self.root / "source.kml"
@@ -322,16 +377,16 @@ class TransposePageTests(unittest.TestCase):
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
             patch("pages.transpose_page.remember_directory") as remember_output,
-            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
-            patch("pages.transpose_page.run_transposition", return_value=result) as run,
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan, **_: plan),
+            patch("pages.transpose_page.export_prepared_transposition", return_value=result) as run,
             patch.object(QMessageBox, "information"),
         ):
             self.page.run_transposition_ui()
 
-        plan = run.call_args.kwargs["plan"]
+        prepared_batch, plan = run.call_args.args
         self.assertEqual(len(plan.jobs), 2)
         self.assertTrue(all(job.source_runway is not None for job in plan.jobs))
-        self.assertEqual(run.call_args.kwargs["target_runway"].elevation_m, None)
+        self.assertEqual(prepared_batch.target_runway.elevation_m, None)
         remember_output.assert_called_once_with(
             FileDialogWorkflow.TRANSPOSITION,
             FileDialogDirection.OUTPUT,
@@ -372,8 +427,8 @@ class TransposePageTests(unittest.TestCase):
             patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
-            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
-            patch("pages.transpose_page.run_transposition", return_value=result),
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan, **_: plan),
+            patch("pages.transpose_page.export_prepared_transposition", return_value=result),
             patch.object(QMessageBox, "warning") as warning,
         ):
             self.page.run_transposition_ui()
@@ -410,8 +465,8 @@ class TransposePageTests(unittest.TestCase):
             patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
-            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
-            patch("pages.transpose_page.run_transposition", return_value=result),
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan, **_: plan),
+            patch("pages.transpose_page.export_prepared_transposition", return_value=result),
             patch.object(QMessageBox, "warning") as warning,
             patch.object(QMessageBox, "information") as information,
         ):
@@ -448,8 +503,8 @@ class TransposePageTests(unittest.TestCase):
 
         with (
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
-            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan: plan),
-            patch("pages.transpose_page.run_transposition", return_value=result),
+            patch.object(self.page, "_edit_output_plan", side_effect=lambda plan, **_: plan),
+            patch("pages.transpose_page.export_prepared_transposition", return_value=result),
             patch.object(QMessageBox, "critical") as critical,
             patch.object(QMessageBox, "information") as information,
         ):
