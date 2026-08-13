@@ -16,6 +16,11 @@ LIVE_GOOGLE_MAPS_API_KEY = os.environ.get("TASMEAD_GOOGLE_MAPS_API_KEY", "").str
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from webengine_runtime import configure_webengine_runtime
+
+
+configure_webengine_runtime()
+
 import map_preview_widget as preview_module
 
 from PyQt6.QtCore import QEventLoop, QTimer
@@ -133,6 +138,39 @@ class PreviewShellPolicyTests(unittest.TestCase):
         self.assertEqual(_sanitise_diagnostic_location("data:text/plain,GEOMETRY"), "data:")
         self.assertNotIn("SECRET", _sanitise_diagnostic_location(value))
 
+    def test_request_generation_requires_the_exact_path_and_bounded_query(self):
+        preview_path = "/secret/preview"
+        self.assertEqual(
+            preview_module._generation_from_request_target(
+                "/secret/preview?generation=1",
+                preview_path,
+            ),
+            1,
+        )
+        self.assertEqual(
+            preview_module._generation_from_request_target(
+                "/secret/preview?generation=2147483647",
+                preview_path,
+            ),
+            2_147_483_647,
+        )
+        for target in (
+            "/secret/preview",
+            "/secret/preview?generation=0",
+            "/secret/preview?generation=2147483648",
+            "/secret/preview?generation=1&extra=1",
+            "/secret/preview?generation=1#fragment",
+            "http://127.0.0.1/secret/preview?generation=1",
+            "/wrong/preview?generation=1",
+        ):
+            with self.subTest(target=target):
+                self.assertIsNone(
+                    preview_module._generation_from_request_target(
+                        target,
+                        preview_path,
+                    )
+                )
+
 
 class MapPreviewControlsTests(unittest.TestCase):
     @classmethod
@@ -165,6 +203,7 @@ class MapPreviewControlsTests(unittest.TestCase):
 
         applied = QSignalSpy(self.widget.scene_applied)
         self.assertFalse(self.widget.apply_button.isEnabled())
+        self.widget._failed_generation = None
         self.widget._on_render_acknowledged(
             self.widget._page_generation, self.widget._revision
         )
@@ -192,6 +231,8 @@ class MapPreviewControlsTests(unittest.TestCase):
 
     def test_shell_requires_a_sized_steady_current_revision_before_apply(self):
         self.assertIn("gmp-map-3d { width: 100%; height: 100%; display: block; }", _PREVIEW_HTML)
+        self.assertIn("window.location.search", _PREVIEW_HTML)
+        self.assertNotIn("window.location.hash", _PREVIEW_HTML)
         self.assertIn("latestRevision", _PREVIEW_HTML)
         self.assertIn("gmp-steadychange", _PREVIEW_HTML)
         self.assertIn("presentationStateChanged", _PREVIEW_HTML)
@@ -210,6 +251,14 @@ class MapPreviewControlsTests(unittest.TestCase):
 
         self.assertFalse(self.widget.apply_button.isEnabled())
         self.assertFalse(self.widget.open_settings_button.isHidden())
+        self.assertEqual(self.widget.status_label.text(), "Rejected")
+
+        self.widget._on_render_acknowledged(
+            self.widget._page_generation,
+            self.widget._revision,
+        )
+        self.assertFalse(self.widget.apply_button.isEnabled())
+        self.assertFalse(self.widget._session_reusable)
         self.assertEqual(self.widget.status_label.text(), "Rejected")
 
     def test_bridge_replaces_untrusted_failure_text_with_a_fixed_message(self):
@@ -345,6 +394,167 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertFalse(self.widget._presentation_timer.isActive())
         self.assertFalse(self.widget._presentation_active)
 
+    def test_consecutive_shell_reloads_use_distinct_requested_generations(self):
+        class FakeServer:
+            def __init__(self):
+                self.generations = []
+
+            def url_for_generation(self, generation):
+                self.generations.append(generation)
+                return preview_module.QUrl(
+                    f"http://127.0.0.1:12345/token/preview?generation={generation}"
+                )
+
+        class FakeWebView:
+            def __init__(self):
+                self.urls = []
+
+            def load(self, url):
+                self.urls.append(url)
+
+        server = FakeServer()
+        web_view = FakeWebView()
+        self.widget._server = server
+        self.widget._web_view = web_view
+        try:
+            with patch.object(preview_module, "WEBENGINE_AVAILABLE", True):
+                self.assertTrue(self.widget._reload_shell())
+                self.assertTrue(self.widget._reload_shell())
+
+            self.assertEqual(server.generations, [1, 2])
+            self.assertEqual(
+                [url.query() for url in web_view.urls],
+                ["generation=1", "generation=2"],
+            )
+            self.assertTrue(all(not url.fragment() for url in web_view.urls))
+        finally:
+            self.widget._server = None
+            self.widget._web_view = None
+
+    def test_healthy_same_key_session_is_reused_for_a_new_scene(self):
+        class FakeWebView:
+            def update(self):
+                return None
+
+        self.widget._api_key = "same-key"
+        self.widget._shell_ready = True
+        self.widget._session_reusable = True
+        self.widget._web_view = FakeWebView()
+        self.widget._server = object()
+        try:
+            self.widget.show()
+            self.app.processEvents()
+            self.widget.hide()
+            self.app.processEvents()
+            with (
+                patch.object(self.widget, "_schedule_render") as render,
+                patch.object(self.widget, "_reload_shell") as reload_shell,
+            ):
+                started = self.widget.set_scene(
+                    scene_with_two_traces(),
+                    "same-key",
+                )
+
+            self.assertTrue(started)
+            render.assert_called_once_with(immediate=True)
+            reload_shell.assert_not_called()
+        finally:
+            self.widget._web_view = None
+            self.widget._server = None
+
+    def test_changed_key_or_failed_session_forces_a_hard_reload(self):
+        self.widget._api_key = "old-key"
+        self.widget._shell_ready = True
+        self.widget._session_reusable = True
+        self.widget._web_view = object()
+        self.widget._server = object()
+        try:
+            with (
+                patch.object(self.widget, "_schedule_render") as render,
+                patch.object(
+                    self.widget,
+                    "_reload_shell",
+                    return_value=True,
+                ) as reload_shell,
+            ):
+                self.assertTrue(
+                    self.widget.set_scene(scene_with_two_traces(), "new-key")
+                )
+
+            reload_shell.assert_called_once_with()
+            render.assert_not_called()
+
+            self.widget._session_reusable = True
+            self.widget._show_error("network", "Network failure")
+            self.assertFalse(self.widget._session_reusable)
+
+            with (
+                patch.object(self.widget, "_schedule_render") as render,
+                patch.object(
+                    self.widget,
+                    "_reload_shell",
+                    return_value=True,
+                ) as reload_shell,
+            ):
+                self.assertTrue(
+                    self.widget.set_scene(scene_with_two_traces(), "new-key")
+                )
+
+            reload_shell.assert_called_once_with()
+            render.assert_not_called()
+        finally:
+            self.widget._web_view = None
+            self.widget._server = None
+
+    def test_renderer_termination_requires_runtime_recreation(self):
+        self.widget._session_reusable = True
+
+        self.widget._on_render_process_terminated()
+
+        self.assertTrue(self.widget._web_runtime_recreation_required)
+        self.assertFalse(self.widget._session_reusable)
+        self.assertIn("renderer stopped", self.widget.status_label.text())
+
+    def test_retry_recreates_a_terminated_web_runtime_before_loading(self):
+        class FakeServer:
+            def url_for_generation(self, generation):
+                return preview_module.QUrl(
+                    f"http://127.0.0.1:12345/token/preview?generation={generation}"
+                )
+
+        class FakeWebView:
+            def __init__(self):
+                self.loaded = []
+
+            def load(self, url):
+                self.loaded.append(url)
+
+        web_view = FakeWebView()
+
+        def create_runtime():
+            self.widget._server = FakeServer()
+            self.widget._web_view = web_view
+
+        self.widget._web_runtime_recreation_required = True
+        try:
+            with (
+                patch.object(preview_module, "WEBENGINE_AVAILABLE", True),
+                patch.object(
+                    self.widget,
+                    "_create_web_view",
+                    side_effect=create_runtime,
+                ) as create_web_view,
+            ):
+                self.assertTrue(self.widget._reload_shell())
+
+            create_web_view.assert_called_once_with()
+            self.assertFalse(self.widget._web_runtime_recreation_required)
+            self.assertEqual(len(web_view.loaded), 1)
+            self.assertEqual(web_view.loaded[0].query(), "generation=1")
+        finally:
+            self.widget._server = None
+            self.widget._web_view = None
+
     def test_enforcing_policy_failure_survives_late_acknowledgement(self):
         self.widget._page_generation = 4
         self.widget._revision = 9
@@ -439,6 +649,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         with patch.object(self.widget, "_ensure_web_view", return_value=False):
             self.widget.set_scene(scene_with_two_traces(), "test-key")
         self.widget._shell_ready = True
+        self.widget._failed_generation = None
 
         with (
             patch.object(preview_module, "_MAX_PAYLOAD_BYTES", 1),
@@ -460,7 +671,10 @@ class PreviewLoopbackTests(unittest.TestCase):
     def test_shell_is_tokenized_non_cacheable_and_contains_no_api_key(self):
         server = PreviewLoopbackServer()
         try:
-            with urllib.request.urlopen(server.url.toString(), timeout=3) as response:
+            with urllib.request.urlopen(
+                server.url_for_generation(1).toString(),
+                timeout=3,
+            ) as response:
                 body = response.read().decode("utf-8")
                 policy = response.headers["Content-Security-Policy"]
                 self.assertEqual(response.status, 200)
@@ -482,16 +696,27 @@ class PreviewLoopbackTests(unittest.TestCase):
                     )
                 )
                 first_nonce = nonce_match.group(1)
-            with urllib.request.urlopen(server.url.toString(), timeout=3) as response:
+            with urllib.request.urlopen(
+                server.url_for_generation(2).toString(),
+                timeout=3,
+            ) as response:
                 second_policy = response.headers["Content-Security-Policy"]
                 second_nonce = re.search(
                     r"script-src 'nonce-([^']+)'", second_policy
                 ).group(1)
             self.assertNotEqual(first_nonce, second_nonce)
-            root_url = f"http://127.0.0.1:{server.port}/"
-            with self.assertRaises(urllib.error.HTTPError) as denied:
-                urllib.request.urlopen(root_url, timeout=3)
-            self.assertEqual(denied.exception.code, 404)
+            invalid_urls = (
+                server.url.toString(),
+                server.url.toString() + "?generation=0",
+                server.url.toString() + "?generation=2147483648",
+                server.url.toString() + "?generation=1&extra=1",
+                f"http://127.0.0.1:{server.port}/?generation=1",
+            )
+            for invalid_url in invalid_urls:
+                with self.subTest(invalid_url=invalid_url):
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        urllib.request.urlopen(invalid_url, timeout=3)
+                    self.assertEqual(denied.exception.code, 404)
         finally:
             server.stop()
 
@@ -544,6 +769,12 @@ class WebEngineShellSmokeTests(unittest.TestCase):
             self.assertEqual(result[0]["background"], "rgb(15, 23, 42)")
             self.assertEqual(result[0]["inlineColor"], "rgb(1, 2, 3)")
             self.assertGreater(result[0]["rules"], 0)
+
+            self.assertTrue(widget._reload_shell())
+            while len(ready) < 2:
+                self.assertTrue(ready.wait(5000))
+            self.assertEqual([list(signal)[0] for signal in ready], [1, 2])
+            self.assertIn("No Google Maps API key", widget.status_label.text())
             QApplication.processEvents()
             self.assertEqual(len(violations), 0)
         finally:
@@ -666,6 +897,24 @@ class LiveGoogleMapsCspSmokeTests(unittest.TestCase):
             self._settle_events()
             self.assertTrue(widget.apply_button.isEnabled())
             self.assertEqual(len(violations), 0)
+
+            first_generation = widget._page_generation
+            widget.hide()
+            QApplication.processEvents()
+            widget.show()
+            outcomes = self._run_and_wait(
+                widget,
+                lambda: widget.set_scene(
+                    scene_with_two_traces(),
+                    LIVE_GOOGLE_MAPS_API_KEY,
+                ),
+            )
+            self.assertTrue(outcomes, "The reused Maps preview timed out.")
+            self.assertEqual(outcomes[0][0], "acknowledged")
+            self.assertEqual(widget._page_generation, first_generation)
+            self.assertTrue(widget.apply_button.isEnabled())
+            self.assertEqual(len(violations), 0)
+
             applied = QSignalSpy(widget.scene_applied)
             expected_scene = widget.scene
             widget.apply_button.click()

@@ -43,6 +43,8 @@ _MAX_CSP_DIAGNOSTICS = 32
 _SHELL_READY_TIMEOUT_MS = 10_000
 _PRESENTATION_REFRESH_INTERVAL_MS = 33
 _NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
+_GENERATION_QUERY_PATTERN = re.compile(r"generation=([1-9][0-9]{0,9})")
+_MAX_GENERATION = 2_147_483_647
 _CSP_DIRECTIVES = frozenset(
     {
         "base-uri",
@@ -174,6 +176,27 @@ def _clamped_diagnostic_number(value: int, *, minimum: int, maximum: int) -> int
     return min(maximum, max(minimum, number))
 
 
+def _generation_from_request_target(
+    request_target: str,
+    preview_path: str,
+) -> int | None:
+    try:
+        request = urlsplit(str(request_target))
+    except (TypeError, ValueError):
+        return None
+    generation_match = _GENERATION_QUERY_PATTERN.fullmatch(request.query)
+    if (
+        request.scheme
+        or request.netloc
+        or request.fragment
+        or request.path != preview_path
+        or generation_match is None
+    ):
+        return None
+    generation = int(generation_match.group(1))
+    return generation if generation <= _MAX_GENERATION else None
+
+
 def _normalised_web_failure(kind: str, message: str) -> tuple[str, str]:
     safe_kind = str(kind).strip().lower()
     if safe_kind not in _WEB_FAILURE_MESSAGES:
@@ -209,7 +232,7 @@ _PREVIEW_HTML = r"""<!doctype html>
   <script nonce="__NONCE__">
   (() => {
     'use strict';
-    const generationMatch = window.location.hash.match(/^#generation=([1-9][0-9]{0,9})$/);
+    const generationMatch = window.location.search.match(/^\?generation=([1-9][0-9]{0,9})$/);
     const initialGeneration = generationMatch
       ? Math.min(2147483647, Number(generationMatch[1]))
       : 0;
@@ -536,7 +559,11 @@ class _PreviewRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         server = self.server
-        if self.path != server.preview_path:  # type: ignore[attr-defined]
+        generation = _generation_from_request_target(
+            self.path,
+            server.preview_path,  # type: ignore[attr-defined]
+        )
+        if generation is None:
             self.send_error(404)
             return
         nonce = secrets.token_urlsafe(24)
@@ -580,6 +607,14 @@ class PreviewLoopbackServer:
     def url(self) -> QUrl:
         port = self._server.server_address[1]
         return QUrl(f"http://127.0.0.1:{port}{self._server.preview_path}")  # type: ignore[attr-defined]
+
+    def url_for_generation(self, generation: int) -> QUrl:
+        value = int(generation)
+        if not 1 <= value <= _MAX_GENERATION:
+            raise ValueError("Preview generation is outside the supported range.")
+        url = QUrl(self.url)
+        url.setQuery(f"generation={value}")
+        return url
 
     @property
     def port(self) -> int:
@@ -713,9 +748,12 @@ class MapPreviewWidget(QWidget):
         self._revision = 0
         self._acknowledged_revision = -1
         self._page_generation = 0
+        self._failed_generation: int | None = None
         self._csp_failed_generation: int | None = None
         self._csp_diagnostics: dict[tuple[str, str, str, str], int] = {}
         self._shell_ready = False
+        self._session_reusable = False
+        self._web_runtime_recreation_required = False
         self._server: PreviewLoopbackServer | None = None
         self._web_view = None
         self._bridge: MapPreviewBridge | None = None
@@ -906,12 +944,36 @@ class MapPreviewWidget(QWidget):
         self._bridge = bridge
         self.map_layout.addWidget(web_view)
 
+    def _dispose_web_runtime(self) -> None:
+        self._shell_ready_timer.stop()
+        self._stop_presentation_watchdog(clear_activity=True)
+        if self._web_view is not None:
+            web_view = self._web_view
+            self._web_view = None
+            self._bridge = None
+            web_view.stop()
+            self.map_layout.removeWidget(web_view)
+            web_view.deleteLater()
+        if self._server is not None:
+            self._server.stop()
+            self._server = None
+        self._shell_ready = False
+        self._session_reusable = False
+
     def set_scene(self, scene: PreviewScene, api_key: str) -> bool:
         if not scene.traces:
             raise ValueError("A preview scene requires at least one trace.")
+        key = str(api_key).strip()
+        reuse_session = (
+            self._session_reusable
+            and self._shell_ready
+            and self._web_view is not None
+            and self._server is not None
+            and key == self._api_key
+        )
         self._scene = scene
         self._committed_scene = scene
-        self._api_key = str(api_key).strip()
+        self._api_key = key
         self.trace_selector.blockSignals(True)
         self.trace_selector.clear()
         for trace in scene.traces:
@@ -925,8 +987,10 @@ class MapPreviewWidget(QWidget):
                 "PyQt6-WebEngine is unavailable or could not start. KML export remains available without preview.",
             )
             return False
-        self._reload_shell()
-        return True
+        if reuse_session:
+            self._schedule_render(immediate=True)
+            return True
+        return self._reload_shell()
 
     @property
     def scene(self) -> PreviewScene | None:
@@ -935,17 +999,33 @@ class MapPreviewWidget(QWidget):
     def _begin_page_generation(self) -> int:
         self._page_generation = (
             1
-            if self._page_generation >= 2_147_483_647
+            if self._page_generation >= _MAX_GENERATION
             else self._page_generation + 1
         )
+        self._failed_generation = None
         self._csp_failed_generation = None
         self._csp_diagnostics.clear()
         return self._page_generation
 
-    def _reload_shell(self) -> None:
+    def _reload_shell(self) -> bool:
         self._stop_presentation_watchdog(clear_activity=True)
-        if not WEBENGINE_AVAILABLE or self._web_view is None or self._server is None:
-            return
+        self._session_reusable = False
+        if not WEBENGINE_AVAILABLE:
+            return False
+        if self._web_runtime_recreation_required:
+            self._dispose_web_runtime()
+            try:
+                self._create_web_view()
+            except Exception:
+                self._show_error(
+                    "initialisation",
+                    "The secure local preview service could not be restarted.",
+                )
+                return False
+            self._idle_label.hide()
+            self._web_runtime_recreation_required = False
+        if self._web_view is None or self._server is None:
+            return False
         self._begin_page_generation()
         self._shell_ready = False
         self._acknowledged_revision = -1
@@ -953,10 +1033,10 @@ class MapPreviewWidget(QWidget):
         self.retry_button.hide()
         self.open_settings_button.hide()
         self.status_label.setText("Initialising secure local preview…")
-        page_url = QUrl(self._server.url)
-        page_url.setFragment(f"generation={self._page_generation}")
+        page_url = self._server.url_for_generation(self._page_generation)
         self._shell_ready_timer.start()
         self._web_view.load(page_url)
+        return True
 
     def _on_load_finished(self, succeeded: bool) -> None:
         if not succeeded:
@@ -975,7 +1055,10 @@ class MapPreviewWidget(QWidget):
         )
 
     def _on_shell_ready(self, generation: int) -> None:
-        if generation != self._page_generation:
+        if (
+            generation != self._page_generation
+            or self._failed_generation == generation
+        ):
             return
         self._shell_ready_timer.stop()
         self._shell_ready = True
@@ -989,9 +1072,13 @@ class MapPreviewWidget(QWidget):
         self._schedule_render(immediate=True)
 
     def _schedule_render(self, *, immediate: bool = False) -> None:
-        if self._csp_failed_generation == self._page_generation:
+        if (
+            self._failed_generation == self._page_generation
+            or self._csp_failed_generation == self._page_generation
+        ):
             self._set_apply_enabled(False)
             return
+        self._session_reusable = False
         self._revision += 1
         self._acknowledged_revision = -1
         self._set_apply_enabled(False)
@@ -1008,6 +1095,7 @@ class MapPreviewWidget(QWidget):
         if (
             not self._shell_ready
             or self._scene is None
+            or self._failed_generation == self._page_generation
             or self._csp_failed_generation == self._page_generation
         ):
             return
@@ -1040,12 +1128,19 @@ class MapPreviewWidget(QWidget):
         if (
             generation != self._page_generation
             or revision != self._revision
+            or self._failed_generation == generation
             or self._csp_failed_generation == generation
+            or self._web_runtime_recreation_required
         ):
             return
         self._stop_presentation_watchdog(clear_activity=True)
         QTimer.singleShot(0, self._refresh_web_presentation)
         self._acknowledged_revision = revision
+        self._session_reusable = (
+            self._shell_ready
+            and self._web_view is not None
+            and self._server is not None
+        )
         self.status_label.setText(
             "Preview matches the quantized WGS84 geometry that will be exported. "
             "The magenta anchor is a preview-only guide."
@@ -1057,6 +1152,7 @@ class MapPreviewWidget(QWidget):
     def _on_render_failed(self, generation: int, kind: str, message: str) -> None:
         if (
             generation != self._page_generation
+            or self._failed_generation == generation
             or self._csp_failed_generation == generation
         ):
             return
@@ -1076,6 +1172,7 @@ class MapPreviewWidget(QWidget):
         if (
             generation != self._page_generation
             or revision != self._revision
+            or self._failed_generation == generation
             or self._csp_failed_generation == generation
         ):
             return
@@ -1165,13 +1262,18 @@ class MapPreviewWidget(QWidget):
         )
 
     def _on_render_process_terminated(self, *_args: Any) -> None:
+        self._web_runtime_recreation_required = True
         self._show_error(
             "render",
             "The embedded map renderer stopped unexpectedly. Check WebGL support and retry.",
         )
 
     def _show_error(self, kind: str, message: str) -> None:
+        self._render_timer.stop()
+        self._shell_ready_timer.stop()
         self._stop_presentation_watchdog(clear_activity=True)
+        self._failed_generation = self._page_generation
+        self._session_reusable = False
         self._set_apply_enabled(False)
         self.status_label.setText(message)
         self.retry_button.setVisible(WEBENGINE_AVAILABLE)
@@ -1251,6 +1353,7 @@ class MapPreviewWidget(QWidget):
         if (
             self._scene is not None
             and self._acknowledged_revision == self._revision
+            and self._failed_generation != self._page_generation
             and self._csp_failed_generation != self._page_generation
         ):
             self._committed_scene = self._scene
@@ -1260,6 +1363,7 @@ class MapPreviewWidget(QWidget):
         if (
             self._scene is not None
             and self._acknowledged_revision == self._revision
+            and self._failed_generation != self._page_generation
             and self._csp_failed_generation != self._page_generation
         ):
             self._committed_scene = self._scene
@@ -1273,19 +1377,9 @@ class MapPreviewWidget(QWidget):
 
     def shutdown(self) -> None:
         self._render_timer.stop()
-        self._shell_ready_timer.stop()
-        self._stop_presentation_watchdog(clear_activity=True)
-        if self._web_view is not None:
-            web_view = self._web_view
-            self._web_view = None
-            self._bridge = None
-            web_view.stop()
-            self.map_layout.removeWidget(web_view)
-            web_view.deleteLater()
-        if self._server is not None:
-            self._server.stop()
-            self._server = None
-        self._shell_ready = False
+        self._dispose_web_runtime()
+        self._web_runtime_recreation_required = False
+        self._failed_generation = None
         self._csp_failed_generation = None
         self._csp_diagnostics.clear()
         self._api_key = ""
