@@ -98,7 +98,6 @@ class DebrisWorkspaceTests(DebrisUiTestCase):
         self.assertEqual(self.page.flight_input_card.objectName(), "workspacePanel")
         self.assertEqual(self.page.results_widget.objectName(), "resultsCard")
         self.assertEqual(self.page.preset_combo.itemText(0), "Choose a debris preset")
-        self.assertEqual(self.page.apply_preset_btn.text(), "Apply")
         self.assertEqual(self.page.save_preset_btn.text(), "Save current…")
         self.assertEqual(self.page.manage_presets_btn.text(), "Manage presets…")
         self.assertEqual(self.page.run_btn.objectName(), "primaryButton")

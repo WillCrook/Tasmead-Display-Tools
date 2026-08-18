@@ -17,11 +17,16 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QInputDialog,
     QMessageBox,
+    QPushButton,
 )
 
 from file_dialog_state import FileDialogDirection, FileDialogWorkflow
 from pages.airfield_ui import AirfieldPresetManagerDialog
-from pages.transpose_page import TransposePage, TranspositionOutputDialog
+from pages.transpose_page import (
+    TransposePage,
+    TranspositionInputDialog,
+    TranspositionOutputDialog,
+)
 from services import (
     KmlPoint,
     KmlStructureError,
@@ -188,6 +193,193 @@ class TransposePageTests(unittest.TestCase):
             1,
         )
 
+    def test_transposition_selection_dialog_supports_all_none_and_requires_a_choice(self):
+        first = self.root / "first.kml"
+        second = self.root / "second.kml"
+        dialog = TranspositionInputDialog(
+            (str(first), str(second)),
+            (str(first),),
+            self.page,
+        )
+
+        self.assertEqual(dialog._checked_paths(), (str(first.resolve()),))
+        dialog.select_none_button.click()
+        self.assertFalse(dialog.continue_button.isEnabled())
+        dialog._validate_and_accept()
+        self.assertIn("at least one", dialog.error_label.text())
+
+        dialog.select_all_button.click()
+        self.assertTrue(dialog.continue_button.isEnabled())
+        dialog._validate_and_accept()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(
+            dialog.selected_paths,
+            (str(first.resolve()), str(second.resolve())),
+        )
+        dialog.close()
+
+    def test_transposition_selection_defaults_to_current_then_remembers_submission(self):
+        first = self.root / "first.kml"
+        second = self.root / "second.kml"
+        self.add_inferred_files(first, second)
+        first_path = str(first.resolve())
+        second_path = str(second.resolve())
+
+        with patch("pages.transpose_page.TranspositionInputDialog") as dialog_class:
+            dialog = dialog_class.return_value
+            dialog.exec.return_value = QDialog.DialogCode.Accepted
+            dialog.selected_paths = (second_path,)
+            self.assertEqual(self.page._choose_transposition_inputs(), (second_path,))
+            self.assertEqual(dialog_class.call_args.args[1], (first_path,))
+
+        with patch("pages.transpose_page.TranspositionInputDialog") as dialog_class:
+            dialog = dialog_class.return_value
+            dialog.exec.return_value = QDialog.DialogCode.Rejected
+            dialog.selected_paths = (first_path,)
+            self.assertIsNone(self.page._choose_transposition_inputs())
+            self.assertEqual(dialog_class.call_args.args[1], (second_path,))
+
+        self.assertEqual(self.page._last_transposition_selection, (second_path,))
+
+        self.page.file_list.clearSelection()
+        self.page.file_list.item(1).setSelected(True)
+        self.page.remove_selected_files()
+        self.assertEqual(self.page._last_transposition_selection, ())
+
+        with patch("pages.transpose_page.TranspositionInputDialog") as dialog_class:
+            dialog_class.return_value.exec.return_value = QDialog.DialogCode.Rejected
+            self.assertIsNone(self.page._choose_transposition_inputs())
+            self.assertEqual(dialog_class.call_args.args[1], (first_path,))
+
+    def test_preview_prepares_only_the_current_file(self):
+        first = self.root / "first.kml"
+        unrelated = self.root / "broken.kml"
+        self.add_inferred_files(first, unrelated)
+        unrelated_state = self.page.source_states[str(unrelated.resolve())]
+        unrelated_state.analysed = True
+        unrelated_state.parse_error = "Unrelated file is broken."
+        self.page._sync_file_item_error(unrelated)
+        self.configure_target()
+        scenes = []
+        self.page.preview_requested.connect(scenes.append)
+
+        with (
+            patch(
+                "pages.transpose_page.prepare_transposition",
+                wraps=prepare_transposition,
+            ) as prepare,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.open_preview()
+
+        self.assertEqual(
+            prepare.call_args.kwargs["input_files"],
+            (str(first.resolve()),),
+        )
+        self.assertEqual(len(scenes), 1)
+        self.assertEqual(len(scenes[0].traces), 1)
+        warning.assert_not_called()
+
+    def test_preview_export_uses_its_file_without_opening_selection_dialog(self):
+        source = self.root / "source.kml"
+        self.add_inferred_files(source)
+        self.page._prepared_batch = prepare_transposition(
+            input_files=(source,),
+            source_runways=(RunwayReference(51.0, -1.0, 90.0, 30.0),),
+            target_runway=RunwayReference(51.1, -0.8, 120.0),
+        )
+
+        with (
+            patch.object(self.page, "_choose_transposition_inputs") as choose,
+            patch.object(self.page, "_run_transposition_for_paths") as run,
+        ):
+            self.page.export_committed_scene()
+
+        choose.assert_not_called()
+        run.assert_called_once_with((str(source.resolve()),))
+
+    def test_unselected_invalid_file_does_not_affect_transposition_preflight(self):
+        first = self.root / "first.kml"
+        unrelated = self.root / "broken.kml"
+        self.add_inferred_files(first, unrelated)
+        unrelated_state = self.page.source_states[str(unrelated.resolve())]
+        unrelated_state.analysed = True
+        unrelated_state.parse_error = "Unrelated file is broken."
+        self.page._sync_file_item_error(unrelated)
+        self.configure_target()
+
+        with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(first.resolve()),),
+            ),
+            patch(
+                "pages.transpose_page.prepare_transposition",
+                wraps=prepare_transposition,
+            ) as prepare,
+            patch.object(QFileDialog, "getExistingDirectory", return_value="") as folder,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.run_transposition_ui()
+
+        self.assertEqual(
+            prepare.call_args.kwargs["input_files"],
+            (str(first.resolve()),),
+        )
+        folder.assert_called_once()
+        warning.assert_not_called()
+
+    def test_selected_errors_are_marked_summarised_and_opened_inline(self):
+        first = self.root / "first.kml"
+        second = self.root / "second.kml"
+        self.add_inferred_files(first, second)
+        self.configure_target()
+
+        self.page.source_card.coordinate_input.clear()
+        self.page._source_form_edited()
+        with (
+            patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
+            patch(
+                "pages.transpose_page.infer_departure_runway",
+                return_value=inferred_result(),
+            ),
+        ):
+            self.page.file_list.setCurrentRow(1)
+        self.page.source_card.elevation_m_input.clear()
+        self.page._source_form_edited()
+
+        with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(first.resolve()), str(second.resolve())),
+            ),
+            patch.object(QFileDialog, "getExistingDirectory") as folder,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.run_transposition_ui()
+
+        folder.assert_not_called()
+        warning.assert_called_once()
+        message = warning.call_args.args[2]
+        self.assertIn("first.kml", message)
+        self.assertIn("departure threshold", message)
+        self.assertIn("second.kml", message)
+        self.assertIn("elevation is required", message)
+        self.assertEqual(self.page._current_source_path, str(first.resolve()))
+        self.assertFalse(self.page.file_list.item(0).icon().isNull())
+        self.assertFalse(self.page.file_list.item(1).icon().isNull())
+        self.assertIn("departure threshold", self.page.source_card.error_label.text())
+        self.assertTrue(self.page.source_card.elevation_m_input.isEnabled())
+
+        self.page.file_list.setCurrentRow(1)
+        self.assertIn("elevation is required", self.page.source_card.error_label.text())
+        self.page.source_card.elevation_m_input.setText("30")
+        self.page._source_form_edited()
+        self.assertTrue(self.page.file_list.item(1).icon().isNull())
+        self.assertFalse(self.page.file_list.item(0).icon().isNull())
+
     def test_action_buttons_use_local_icons(self):
         for button in (
             self.page.add_files_btn,
@@ -307,15 +499,24 @@ class TransposePageTests(unittest.TestCase):
         self.page._load_presets()
 
         for card in (self.page.source_card, self.page.target_card):
-            index = card.preset_combo.findData(str(record.preset.id), Qt.ItemDataRole.UserRole)
+            index = card.preset_combo.findData(
+                str(record.preset.id),
+                Qt.ItemDataRole.UserRole,
+            )
             card.preset_combo.setCurrentIndex(index)
-        self.page._apply_source_preset()
-        self.page._apply_target_preset()
+            card.preset_combo.activated.emit(index)
 
         self.assertEqual(self.page.source_card.elevation_m_input.text(), "38")
         self.assertEqual(self.page.source_card.status_label.text(), "Preset")
         self.assertEqual(self.page.target_card.name_input.text(), "Farnborough")
         self.assertFalse(self.page.target_card.include_elevation)
+        self.assertFalse(
+            any(
+                button.text() == "Apply"
+                for card in (self.page.source_card, self.page.target_card)
+                for button in card.findChildren(QPushButton)
+            )
+        )
 
     def test_nonstandard_runways_are_confirmed_once_and_cancel_stops_run(self):
         source = self.root / "source.kml"
@@ -325,6 +526,11 @@ class TransposePageTests(unittest.TestCase):
         self.configure_target(runway="TEMP")
 
         with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(source.resolve()),),
+            ),
             patch.object(
                 QMessageBox,
                 "question",
@@ -346,6 +552,11 @@ class TransposePageTests(unittest.TestCase):
         self.configure_target(runway="24r")
 
         with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(source.resolve()),),
+            ),
             patch.object(QMessageBox, "question") as question,
             patch.object(QFileDialog, "getExistingDirectory", return_value=""),
         ):
@@ -373,6 +584,11 @@ class TransposePageTests(unittest.TestCase):
         result = TranspositionBatchResult(outcomes=outputs)
 
         with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(first.resolve()), str(second.resolve())),
+            ),
             patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
@@ -424,6 +640,11 @@ class TransposePageTests(unittest.TestCase):
         result = TranspositionBatchResult(outcomes=(success, failure))
 
         with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(first.resolve()), str(failed.resolve())),
+            ),
             patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
@@ -462,6 +683,11 @@ class TransposePageTests(unittest.TestCase):
         )
 
         with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(source.resolve()),),
+            ),
             patch("pages.transpose_page.parse_kml_track", return_value=inferred_track()),
             patch("pages.transpose_page.infer_departure_runway", return_value=inferred_result()),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
@@ -502,6 +728,11 @@ class TransposePageTests(unittest.TestCase):
         result = TranspositionBatchResult(outcomes=(failure,))
 
         with (
+            patch.object(
+                self.page,
+                "_choose_transposition_inputs",
+                return_value=(str(source.resolve()),),
+            ),
             patch.object(QFileDialog, "getExistingDirectory", return_value=str(output_dir)),
             patch.object(self.page, "_edit_output_plan", side_effect=lambda plan, **_: plan),
             patch("pages.transpose_page.export_prepared_transposition", return_value=result),
@@ -539,6 +770,33 @@ class TransposePageTests(unittest.TestCase):
         dialog._validate_and_accept()
         self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
         self.assertIn("unique", dialog.error_label.text())
+        dialog.close()
+
+    def test_output_dialog_fits_editors_using_live_font_and_screen_metrics(self):
+        output_dir = self.root / "outputs"
+        output_dir.mkdir()
+        plan = create_transposition_plan(
+            [self.root / f"input-{index}.kml" for index in range(8)],
+            output_dir,
+            "Fairford",
+        )
+        dialog = TranspositionOutputDialog(plan, self.page)
+        larger_font = dialog.font()
+        larger_font.setPointSize(larger_font.pointSize() + 6)
+        dialog.setFont(larger_font)
+        dialog.show()
+        self.app.processEvents()
+
+        for row, edit in enumerate(dialog.filename_edits):
+            self.assertGreaterEqual(dialog.table.rowHeight(row), edit.sizeHint().height())
+            self.assertGreaterEqual(edit.height(), edit.sizeHint().height())
+        self.assertGreaterEqual(
+            dialog.table.height(),
+            dialog.table.horizontalHeader().height() + dialog.table.rowHeight(0),
+        )
+        available = dialog.screen().availableGeometry()
+        self.assertLessEqual(dialog.width(), available.width())
+        self.assertLessEqual(dialog.height(), available.height())
         dialog.close()
 
     def test_existing_custom_output_requires_explicit_overwrite_confirmation(self):

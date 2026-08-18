@@ -9,8 +9,10 @@ from pathlib import Path
 from uuid import UUID
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -23,6 +25,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -111,7 +114,103 @@ class SourceAirfieldState:
     altitude_mode: str | None = None
     inference: RunwayInferenceResult | None = None
     parse_error: str | None = None
+    transposition_error: str | None = None
+    transposition_error_correctable: bool = False
     details: str = ""
+
+
+class TranspositionInputDialog(QDialog):
+    """Choose the loaded KML files included in one transposition attempt."""
+
+    def __init__(self, input_files, initially_selected=(), parent=None):
+        super().__init__(parent)
+        self.selected_paths: tuple[str, ...] = ()
+        selected = {str(Path(path).resolve(strict=False)) for path in initially_selected}
+        self.setWindowTitle("Choose Files to Transpose")
+        self.resize(560, min(520, 180 + len(input_files) * 32))
+
+        layout = QVBoxLayout(self)
+        instruction = QLabel("Choose which loaded KML files to transpose.")
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+
+        self.file_list = QListWidget()
+        self.file_list.setAccessibleName("Files to transpose")
+        for raw_path in input_files:
+            path = str(Path(raw_path).resolve(strict=False))
+            item = QListWidgetItem(Path(path).name)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if path in selected
+                else Qt.CheckState.Unchecked
+            )
+            self.file_list.addItem(item)
+        self.file_list.itemChanged.connect(self._selection_changed)
+        layout.addWidget(self.file_list)
+
+        selection_actions = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all")
+        self.select_none_button = QPushButton("Select none")
+        self.select_all_button.clicked.connect(
+            lambda: self._set_all(Qt.CheckState.Checked)
+        )
+        self.select_none_button.clicked.connect(
+            lambda: self._set_all(Qt.CheckState.Unchecked)
+        )
+        selection_actions.addWidget(self.select_all_button)
+        selection_actions.addWidget(self.select_none_button)
+        selection_actions.addStretch()
+        layout.addLayout(selection_actions)
+
+        self.error_label = QLabel()
+        self.error_label.setObjectName("errorText")
+        self.error_label.setAccessibleName("Transposition file selection error")
+        layout.addWidget(self.error_label)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.continue_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.continue_button.setText("Continue")
+        self.buttons.accepted.connect(self._validate_and_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._selection_changed()
+
+    def _checked_paths(self) -> tuple[str, ...]:
+        return tuple(
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for row in range(self.file_list.count())
+            if (item := self.file_list.item(row)).checkState()
+            == Qt.CheckState.Checked
+        )
+
+    def _selection_changed(self, _item=None) -> None:
+        has_selection = bool(self._checked_paths())
+        self.continue_button.setEnabled(has_selection)
+        if has_selection:
+            self.error_label.clear()
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        for row in range(self.file_list.count()):
+            self.file_list.item(row).setCheckState(state)
+        self._selection_changed()
+
+    def _validate_and_accept(self) -> None:
+        selected = self._checked_paths()
+        if not selected:
+            self.error_label.setText("Select at least one KML file to continue.")
+            return
+        self.selected_paths = selected
+        self.accept()
 
 
 class TranspositionOutputDialog(QDialog):
@@ -122,8 +221,9 @@ class TranspositionOutputDialog(QDialog):
         self._source_plan = plan
         self.validated_plan = None
         self.filename_edits = []
+        self._screen_change_connected = False
         self.setWindowTitle("Choose Transposition Output Names")
-        self.resize(720, min(560, 190 + len(plan.jobs) * 42))
+        self.setSizeGripEnabled(True)
 
         layout = QVBoxLayout(self)
         instruction = QLabel(
@@ -137,27 +237,27 @@ class TranspositionOutputDialog(QDialog):
         folder_label.setWordWrap(True)
         layout.addWidget(folder_label)
 
-        table = QTableWidget(len(plan.jobs), 2, self)
-        table.setHorizontalHeaderLabels(("Input KML", "Output filename"))
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setAlternatingRowColors(True)
+        self.table = QTableWidget(len(plan.jobs), 2, self)
+        self.table.setHorizontalHeaderLabels(("Input KML", "Output filename"))
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setAlternatingRowColors(True)
         for row, job in enumerate(plan.jobs):
             input_item = QTableWidgetItem(job.input_path.name)
             input_item.setToolTip(str(job.input_path))
             input_item.setFlags(
                 Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             )
-            table.setItem(row, 0, input_item)
+            self.table.setItem(row, 0, input_item)
 
             filename_edit = QLineEdit(job.output_path.name)
             filename_edit.setAccessibleName(
                 f"Output filename for {job.input_path.name}"
             )
-            table.setCellWidget(row, 1, filename_edit)
+            self.table.setCellWidget(row, 1, filename_edit)
             self.filename_edits.append(filename_edit)
-        table.resizeColumnsToContents()
-        layout.addWidget(table)
+        self.table.resizeColumnsToContents()
+        layout.addWidget(self.table, 1)
 
         self.error_label = QLabel()
         self.error_label.setObjectName("errorText")
@@ -172,6 +272,79 @@ class TranspositionOutputDialog(QDialog):
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        self._size_table_rows()
+        self._fit_to_available_screen()
+
+    def _size_table_rows(self) -> None:
+        """Keep embedded editors fully visible at the active font and DPI."""
+        header = self.table.verticalHeader()
+        default_height = header.defaultSectionSize()
+        editor_margin = max(
+            2,
+            self.table.style().pixelMetric(
+                QStyle.PixelMetric.PM_FocusFrameVMargin
+            ),
+        )
+        for row, edit in enumerate(self.filename_edits):
+            row_height = max(
+                default_height,
+                edit.sizeHint().height() + (2 * editor_margin),
+            )
+            self.table.setRowHeight(row, row_height)
+
+    def _table_content_height(self) -> int:
+        header_height = self.table.horizontalHeader().sizeHint().height()
+        rows_height = sum(
+            self.table.rowHeight(row) for row in range(self.table.rowCount())
+        )
+        return header_height + rows_height + (2 * self.table.frameWidth())
+
+    def _fit_to_available_screen(self, *_args) -> None:
+        """Choose a useful initial size without exceeding the current screen."""
+        self._size_table_rows()
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        outer_margin = max(
+            16,
+            self.style().pixelMetric(QStyle.PixelMetric.PM_LayoutTopMargin),
+        )
+        maximum_width = max(1, available.width() - (2 * outer_margin))
+        maximum_height = max(1, available.height() - (2 * outer_margin))
+
+        self.layout().activate()
+        non_table_height = max(
+            0,
+            self.sizeHint().height() - self.table.sizeHint().height(),
+        )
+        one_row_height = (
+            self.table.horizontalHeader().sizeHint().height()
+            + (self.table.rowHeight(0) if self.table.rowCount() else 0)
+            + (2 * self.table.frameWidth())
+        )
+        table_height = min(
+            self._table_content_height(),
+            max(one_row_height, maximum_height - non_table_height),
+        )
+        self.table.setMinimumHeight(table_height)
+        self.layout().activate()
+
+        preferred_width = max(720, self.sizeHint().width())
+        preferred_height = self.sizeHint().height()
+        self.resize(
+            min(preferred_width, maximum_width),
+            min(preferred_height, maximum_height),
+        )
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt virtual method
+        super().showEvent(event)
+        self._fit_to_available_screen()
+        handle = self.windowHandle()
+        if handle is not None and not self._screen_change_connected:
+            handle.screenChanged.connect(self._fit_to_available_screen)
+            self._screen_change_connected = True
 
     def output_filenames(self):
         return tuple(edit.text() for edit in self.filename_edits)
@@ -206,6 +379,7 @@ class TransposePage(QWidget):
         self._prepared_signature = None
         self._accepted_signature = None
         self._committed_adjustments = {}
+        self._last_transposition_selection: tuple[str, ...] | None = None
 
         self.preset_repository = PresetRepository(
             app_data_path("presets/airfield"),
@@ -424,10 +598,12 @@ class TransposePage(QWidget):
         payload, warnings = decoded
         state = self.source_states[self._current_source_path]
         state.values = self._values_from_preset(payload)
+        self._refresh_correctable_source_error(state)
         state.provenance = "Preset"
         preset_notes = "\n".join(warnings)
         if preset_notes:
             state.details = "\n\n".join(filter(None, (state.details, preset_notes)))
+        self._sync_file_item_error(self._current_source_path)
         self._render_source_state(state)
 
     def _apply_target_preset(self) -> None:
@@ -523,6 +699,13 @@ class TransposePage(QWidget):
             if path in self.input_files:
                 self.input_files.remove(path)
             self.file_list.takeItem(self.file_list.row(item))
+        if self._last_transposition_selection is not None:
+            remaining = set(self.input_files)
+            self._last_transposition_selection = tuple(
+                path
+                for path in self._last_transposition_selection
+                if path in remaining
+            )
         self._update_file_count()
         if self.file_list.currentItem() is None and self.file_list.count():
             self.file_list.setCurrentRow(0)
@@ -560,6 +743,7 @@ class TransposePage(QWidget):
 
     def _analyse_source(self, state: SourceAirfieldState) -> None:
         state.analysed = True
+        state.parse_error = None
         try:
             track = parse_kml_track(state.path)
             state.altitude_mode = track.altitude_mode
@@ -567,8 +751,11 @@ class TransposePage(QWidget):
             state.inference = inference
         except Exception as error:
             state.parse_error = str(error)
+            state.transposition_error = None
+            state.transposition_error_correctable = False
             state.provenance = "File error"
             state.details = str(error)
+            self._sync_file_item_error(str(state.path))
             return
 
         candidate = inference.candidate
@@ -578,6 +765,7 @@ class TransposePage(QWidget):
             state.details = "\n".join(
                 filter(None, (inference.error or "", *warnings))
             )
+            self._sync_file_item_error(str(state.path))
             return
 
         reference = candidate.reference
@@ -597,6 +785,7 @@ class TransposePage(QWidget):
         if combined_warnings:
             evidence.extend(("", "Warnings:", *combined_warnings))
         state.details = "\n".join(evidence)
+        self._sync_file_item_error(str(state.path))
 
     def _commit_current_source(self) -> None:
         if self._rendering_source or self._current_source_path is None:
@@ -612,7 +801,10 @@ class TransposePage(QWidget):
         if state is None or state.parse_error is not None:
             return
         state.values = self.source_card.values()
+        self._refresh_correctable_source_error(state)
         state.provenance = "Manual override"
+        self.source_card.set_error(self._source_error(state))
+        self._sync_file_item_error(self._current_source_path)
         self._render_source_status(state)
 
     def _restore_auto_source(self) -> None:
@@ -622,7 +814,9 @@ class TransposePage(QWidget):
         if state is None or state.auto_values is None:
             return
         state.values = state.auto_values
+        self._refresh_correctable_source_error(state)
         state.provenance = "Auto-detected"
+        self._sync_file_item_error(self._current_source_path)
         self._render_source_state(state)
 
     def _render_source_state(self, state: SourceAirfieldState | None) -> None:
@@ -636,10 +830,81 @@ class TransposePage(QWidget):
                 return
             self.source_card.set_values(state.values)
             self.source_card.set_fields_enabled(state.parse_error is None)
-            self.source_card.set_error(state.parse_error or "")
+            self.source_card.set_error(self._source_error(state))
             self._render_source_status(state)
         finally:
             self._rendering_source = False
+
+    @staticmethod
+    def _source_error(state: SourceAirfieldState) -> str:
+        return state.transposition_error or state.parse_error or ""
+
+    def _file_item_for_path(self, path: str | Path) -> QListWidgetItem | None:
+        key = self._path_key(path)
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            if self._path_key(str(item.data(Qt.ItemDataRole.UserRole))) == key:
+                return item
+        return None
+
+    def _sync_file_item_error(self, path: str | Path) -> None:
+        item = self._file_item_for_path(path)
+        state = self.source_states.get(str(Path(path).resolve(strict=False)))
+        if item is None or state is None:
+            return
+        message = self._source_error(state)
+        if message:
+            item.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MessageBoxWarning
+                )
+            )
+            item.setToolTip(f"{state.path}\n\nError: {message}")
+            accessible = f"Full path: {state.path}. Error: {message}"
+        else:
+            item.setIcon(QIcon())
+            item.setToolTip(str(state.path))
+            accessible = f"Full path: {state.path}"
+        item.setData(Qt.ItemDataRole.AccessibleDescriptionRole, accessible)
+
+    def _set_transposition_error(
+        self,
+        path: str | Path,
+        message: str,
+        *,
+        correctable: bool = False,
+    ) -> None:
+        resolved = str(Path(path).resolve(strict=False))
+        state = self.source_states.get(resolved)
+        if state is None:
+            return
+        state.transposition_error = str(message).strip()
+        state.transposition_error_correctable = correctable
+        self._sync_file_item_error(resolved)
+
+    def _clear_transposition_error(self, path: str | Path) -> None:
+        resolved = str(Path(path).resolve(strict=False))
+        state = self.source_states.get(resolved)
+        if state is None:
+            return
+        state.transposition_error = None
+        state.transposition_error_correctable = False
+        self._sync_file_item_error(resolved)
+
+    def _refresh_correctable_source_error(self, state: SourceAirfieldState) -> None:
+        if not state.transposition_error_correctable:
+            return
+        try:
+            self._reference_from_values(
+                state.values,
+                label=state.path.name,
+                elevation_required=state.altitude_mode == "absolute",
+            )
+        except ValueError as error:
+            state.transposition_error = str(error)
+            return
+        state.transposition_error = None
+        state.transposition_error_correctable = False
 
     def _render_source_status(self, state: SourceAirfieldState) -> None:
         confidence = ""
@@ -712,17 +977,20 @@ class TransposePage(QWidget):
                 self.file_list.setCurrentItem(item)
                 break
 
-    def _review_source_runways(self, _fallback_elevation_m=None):
-        """Return one inline-reviewed reference per input; no modal review is used."""
+    def _review_source_runways(self, _fallback_elevation_m=None, *, paths=None):
+        """Return one inline-reviewed reference per requested input."""
         self._commit_current_source()
         self._ensure_source_states()
+        requested_paths = tuple(paths) if paths is not None else tuple(self.input_files)
         reviewed: list[RunwayReference | None] = []
-        for path in self.input_files:
+        for raw_path in requested_paths:
+            path = str(Path(raw_path).resolve(strict=False))
             state = self.source_states[path]
             if not state.analysed:
                 self._analyse_source(state)
             if state.parse_error is not None:
                 reviewed.append(None)
+                self._sync_file_item_error(path)
                 continue
             try:
                 reference = self._reference_from_values(
@@ -731,10 +999,10 @@ class TransposePage(QWidget):
                     elevation_required=state.altitude_mode == "absolute",
                 )
             except ValueError as error:
-                self._select_source_path(path)
-                self.source_card.set_error(str(error))
-                QMessageBox.warning(self, "Original airfield needs attention", str(error))
-                return None
+                self._set_transposition_error(path, str(error), correctable=True)
+                reviewed.append(None)
+                continue
+            self._clear_transposition_error(path)
             state.values = AirfieldFormValues(
                 airfield_name=state.values.airfield_name,
                 runway=state.values.runway,
@@ -783,9 +1051,11 @@ class TransposePage(QWidget):
         self.target_card.set_error("")
         return reference
 
-    def _nonstandard_runways(self):
+    def _nonstandard_runways(self, paths=None):
         entries: list[tuple[str, str, QWidget, str | None]] = []
-        for path in self.input_files:
+        requested_paths = tuple(paths) if paths is not None else tuple(self.input_files)
+        for raw_path in requested_paths:
+            path = str(Path(raw_path).resolve(strict=False))
             state = self.source_states.get(path)
             if state is None or state.parse_error is not None:
                 continue
@@ -821,12 +1091,17 @@ class TransposePage(QWidget):
             )
         return entries
 
-    def _confirm_runway_overrides(self) -> bool:
-        entries = self._nonstandard_runways()
+    def _confirm_runway_overrides(
+        self,
+        paths=None,
+        *,
+        action: str = "transpose these files",
+    ) -> bool:
+        entries = self._nonstandard_runways(paths)
         if confirm_nonstandard_runways(
             self,
             tuple((context, value, widget) for context, value, widget, _ in entries),
-            action="transpose these files",
+            action=action,
         ):
             return True
         if entries and entries[0][3] is not None:
@@ -834,23 +1109,36 @@ class TransposePage(QWidget):
             self.source_card.runway_input.setFocus()
         return False
 
-    def _validated_transposition_inputs(self):
+    def _choose_transposition_inputs(self) -> tuple[str, ...] | None:
         if not self.input_files:
             QMessageBox.warning(self, "No Files", "Please select at least one KML file.")
             return None
+
+        available = set(self.input_files)
+        remembered = tuple(
+            path
+            for path in (self._last_transposition_selection or ())
+            if path in available
+        )
+        if not remembered:
+            current = self._current_source_path
+            remembered = (current,) if current in available else ()
+        dialog = TranspositionInputDialog(self.input_files, remembered, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        self._last_transposition_selection = dialog.selected_paths
+        return dialog.selected_paths
+
+    def _validated_inputs_for_paths(self, paths):
         target_runway = self._validated_target()
         if target_runway is None:
             return None
-        reviewed_runways = self._review_source_runways(None)
-        if reviewed_runways is None:
-            return None
-        if not self._confirm_runway_overrides():
-            return None
+        reviewed_runways = self._review_source_runways(paths=paths)
         return target_runway, reviewed_runways
 
-    def _current_preview_signature(self, target_runway, reviewed_runways):
+    def _preparation_signature(self, input_files, target_runway, reviewed_runways):
         fingerprints = []
-        for raw_path in self.input_files:
+        for raw_path in input_files:
             path = Path(raw_path).resolve(strict=False)
             file_signature = self._source_fingerprint(path)
             fingerprints.append((self._path_key(path), file_signature))
@@ -864,6 +1152,18 @@ class TransposePage(QWidget):
                 runway.elevation_m,
             )
             for runway in reviewed_runways
+        )
+        target_values = self.target_card.values()
+        return (
+            tuple(fingerprints),
+            runway_signature,
+            (
+                target_runway.latitude,
+                target_runway.longitude,
+                target_runway.true_heading_deg,
+                target_values.airfield_name.strip(),
+                target_values.runway.strip(),
+            ),
         )
 
     @staticmethod
@@ -880,18 +1180,6 @@ class TransposePage(QWidget):
         except OSError:
             return None
         return stat.st_size, stat.st_mtime_ns, digest.hexdigest()
-        target_values = self.target_card.values()
-        return (
-            tuple(fingerprints),
-            runway_signature,
-            (
-                target_runway.latitude,
-                target_runway.longitude,
-                target_runway.true_heading_deg,
-                target_values.airfield_name.strip(),
-                target_values.runway.strip(),
-            ),
-        )
 
     def _apply_committed_adjustments(self, batch):
         items = []
@@ -912,7 +1200,13 @@ class TransposePage(QWidget):
             items.append(item)
         return replace(batch, items=tuple(items))
 
-    def _prepare_current_batch(self, target_runway, reviewed_runways, signature):
+    def _prepare_current_batch(
+        self,
+        input_files,
+        target_runway,
+        reviewed_runways,
+        signature,
+    ):
         if (
             self._prepared_batch is not None
             and self._accepted_signature == signature
@@ -920,7 +1214,7 @@ class TransposePage(QWidget):
         ):
             return self._prepared_batch
         batch = prepare_transposition(
-            input_files=self.input_files,
+            input_files=input_files,
             source_runways=reviewed_runways,
             target_runway=target_runway,
         )
@@ -929,15 +1223,70 @@ class TransposePage(QWidget):
         self._prepared_signature = signature
         return batch
 
+    def _record_preparation_failures(self, batch):
+        failures = []
+        for item in batch.failed_items:
+            path = str(item.input_path.resolve(strict=False))
+            state = self.source_states.get(path)
+            message = self._source_error(state) if state is not None else ""
+            message = message or item.message
+            correctable = bool(
+                state is not None
+                and state.transposition_error
+                and state.transposition_error_correctable
+            )
+            self._set_transposition_error(
+                path,
+                message,
+                correctable=correctable,
+            )
+            failures.append((path, message))
+        for item in batch.prepared:
+            self._clear_transposition_error(item.input_path)
+        if self._current_source_path:
+            self._render_source_state(self.source_states[self._current_source_path])
+        return tuple(failures)
+
+    def _show_source_failures(self, failures, *, title: str, introduction: str) -> None:
+        if not failures:
+            return
+        first_path = str(Path(failures[0][0]).resolve(strict=False))
+        self._select_source_path(first_path)
+        state = self.source_states.get(first_path)
+        if state is not None:
+            self._render_source_state(state)
+        details = "\n".join(
+            f"• {Path(path).name}: {message}" for path, message in failures
+        )
+        QMessageBox.warning(
+            self,
+            title,
+            f"{introduction}\n\n{details}\n\n"
+            "Select a marked input file to review its error.",
+        )
+
     def open_preview(self) -> None:
-        validated = self._validated_transposition_inputs()
+        current_path = self._current_source_path
+        if current_path is None:
+            QMessageBox.warning(
+                self,
+                "No file selected",
+                "Select one KML file in the input list to preview it.",
+            )
+            return
+        input_files = (current_path,)
+        validated = self._validated_inputs_for_paths(input_files)
         if validated is None:
             return
         target_runway, reviewed_runways = validated
-        signature = self._current_preview_signature(target_runway, reviewed_runways)
+        signature = self._preparation_signature(
+            input_files,
+            target_runway,
+            reviewed_runways,
+        )
         try:
             batch = prepare_transposition(
-                input_files=self.input_files,
+                input_files=input_files,
                 source_runways=reviewed_runways,
                 target_runway=target_runway,
             )
@@ -949,27 +1298,19 @@ class TransposePage(QWidget):
                 str(error) or "The transposition preview could not be prepared.",
             )
             return
-        if not batch.prepared:
-            failures = "\n".join(
-                f"• {item.input_path.name}: {item.message}"
-                for item in batch.failed_items
-            )
-            QMessageBox.critical(
-                self,
-                "No traces could be previewed",
-                failures or "No valid trace geometry was produced.",
+        failures = self._record_preparation_failures(batch)
+        if failures:
+            self._show_source_failures(
+                failures,
+                title="Preview file needs attention",
+                introduction="The selected file cannot be previewed:",
             )
             return
-        if batch.failed_items:
-            failures = "\n".join(
-                f"• {item.input_path.name}: {item.message}"
-                for item in batch.failed_items
-            )
-            QMessageBox.warning(
-                self,
-                "Some traces could not be prepared",
-                "The valid traces will still be shown:\n\n" + failures,
-            )
+        if not self._confirm_runway_overrides(
+            input_files,
+            action="preview this file",
+        ):
+            return
         self._prepared_batch = batch
         self._prepared_signature = signature
         self.preview_requested.emit(
@@ -1000,16 +1341,34 @@ class TransposePage(QWidget):
         self._accepted_signature = self._prepared_signature
 
     def export_committed_scene(self) -> None:
-        self.run_transposition_ui()
+        if self._prepared_batch is None:
+            return
+        input_files = tuple(
+            str(item.input_path.resolve(strict=False))
+            for item in self._prepared_batch.items
+        )
+        if input_files:
+            self._run_transposition_for_paths(input_files)
 
     def run_transposition_ui(self) -> None:
-        validated = self._validated_transposition_inputs()
+        input_files = self._choose_transposition_inputs()
+        if input_files is None:
+            return
+        self._run_transposition_for_paths(input_files)
+
+    def _run_transposition_for_paths(self, input_files) -> None:
+        validated = self._validated_inputs_for_paths(input_files)
         if validated is None:
             return
         target_runway, reviewed_runways = validated
-        signature = self._current_preview_signature(target_runway, reviewed_runways)
+        signature = self._preparation_signature(
+            input_files,
+            target_runway,
+            reviewed_runways,
+        )
         try:
             prepared_batch = self._prepare_current_batch(
+                input_files,
                 target_runway,
                 reviewed_runways,
                 signature,
@@ -1022,17 +1381,18 @@ class TransposePage(QWidget):
             )
             return
 
-        if not prepared_batch.prepared:
-            failures = "\n".join(
-                f"• {item.input_path.name}: {item.message}"
-                for item in prepared_batch.failed_items
+        failures = self._record_preparation_failures(prepared_batch)
+        if failures:
+            self._show_source_failures(
+                failures,
+                title="Selected files need attention",
+                introduction=(
+                    "No files were transposed because the following selected "
+                    "inputs need attention:"
+                ),
             )
-            QMessageBox.critical(
-                self,
-                "Transposition failed",
-                "No KML files can be exported because preparation failed for "
-                f"every input.\n\n{failures}",
-            )
+            return
+        if not self._confirm_runway_overrides(input_files):
             return
 
         output_dir = QFileDialog.getExistingDirectory(
@@ -1050,7 +1410,7 @@ class TransposePage(QWidget):
 
         try:
             plan = create_transposition_plan(
-                input_files=self.input_files,
+                input_files=input_files,
                 output_directory=output_dir,
                 target_airfield=self.target_card.name_input.text(),
             )
@@ -1208,4 +1568,9 @@ class TransposePage(QWidget):
         )
 
 
-__all__ = ["SourceAirfieldState", "TransposePage", "TranspositionOutputDialog"]
+__all__ = [
+    "SourceAirfieldState",
+    "TransposePage",
+    "TranspositionInputDialog",
+    "TranspositionOutputDialog",
+]

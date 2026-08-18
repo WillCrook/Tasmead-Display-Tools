@@ -440,8 +440,21 @@ class DebrisPagePresetTests(PresetPageTestCase):
 
         self.assertEqual(Path(self.page.presets_dir), self.app_root / "presets" / "debris")
         self.assertEqual(UUID(item.data(Qt.ItemDataRole.UserRole)), record.preset.id)
-        self.assertTrue(self.page.apply_preset_btn.isEnabled())
+        self.assertTrue(self.page.preset_combo.isEnabled())
         self.assertTrue(self.page.manage_presets_btn.isEnabled())
+
+    def test_user_activated_preset_applies_immediately(self):
+        record = self.page.preset_repository.create("Managed", self.data(mass="37"))
+        self.page.load_presets_from_disk()
+        index = self.page.preset_combo.findData(
+            str(record.preset.id), Qt.ItemDataRole.UserRole
+        )
+
+        self.page.preset_combo.setCurrentIndex(index)
+        self.assertNotEqual(self.page.inputs["Mass (kg)"].text(), "37")
+        self.page.preset_combo.activated.emit(index)
+
+        self.assertEqual(self.page.inputs["Mass (kg)"].text(), "37")
 
     def test_import_uses_and_remembers_debris_preset_input_directory(self):
         preset = Preset.create(PresetType.DEBRIS, "Imported", self.data())
@@ -479,7 +492,7 @@ class DebrisPagePresetTests(PresetPageTestCase):
         )
         self.assertIsNotNone(self.page.preset_repository.get(preset.id))
 
-    def test_compact_preset_toolbar_exposes_apply_save_and_manager_actions(self):
+    def test_compact_preset_toolbar_exposes_direct_selector_save_and_manager_actions(self):
         labels = [
             label.text()
             for label in self.page.presets_widget.findChildren(QLabel)
@@ -497,7 +510,6 @@ class DebrisPagePresetTests(PresetPageTestCase):
         self.assertEqual(
             buttons,
             [
-                "Apply",
                 "Save current…",
                 "Manage presets…",
             ],

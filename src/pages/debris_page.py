@@ -120,8 +120,7 @@ class DebrisPage(PresetUiMixin, QWidget):
         if not hasattr(self, "preset_combo"):
             return
         busy = self.has_active_simulation()
-        selected = self.preset_combo.currentData(Qt.ItemDataRole.UserRole) is not None
-        self.apply_preset_btn.setEnabled(selected and not busy)
+        self.preset_combo.setEnabled(not busy)
         self.save_preset_btn.setEnabled(not busy)
         self.manage_presets_btn.setEnabled(not busy)
 
@@ -582,11 +581,8 @@ class DebrisPage(PresetUiMixin, QWidget):
         self.preset_combo.setAccessibleName("Debris preset")
         self.preset_combo.setMinimumContentsLength(18)
         self.preset_combo.currentIndexChanged.connect(self.update_preset_actions)
+        self.preset_combo.activated.connect(self._apply_activated_preset)
         layout.addWidget(self.preset_combo, 1)
-
-        self.apply_preset_btn = QPushButton("Apply")
-        self.apply_preset_btn.clicked.connect(self.apply_selected_preset)
-        layout.addWidget(self.apply_preset_btn)
 
         self.save_preset_btn = QPushButton("Save current…")
         self.save_preset_btn.clicked.connect(self.save_preset)
@@ -596,6 +592,15 @@ class DebrisPage(PresetUiMixin, QWidget):
         set_button_icon(self.manage_presets_btn, AppIcon.LIST)
         self.manage_presets_btn.clicked.connect(self.open_preset_manager)
         layout.addWidget(self.manage_presets_btn)
+
+    def _apply_activated_preset(self, index):
+        """Apply a valid preset immediately after a user selects it."""
+        selected_id = self.preset_combo.itemData(
+            index,
+            Qt.ItemDataRole.UserRole,
+        )
+        if not self.has_active_simulation() and selected_id is not None:
+            self.apply_selected_preset()
 
     def save_preset(self):
         try:

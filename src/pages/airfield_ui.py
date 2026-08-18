@@ -150,11 +150,8 @@ class AirfieldCard(QFrame):
         self.preset_combo.setAccessibleName(f"{title} preset")
         self.preset_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.preset_combo.setMinimumContentsLength(16)
-        self.apply_preset_btn = QPushButton("Apply")
-        self.apply_preset_btn.setAccessibleName(f"Apply preset to {title}")
-        self.apply_preset_btn.clicked.connect(self.preset_apply_requested)
+        self.preset_combo.activated.connect(self._apply_activated_preset)
         preset_row.addWidget(self.preset_combo, 1)
-        preset_row.addWidget(self.apply_preset_btn)
         root.addLayout(preset_row)
 
         fields = QGridLayout()
@@ -295,7 +292,11 @@ class AirfieldCard(QFrame):
         for field in self.editable_fields():
             field.setEnabled(enabled)
         self.preset_combo.setEnabled(enabled)
-        self.apply_preset_btn.setEnabled(enabled)
+
+    def _apply_activated_preset(self, index: int) -> None:
+        """Apply only explicit user selections, not programmatic refreshes."""
+        if self.preset_combo.itemData(index, Qt.ItemDataRole.UserRole) is not None:
+            self.preset_apply_requested.emit()
 
     def set_status(
         self,
@@ -411,7 +412,6 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
             show_inference=False,
         )
         self.editor_form.preset_combo.hide()
-        self.editor_form.apply_preset_btn.hide()
         editor_layout.addWidget(self.editor_form)
         self.editor_note = QLabel()
         self.editor_note.setObjectName("warningText")
