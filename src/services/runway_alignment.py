@@ -43,6 +43,29 @@ class RunwayConfidence(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class DetectionSignalScore:
+    """One explanatory input to the combined runway-detection assessment."""
+
+    name: str
+    percent: int
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RunwayDetectionAssessment:
+    """Heuristic reliability assessment for an inferred runway candidate."""
+
+    overall_percent: int
+    rating: RunwayConfidence
+    heading_percent: int
+    threshold_percent: int
+    ground_elevation_percent: int
+    signals: tuple[DetectionSignalScore, ...]
+    weakest_signal: DetectionSignalScore
+    cap_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RunwayReference:
     """One directional runway threshold used as a transposition anchor."""
 
@@ -86,10 +109,13 @@ class RunwayCandidate:
     cross_track_error_m: float
     evidence: tuple[str, ...]
     warnings: tuple[str, ...] = ()
+    detection_assessment: RunwayDetectionAssessment | None = None
 
     @property
     def confidence(self) -> RunwayConfidence:
-        """Return the lower confidence for callers using the original API."""
+        """Return combined confidence, with the legacy minimum as a fallback."""
+        if self.detection_assessment is not None:
+            return self.detection_assessment.rating
         confidence_order = {
             RunwayConfidence.LOW: 0,
             RunwayConfidence.MEDIUM: 1,
@@ -465,6 +491,222 @@ def _threshold_confidence(
     return RunwayConfidence.LOW
 
 
+def _interpolated_score(
+    value: float,
+    anchors: Sequence[tuple[float, float]],
+) -> float:
+    """Linearly interpolate a clamped 0-100 score between metric anchors."""
+    ordered = sorted(anchors)
+    if value <= ordered[0][0]:
+        return ordered[0][1]
+    if value >= ordered[-1][0]:
+        return ordered[-1][1]
+    for (left_value, left_score), (right_value, right_score) in zip(
+        ordered,
+        ordered[1:],
+    ):
+        if value <= right_value:
+            fraction = (value - left_value) / (right_value - left_value)
+            return left_score + fraction * (right_score - left_score)
+    return ordered[-1][1]
+
+
+def _rounded_score(value: float) -> int:
+    """Round a non-negative percentage conventionally rather than to even."""
+    return max(0, min(100, math.floor(value + 0.5 + 1e-9)))
+
+
+def _heading_detection_scores(
+    fit: _WindowFit,
+) -> tuple[float, tuple[DetectionSignalScore, ...]]:
+    length = _interpolated_score(
+        fit.span_m,
+        ((300.0, 0.0), (400.0, 60.0), (700.0, 85.0), (800.0, 100.0)),
+    )
+    straightness = _interpolated_score(
+        fit.straightness,
+        ((0.75, 0.0), (0.88, 60.0), (0.95, 85.0), (1.0, 100.0)),
+    )
+    cross_track = _interpolated_score(
+        fit.cross_track_p95_m,
+        ((0.0, 100.0), (20.0, 85.0), (40.0, 60.0), (75.0, 0.0)),
+    )
+    heading_consistency = _interpolated_score(
+        fit.heading_dispersion_deg,
+        ((0.0, 100.0), (8.0, 85.0), (18.0, 60.0), (45.0, 0.0)),
+    )
+    heading = (
+        heading_consistency * 0.35
+        + cross_track * 0.30
+        + straightness * 0.20
+        + length * 0.15
+    )
+    signals = (
+        DetectionSignalScore(
+            "Heading consistency",
+            _rounded_score(heading_consistency),
+            f"{fit.heading_dispersion_deg:.1f}\u00b0 median dispersion",
+        ),
+        DetectionSignalScore(
+            "Cross-track fit",
+            _rounded_score(cross_track),
+            f"{fit.cross_track_p95_m:.1f} m at the 95th percentile",
+        ),
+        DetectionSignalScore(
+            "Straightness",
+            _rounded_score(straightness),
+            f"{fit.straightness:.3f} span-to-path ratio",
+        ),
+        DetectionSignalScore(
+            "Aligned length",
+            _rounded_score(length),
+            f"{fit.span_m:.0f} m",
+        ),
+    )
+    return heading, signals
+
+
+def _ground_elevation_detection_score(
+    altitude_mode: str,
+    estimate: _GroundElevationEstimate | None,
+    fallback_elevation_m: float | None,
+) -> tuple[float, str]:
+    if altitude_mode in {"relativeToGround", "clampToGround"}:
+        return 100.0, "Ground handling is supplied by the KML altitude mode."
+    if altitude_mode != "absolute":
+        return 0.0, "This altitude mode does not provide supported ground handling."
+    if estimate is None:
+        if fallback_elevation_m is not None:
+            return 40.0, "A preset fallback was used; no stable window was detected."
+        return 0.0, "No stable ground-elevation window or fallback was available."
+
+    span = estimate.end_distance_m - estimate.start_distance_m
+    sample_score = _interpolated_score(
+        estimate.sample_count,
+        ((MIN_GROUND_ELEVATION_SAMPLES, 60.0), (10.0, 100.0)),
+    )
+    span_score = _interpolated_score(
+        span,
+        ((MIN_GROUND_ELEVATION_SPAN_M, 60.0), (200.0, 100.0)),
+    )
+    spread_score = _interpolated_score(
+        estimate.altitude_spread_m,
+        ((0.0, 100.0), (1.0, 100.0), (MAX_GROUND_ELEVATION_SPREAD_M, 60.0)),
+    )
+    slope_score = _interpolated_score(
+        abs(estimate.slope),
+        ((0.0, 100.0), (0.005, 100.0), (MAX_GROUND_ELEVATION_SLOPE, 60.0)),
+    )
+    score = (
+        sample_score * 0.30
+        + spread_score * 0.30
+        + span_score * 0.20
+        + slope_score * 0.20
+    )
+    detail = (
+        f"{estimate.sample_count} stable samples across {span:.0f} m, "
+        f"{estimate.altitude_spread_m:.2f} m spread, "
+        f"{abs(estimate.slope) * 100.0:.2f}% absolute slope"
+    )
+    return score, detail
+
+
+def _runway_detection_assessment(
+    event: _RunwayEvent,
+    point_count: int,
+    altitude_mode: str,
+    elevation_estimate: _GroundElevationEstimate | None,
+    fallback_elevation_m: float | None,
+) -> RunwayDetectionAssessment:
+    heading, heading_signals = _heading_detection_scores(event.best_fit)
+    threshold_rating = _threshold_confidence(event, point_count)
+    threshold = {
+        RunwayConfidence.HIGH: 90.0,
+        RunwayConfidence.MEDIUM: 70.0,
+        RunwayConfidence.LOW: 35.0,
+    }[threshold_rating]
+    threshold_label = (
+        "moderate"
+        if threshold_rating is RunwayConfidence.MEDIUM
+        else threshold_rating.value
+    )
+    ground_elevation, ground_detail = _ground_elevation_detection_score(
+        altitude_mode,
+        elevation_estimate,
+        fallback_elevation_m,
+    )
+    signals = heading_signals + (
+        DetectionSignalScore(
+            "Threshold detection",
+            _rounded_score(threshold),
+            f"Existing threshold assessment: {threshold_label}",
+        ),
+        DetectionSignalScore(
+            "Ground elevation",
+            _rounded_score(ground_elevation),
+            ground_detail,
+        ),
+    )
+    raw_overall = heading * 0.45 + threshold * 0.35 + ground_elevation * 0.20
+    cap = 100.0
+    cap_reason = None
+    critical_heading = min(heading_signals[:2], key=lambda signal: signal.percent)
+    if critical_heading.percent < 25:
+        cap = 59.0
+        cap_reason = (
+            f"Capped because {critical_heading.name.lower()} is critically weak "
+            f"at {critical_heading.percent}%."
+        )
+    elif heading < 40.0:
+        cap = 59.0
+        cap_reason = (
+            "Capped because heading detection is critically weak at "
+            f"{_rounded_score(heading)}%."
+        )
+    elif threshold < 40.0:
+        cap = 59.0
+        cap_reason = (
+            "Capped because threshold detection is critically weak at "
+            f"{_rounded_score(threshold)}%."
+        )
+    elif altitude_mode == "absolute" and ground_elevation == 0.0:
+        cap = 59.0
+        cap_reason = "Capped because required ground elevation could not be detected."
+    elif min(heading, threshold, ground_elevation) < 60.0:
+        cap = 79.0
+        weakest_component = min(
+            (
+                ("heading detection", heading),
+                ("threshold detection", threshold),
+                ("ground elevation", ground_elevation),
+            ),
+            key=lambda item: item[1],
+        )
+        cap_reason = (
+            f"Capped because {weakest_component[0]} is weak at "
+            f"{_rounded_score(weakest_component[1])}%."
+        )
+    overall = _rounded_score(min(raw_overall, cap))
+    rating = (
+        RunwayConfidence.HIGH
+        if overall >= 80
+        else RunwayConfidence.MEDIUM
+        if overall >= 60
+        else RunwayConfidence.LOW
+    )
+    weakest_signal = min(signals, key=lambda signal: signal.percent)
+    return RunwayDetectionAssessment(
+        overall_percent=overall,
+        rating=rating,
+        heading_percent=_rounded_score(heading),
+        threshold_percent=_rounded_score(threshold),
+        ground_elevation_percent=_rounded_score(ground_elevation),
+        signals=signals,
+        weakest_signal=weakest_signal,
+        cap_reason=cap_reason,
+    )
+
+
 def _select_departure_event(
     events: Sequence[_RunwayEvent],
     samples: Sequence[_Sample],
@@ -735,6 +977,13 @@ def infer_departure_runway(
             else "Departure classification: not confirmed by climb"
         ),
     )
+    detection_assessment = _runway_detection_assessment(
+        selected_event,
+        len(track.points),
+        track.altitude_mode,
+        elevation_estimate,
+        fallback_elevation_m,
+    )
     return RunwayInferenceResult(
         candidate=RunwayCandidate(
             reference=RunwayReference(
@@ -752,6 +1001,7 @@ def infer_departure_runway(
             cross_track_error_m=best.cross_track_p95_m,
             evidence=evidence,
             warnings=tuple(warnings),
+            detection_assessment=detection_assessment,
         ),
         warnings=tuple(warnings),
     )

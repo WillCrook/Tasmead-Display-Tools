@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import re
 
@@ -185,9 +185,280 @@ class AirfieldPresetData:
         }
 
 
+TRANSPOSITION_PRESET_DATA_VERSION = 2
+_TRANSPOSITION_FIELDS = {
+    "data_version",
+    "runway",
+    "original_trace",
+    "target_trace",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class RunwayPresetSection:
+    """Reusable runway geometry for either runway-alignment card."""
+
+    threshold_latitude: float
+    threshold_longitude: float
+    true_heading_deg: float
+    elevation_m: float | None = None
+
+    @classmethod
+    def validated(
+        cls,
+        *,
+        threshold: CoordinatePair,
+        true_heading_deg: object,
+        elevation_m: object = None,
+        elevation_required: bool = False,
+    ) -> "RunwayPresetSection":
+        heading = _optional_float(true_heading_deg, "True heading")
+        if heading is None:
+            raise AirfieldPresetError("Enter a true heading.")
+        elevation = _optional_float(elevation_m, "Elevation")
+        if elevation_required and elevation is None:
+            raise AirfieldPresetError("Enter the airfield elevation.")
+        try:
+            reference = RunwayReference(
+                threshold.latitude,
+                threshold.longitude,
+                heading,
+                elevation,
+            )
+        except ValueError as error:
+            raise AirfieldPresetError(str(error)) from error
+        return cls(
+            reference.latitude,
+            reference.longitude,
+            reference.true_heading_deg,
+            reference.elevation_m,
+        )
+
+    @classmethod
+    def from_mapping(cls, data: object) -> "RunwayPresetSection":
+        if not isinstance(data, Mapping):
+            raise AirfieldPresetError("Runway preset data must be an object.")
+        expected = {
+            "threshold_latitude",
+            "threshold_longitude",
+            "true_heading_deg",
+            "elevation_m",
+        }
+        if set(data) != expected:
+            raise AirfieldPresetError(
+                "Runway preset data contains unsupported or missing fields."
+            )
+        latitude = _optional_float(data["threshold_latitude"], "Departure threshold latitude")
+        longitude = _optional_float(data["threshold_longitude"], "Departure threshold longitude")
+        heading = _optional_float(data["true_heading_deg"], "True heading")
+        if latitude is None or longitude is None or heading is None:
+            raise AirfieldPresetError(
+                "Runway presets require a departure threshold and true heading."
+            )
+        elevation = _optional_float(data["elevation_m"], "Elevation")
+        try:
+            reference = RunwayReference(latitude, longitude, heading, elevation)
+        except ValueError as error:
+            raise AirfieldPresetError(str(error)) from error
+        return cls(
+            reference.latitude,
+            reference.longitude,
+            reference.true_heading_deg,
+            reference.elevation_m,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "threshold_latitude": self.threshold_latitude,
+            "threshold_longitude": self.threshold_longitude,
+            "true_heading_deg": self.true_heading_deg,
+            "elevation_m": self.elevation_m,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OriginalTracePresetSection:
+    """The only user-editable source-trace value."""
+
+    ground_elevation_m: float
+
+    @classmethod
+    def validated(cls, value: object) -> "OriginalTracePresetSection":
+        elevation = _optional_float(value, "Ground reference elevation")
+        if elevation is None:
+            raise AirfieldPresetError("Enter the ground reference elevation.")
+        return cls(elevation)
+
+    @classmethod
+    def from_mapping(cls, data: object) -> "OriginalTracePresetSection":
+        if not isinstance(data, Mapping) or set(data) != {"ground_elevation_m"}:
+            raise AirfieldPresetError(
+                "Original trace preset data contains unsupported or missing fields."
+            )
+        return cls.validated(data["ground_elevation_m"])
+
+    def to_mapping(self) -> dict[str, object]:
+        return {"ground_elevation_m": self.ground_elevation_m}
+
+
+@dataclass(frozen=True, slots=True)
+class TargetTracePresetSection:
+    """Manual destination anchor and clockwise rotation."""
+
+    target_latitude: float
+    target_longitude: float
+    rotation_deg: float
+
+    @classmethod
+    def validated(
+        cls,
+        *,
+        target: CoordinatePair,
+        rotation_deg: object,
+    ) -> "TargetTracePresetSection":
+        rotation = _optional_float(rotation_deg, "Clockwise rotation")
+        if rotation is None or not 0.0 <= rotation <= 360.0:
+            raise AirfieldPresetError(
+                "Clockwise rotation must be between 0 and 360 degrees."
+            )
+        try:
+            reference = RunwayReference(
+                target.latitude,
+                target.longitude,
+                0.0,
+            )
+        except ValueError as error:
+            raise AirfieldPresetError(str(error)) from error
+        return cls(reference.latitude, reference.longitude, rotation)
+
+    @classmethod
+    def from_mapping(cls, data: object) -> "TargetTracePresetSection":
+        if not isinstance(data, Mapping) or set(data) != {
+            "target_latitude",
+            "target_longitude",
+            "rotation_deg",
+        }:
+            raise AirfieldPresetError(
+                "Target trace preset data contains unsupported or missing fields."
+            )
+        latitude = _optional_float(data["target_latitude"], "Target latitude")
+        longitude = _optional_float(data["target_longitude"], "Target longitude")
+        if latitude is None or longitude is None:
+            raise AirfieldPresetError("Target trace presets require coordinates.")
+        try:
+            target = CoordinatePair(latitude, longitude)
+        except ValueError as error:
+            raise AirfieldPresetError(str(error)) from error
+        return cls.validated(target=target, rotation_deg=data["rotation_deg"])
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "target_latitude": self.target_latitude,
+            "target_longitude": self.target_longitude,
+            "rotation_deg": self.rotation_deg,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TranspositionPresetData:
+    """Shared, partial data that can be built up from any alignment card."""
+
+    runway: RunwayPresetSection | None = None
+    original_trace: OriginalTracePresetSection | None = None
+    target_trace: TargetTracePresetSection | None = None
+
+    @classmethod
+    def from_mapping(
+        cls, data: Mapping[str, object]
+    ) -> tuple["TranspositionPresetData", tuple[str, ...]]:
+        if set(data) == _TRANSPOSITION_FIELDS:
+            if data["data_version"] != TRANSPOSITION_PRESET_DATA_VERSION:
+                raise AirfieldPresetError(
+                    f'Unsupported transposition preset data_version {data["data_version"]!r}.'
+                )
+            return (
+                cls(
+                    runway=(
+                        None
+                        if data["runway"] is None
+                        else RunwayPresetSection.from_mapping(data["runway"])
+                    ),
+                    original_trace=(
+                        None
+                        if data["original_trace"] is None
+                        else OriginalTracePresetSection.from_mapping(
+                            data["original_trace"]
+                        )
+                    ),
+                    target_trace=(
+                        None
+                        if data["target_trace"] is None
+                        else TargetTracePresetSection.from_mapping(data["target_trace"])
+                    ),
+                ),
+                (),
+            )
+
+        if set(data) & {"data_version", "original_trace", "target_trace"}:
+            raise AirfieldPresetError(
+                "Transposition preset data contains unsupported or missing fields."
+            )
+
+        legacy, warnings = AirfieldPresetData.from_mapping(data)
+        if (
+            legacy.threshold_latitude is None
+            or legacy.threshold_longitude is None
+            or legacy.true_heading_deg is None
+        ):
+            raise AirfieldPresetError(
+                "This legacy preset does not contain complete runway geometry."
+            )
+        runway = RunwayPresetSection.from_mapping(
+            {
+                "threshold_latitude": legacy.threshold_latitude,
+                "threshold_longitude": legacy.threshold_longitude,
+                "true_heading_deg": legacy.true_heading_deg,
+                "elevation_m": legacy.elevation_m,
+            }
+        )
+        return cls(runway=runway), warnings
+
+    def with_runway(self, runway: RunwayPresetSection) -> "TranspositionPresetData":
+        return replace(self, runway=runway)
+
+    def with_original_trace(
+        self, original_trace: OriginalTracePresetSection
+    ) -> "TranspositionPresetData":
+        return replace(self, original_trace=original_trace)
+
+    def with_target_trace(
+        self, target_trace: TargetTracePresetSection
+    ) -> "TranspositionPresetData":
+        return replace(self, target_trace=target_trace)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "data_version": TRANSPOSITION_PRESET_DATA_VERSION,
+            "runway": None if self.runway is None else self.runway.to_mapping(),
+            "original_trace": (
+                None
+                if self.original_trace is None
+                else self.original_trace.to_mapping()
+            ),
+            "target_trace": (
+                None if self.target_trace is None else self.target_trace.to_mapping()
+            ),
+        }
+
+
 __all__ = [
     "AirfieldPresetData",
     "AirfieldPresetError",
+    "OriginalTracePresetSection",
+    "RunwayPresetSection",
     "RunwayDesignator",
+    "TRANSPOSITION_PRESET_DATA_VERSION",
+    "TargetTracePresetSection",
+    "TranspositionPresetData",
     "normalise_runway_designator",
 ]

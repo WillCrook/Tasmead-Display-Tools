@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -9,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from services import (
+    DetectionSignalScore,
     KmlPoint,
     KmlTrack,
     RunwayConfidence,
@@ -18,6 +20,7 @@ from services import (
     inverse_distance_bearing,
     transpose_geodesic_points,
 )
+from services.runway_alignment import _interpolated_score
 from services.transpose_coordinates import _waypoints_for_transposition
 
 
@@ -124,10 +127,7 @@ class DepartureInferenceTests(unittest.TestCase):
         result = infer_departure_runway(runway_track(heading=90.0))
 
         self.assertIsNotNone(result.candidate)
-        self.assertIn(
-            result.candidate.confidence,
-            {RunwayConfidence.HIGH, RunwayConfidence.MEDIUM},
-        )
+        self.assertIs(result.candidate.confidence, RunwayConfidence.LOW)
         self.assertLess(
             abs((result.candidate.reference.true_heading_deg - 90.0 + 180) % 360 - 180),
             2.0,
@@ -136,6 +136,10 @@ class DepartureInferenceTests(unittest.TestCase):
         self.assertIn("Ignored stationary jitter points", result.candidate.evidence[3])
         self.assertIs(result.candidate.heading_confidence, RunwayConfidence.HIGH)
         self.assertIs(result.candidate.threshold_confidence, RunwayConfidence.HIGH)
+        assessment = result.candidate.detection_assessment
+        self.assertEqual(assessment.overall_percent, 59)
+        self.assertEqual(assessment.ground_elevation_percent, 0)
+        self.assertIn("required ground elevation", assessment.cap_reason)
 
     def test_departure_after_long_apron_recording_is_still_inferred(self):
         runway_latitude = 48.9489
@@ -299,6 +303,18 @@ class DepartureInferenceTests(unittest.TestCase):
 
 
 class GroundElevationInferenceTests(unittest.TestCase):
+    def test_detection_score_interpolation_uses_declared_boundaries(self):
+        anchors = (
+            (300.0, 0.0),
+            (400.0, 60.0),
+            (700.0, 85.0),
+            (800.0, 100.0),
+        )
+        self.assertEqual(_interpolated_score(250.0, anchors), 0.0)
+        self.assertEqual(_interpolated_score(400.0, anchors), 60.0)
+        self.assertEqual(_interpolated_score(700.0, anchors), 85.0)
+        self.assertEqual(_interpolated_score(900.0, anchors), 100.0)
+
     def test_isolated_low_outlier_does_not_control_ground_elevation(self):
         def altitude(distance):
             if distance == 100:
@@ -396,6 +412,13 @@ class GroundElevationInferenceTests(unittest.TestCase):
         self.assertIsNotNone(manual.candidate)
         self.assertIsNone(manual.candidate.reference.elevation_m)
         self.assertTrue(any("enter it manually" in item for item in manual.warnings))
+        fallback_assessment = fallback.candidate.detection_assessment
+        manual_assessment = manual.candidate.detection_assessment
+        self.assertEqual(fallback_assessment.ground_elevation_percent, 40)
+        self.assertEqual(fallback_assessment.overall_percent, 79)
+        self.assertIs(fallback_assessment.rating, RunwayConfidence.MEDIUM)
+        self.assertEqual(manual_assessment.ground_elevation_percent, 0)
+        self.assertEqual(manual_assessment.overall_percent, 59)
 
     def test_non_absolute_track_does_not_infer_ground_reference(self):
         result = infer_departure_runway(
@@ -411,6 +434,53 @@ class GroundElevationInferenceTests(unittest.TestCase):
         self.assertFalse(
             any("Ground reference elevation" in item for item in result.candidate.evidence)
         )
+        assessment = result.candidate.detection_assessment
+        self.assertEqual(assessment.ground_elevation_percent, 100)
+        self.assertIs(assessment.rating, RunwayConfidence.HIGH)
+
+    def test_clamped_ground_is_high_and_unsupported_sea_floor_is_low(self):
+        clamped = infer_departure_runway(runway_track(altitude_mode="clampToGround"))
+        sea_floor = infer_departure_runway(
+            runway_track(altitude_mode="relativeToSeaFloor")
+        )
+
+        self.assertEqual(
+            clamped.candidate.detection_assessment.ground_elevation_percent,
+            100,
+        )
+        self.assertEqual(
+            sea_floor.candidate.detection_assessment.ground_elevation_percent,
+            0,
+        )
+        self.assertIs(
+            sea_floor.candidate.detection_assessment.rating,
+            RunwayConfidence.MEDIUM,
+        )
+        self.assertEqual(
+            sea_floor.candidate.detection_assessment.overall_percent,
+            77,
+        )
+
+    def test_critically_weak_heading_signal_caps_weighted_result(self):
+        signals = (
+            DetectionSignalScore("Heading consistency", 18, "test signal"),
+            DetectionSignalScore("Cross-track fit", 96, "test signal"),
+            DetectionSignalScore("Straightness", 96, "test signal"),
+            DetectionSignalScore("Aligned length", 93, "test signal"),
+        )
+        with patch(
+            "services.runway_alignment._heading_detection_scores",
+            return_value=(91.0, signals),
+        ):
+            result = infer_departure_runway(
+                runway_track(altitude_mode="relativeToGround")
+            )
+
+        assessment = result.candidate.detection_assessment
+        self.assertEqual(assessment.overall_percent, 59)
+        self.assertIs(assessment.rating, RunwayConfidence.LOW)
+        self.assertEqual(assessment.weakest_signal.name, "Heading consistency")
+        self.assertIn("critically weak", assessment.cap_reason)
 
 
 class AltitudeModeTests(unittest.TestCase):

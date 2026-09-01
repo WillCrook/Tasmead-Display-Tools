@@ -12,6 +12,10 @@ from services import (
     AirfieldPresetData,
     AirfieldPresetError,
     CoordinatePair,
+    OriginalTracePresetSection,
+    RunwayPresetSection,
+    TargetTracePresetSection,
+    TranspositionPresetData,
     normalise_runway_designator,
 )
 
@@ -79,6 +83,43 @@ class AirfieldPresetDataTests(unittest.TestCase):
                 true_heading_deg="240",
                 elevation_m="",
             )
+
+    def test_shared_partial_payload_round_trips_all_sections(self):
+        payload = TranspositionPresetData(
+            runway=RunwayPresetSection.validated(
+                threshold=CoordinatePair(51.2, -1.1),
+                true_heading_deg="240",
+                elevation_m="38",
+            ),
+            original_trace=OriginalTracePresetSection.validated("31.5"),
+            target_trace=TargetTracePresetSection.validated(
+                target=CoordinatePair(52.0, 0.25),
+                rotation_deg="35",
+            ),
+        )
+
+        decoded, warnings = TranspositionPresetData.from_mapping(
+            payload.to_mapping()
+        )
+
+        self.assertEqual(decoded, payload)
+        self.assertEqual(warnings, ())
+
+    def test_legacy_airfield_payload_decodes_as_runway_only(self):
+        decoded, _ = TranspositionPresetData.from_mapping(
+            {
+                "airfield_name": "Farnborough",
+                "runway": "24",
+                "threshold_latitude": 51.272833,
+                "threshold_longitude": -0.792044,
+                "true_heading_deg": 240.0,
+                "elevation_m": 38.0,
+            }
+        )
+
+        self.assertIsNotNone(decoded.runway)
+        self.assertIsNone(decoded.original_trace)
+        self.assertIsNone(decoded.target_trace)
 
 
 if __name__ == "__main__":

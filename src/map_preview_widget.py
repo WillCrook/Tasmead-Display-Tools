@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -18,8 +19,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
+    QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
@@ -391,6 +394,7 @@ _PREVIEW_HTML = r"""<!doctype html>
       if (state.cspFailed) return;
       if (!state.googleReady) { state.pending = {payload, revision}; return; }
       try {
+        if (state.bridge) state.bridge.renderStarted(state.generation, Number(revision));
         setStatus('Rendering WGS84 trace geometry…');
         const [maps3d, markerLibrary] = await Promise.all([
           google.maps.importLibrary('maps3d'),
@@ -632,6 +636,7 @@ class PreviewLoopbackServer:
 
 class MapPreviewBridge(QObject):
     shell_ready = pyqtSignal(int)
+    render_started = pyqtSignal(int, int)
     render_acknowledged = pyqtSignal(int, int)
     render_failed = pyqtSignal(int, str, str)
     presentation_state_changed = pyqtSignal(int, int, bool)
@@ -645,6 +650,17 @@ class MapPreviewBridge(QObject):
             _clamped_diagnostic_number(
                 generation, minimum=0, maximum=2_147_483_647
             )
+        )
+
+    @pyqtSlot(int, int)
+    def renderStarted(self, generation: int, revision: int) -> None:  # noqa: N802
+        self.render_started.emit(
+            _clamped_diagnostic_number(
+                generation, minimum=0, maximum=2_147_483_647
+            ),
+            _clamped_diagnostic_number(
+                revision, minimum=0, maximum=2_147_483_647
+            ),
         )
 
     @pyqtSlot(int, int)
@@ -758,6 +774,7 @@ class MapPreviewWidget(QWidget):
         self._web_view = None
         self._bridge: MapPreviewBridge | None = None
         self._loading_controls = False
+        self._loading_active = False
         self._presentation_active = False
 
         self._render_timer = QTimer(self)
@@ -795,9 +812,41 @@ class MapPreviewWidget(QWidget):
 
         self.map_host = QFrame()
         self.map_host.setObjectName("previewHost")
-        self.map_layout = QVBoxLayout(self.map_host)
+        self.map_layout = QStackedLayout(self.map_host)
         self.map_layout.setContentsMargins(0, 0, 0, 0)
+        self.map_layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
         splitter.addWidget(self.map_host)
+
+        self.loading_screen = QFrame()
+        self.loading_screen.setObjectName("previewLoadingScreen")
+        loading_layout = QVBoxLayout(self.loading_screen)
+        loading_layout.setContentsMargins(24, 24, 24, 24)
+        loading_layout.addStretch()
+        loading_card = QFrame()
+        loading_card.setObjectName("previewLoadingCard")
+        loading_card.setMaximumWidth(420)
+        loading_card_layout = QVBoxLayout(loading_card)
+        loading_card_layout.setContentsMargins(28, 24, 28, 24)
+        loading_card_layout.setSpacing(10)
+        self.loading_title = QLabel("Preview")
+        self.loading_title.setObjectName("dialogTitle")
+        self.loading_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_card_layout.addWidget(self.loading_title)
+        self.loading_message = QLabel()
+        self.loading_message.setObjectName("mutedText")
+        self.loading_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_message.setWordWrap(True)
+        loading_card_layout.addWidget(self.loading_message)
+        self.loading_progress = QProgressBar()
+        self.loading_progress.setAccessibleName("Preview loading progress")
+        self.loading_progress.setRange(0, 0)
+        self.loading_progress.setTextVisible(False)
+        loading_card_layout.addWidget(self.loading_progress)
+        loading_layout.addWidget(
+            loading_card, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
+        loading_layout.addStretch()
+        self.map_layout.addWidget(self.loading_screen)
 
         controls = QFrame()
         controls.setObjectName("workspacePanel")
@@ -881,16 +930,38 @@ class MapPreviewWidget(QWidget):
         splitter.setSizes((900, 340))
         self._set_apply_enabled(False)
 
-        self._idle_label = QLabel(
+        self._idle_message = (
             "The Google Maps 3D renderer starts only when a preview is requested."
             if WEBENGINE_AVAILABLE
             else
                 "PyQt6-WebEngine is not installed. Install the dependencies in "
                 "requirements.txt, then restart the application."
         )
-        self._idle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._idle_label.setWordWrap(True)
-        self.map_layout.addWidget(self._idle_label)
+        self._show_idle_state()
+
+    def _show_loading(self, message: str) -> None:
+        self._loading_active = True
+        self.loading_title.setText("Loading preview")
+        self.loading_message.setText(message)
+        self.loading_progress.show()
+        self.loading_screen.show()
+        self.loading_screen.raise_()
+
+    def _update_loading(self, message: str) -> None:
+        if self._loading_active:
+            self.loading_message.setText(message)
+
+    def _hide_loading(self) -> None:
+        self._loading_active = False
+        self.loading_screen.hide()
+
+    def _show_idle_state(self) -> None:
+        self._loading_active = False
+        self.loading_title.setText("Preview")
+        self.loading_message.setText(self._idle_message)
+        self.loading_progress.hide()
+        self.loading_screen.show()
+        self.loading_screen.raise_()
 
     def _ensure_web_view(self) -> bool:
         if not WEBENGINE_AVAILABLE:
@@ -905,7 +976,6 @@ class MapPreviewWidget(QWidget):
                 "The secure local preview service could not be started.",
             )
             return False
-        self._idle_label.hide()
         return True
 
     def _create_web_view(self) -> None:
@@ -914,6 +984,7 @@ class MapPreviewWidget(QWidget):
         try:
             web_view = QWebEngineView(self.map_host)
             page = RestrictedPreviewPage(server.port, web_view)
+            page.setBackgroundColor(QColor("#0f172a"))
             web_view.setPage(page)
             bridge = MapPreviewBridge(web_view)
             channel = QWebChannel(page)
@@ -921,6 +992,7 @@ class MapPreviewWidget(QWidget):
             page.setWebChannel(channel)
             page._tasmead_channel = channel
             bridge.shell_ready.connect(self._on_shell_ready)
+            bridge.render_started.connect(self._on_render_started)
             bridge.render_acknowledged.connect(self._on_render_acknowledged)
             bridge.render_failed.connect(self._on_render_failed)
             bridge.presentation_state_changed.connect(
@@ -943,6 +1015,8 @@ class MapPreviewWidget(QWidget):
         self._web_view = web_view
         self._bridge = bridge
         self.map_layout.addWidget(web_view)
+        if not self.loading_screen.isHidden():
+            self.loading_screen.raise_()
 
     def _dispose_web_runtime(self) -> None:
         self._shell_ready_timer.stop()
@@ -963,6 +1037,7 @@ class MapPreviewWidget(QWidget):
     def set_scene(self, scene: PreviewScene, api_key: str) -> bool:
         if not scene.traces:
             raise ValueError("A preview scene requires at least one trace.")
+        self._show_loading("Preparing preview…")
         key = str(api_key).strip()
         reuse_session = (
             self._session_reusable
@@ -1022,7 +1097,6 @@ class MapPreviewWidget(QWidget):
                     "The secure local preview service could not be restarted.",
                 )
                 return False
-            self._idle_label.hide()
             self._web_runtime_recreation_required = False
         if self._web_view is None or self._server is None:
             return False
@@ -1033,6 +1107,7 @@ class MapPreviewWidget(QWidget):
         self.retry_button.hide()
         self.open_settings_button.hide()
         self.status_label.setText("Initialising secure local preview…")
+        self._show_loading("Preparing preview…")
         page_url = self._server.url_for_generation(self._page_generation)
         self._shell_ready_timer.start()
         self._web_view.load(page_url)
@@ -1066,6 +1141,7 @@ class MapPreviewWidget(QWidget):
             self._show_error("missing-key", "No Google Maps API key is configured.")
             return
         self.status_label.setText("Loading Google Maps 3D…")
+        self._update_loading("Loading Google Maps 3D…")
         self._run_javascript(
             f"window.tasmead.loadGoogleMaps({json.dumps(self._api_key)});"
         )
@@ -1124,6 +1200,16 @@ class MapPreviewWidget(QWidget):
         if self._web_view is not None:
             self._web_view.page().runJavaScript(source)
 
+    def _on_render_started(self, generation: int, revision: int) -> None:
+        if (
+            generation != self._page_generation
+            or revision != self._revision
+            or self._failed_generation == generation
+            or self._csp_failed_generation == generation
+        ):
+            return
+        self._update_loading("Rendering preview…")
+
     def _on_render_acknowledged(self, generation: int, revision: int) -> None:
         if (
             generation != self._page_generation
@@ -1133,6 +1219,7 @@ class MapPreviewWidget(QWidget):
             or self._web_runtime_recreation_required
         ):
             return
+        self._hide_loading()
         self._stop_presentation_watchdog(clear_activity=True)
         QTimer.singleShot(0, self._refresh_web_presentation)
         self._acknowledged_revision = revision
@@ -1274,6 +1361,7 @@ class MapPreviewWidget(QWidget):
         self._stop_presentation_watchdog(clear_activity=True)
         self._failed_generation = self._page_generation
         self._session_reusable = False
+        self._hide_loading()
         self._set_apply_enabled(False)
         self.status_label.setText(message)
         self.retry_button.setVisible(WEBENGINE_AVAILABLE)
@@ -1385,6 +1473,7 @@ class MapPreviewWidget(QWidget):
         self._api_key = ""
         self._scene = None
         self._committed_scene = None
+        self._show_idle_state()
 
 
 __all__ = [

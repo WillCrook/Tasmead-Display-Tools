@@ -276,6 +276,129 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertNotIn("SECRET", failures[0][2])
         self.assertNotIn("maps.googleapis.com", failures[0][2])
 
+    def test_bridge_bounds_render_started_identifiers_before_emitting(self):
+        bridge = MapPreviewBridge()
+        started = QSignalSpy(bridge.render_started)
+
+        bridge.renderStarted(-4, 9_000_000_000)
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(list(started[0]), [0, 2_147_483_647])
+
+    def test_loading_screen_tracks_current_preview_lifecycle(self):
+        self.widget._page_generation = 4
+        self.widget._revision = 8
+        self.widget._api_key = "test-key"
+
+        self.widget._show_loading("Preparing preview…")
+        self.assertTrue(self.widget._loading_active)
+        self.assertFalse(self.widget.loading_screen.isHidden())
+        self.assertEqual(self.widget.loading_message.text(), "Preparing preview…")
+        self.assertEqual(
+            (
+                self.widget.loading_progress.minimum(),
+                self.widget.loading_progress.maximum(),
+            ),
+            (0, 0),
+        )
+
+        with patch.object(self.widget, "_schedule_render"):
+            self.widget._on_shell_ready(4)
+        self.assertEqual(
+            self.widget.loading_message.text(), "Loading Google Maps 3D…"
+        )
+        self.widget._on_render_started(4, 8)
+        self.assertEqual(self.widget.loading_message.text(), "Rendering preview…")
+
+        self.widget._on_render_acknowledged(4, 8)
+        self.assertFalse(self.widget._loading_active)
+        self.assertTrue(self.widget.loading_screen.isHidden())
+
+    def test_stale_render_events_do_not_dismiss_or_update_current_loader(self):
+        self.widget._page_generation = 5
+        self.widget._revision = 10
+        self.widget._show_loading("Loading Google Maps 3D…")
+
+        self.widget._on_render_started(4, 10)
+        self.widget._on_render_started(5, 9)
+        self.widget._on_render_acknowledged(4, 10)
+        self.widget._on_render_acknowledged(5, 9)
+
+        self.assertTrue(self.widget._loading_active)
+        self.assertEqual(
+            self.widget.loading_message.text(), "Loading Google Maps 3D…"
+        )
+
+    def test_ordinary_scene_update_does_not_cover_the_existing_map(self):
+        self.widget._hide_loading()
+
+        self.widget._schedule_render()
+
+        self.widget._render_timer.stop()
+        self.assertFalse(self.widget._loading_active)
+        self.assertTrue(self.widget.loading_screen.isHidden())
+
+    def test_error_hides_loader_and_shutdown_restores_idle_state(self):
+        self.widget._show_loading("Preparing preview…")
+        self.widget._show_error("network", "Network failure")
+
+        self.assertFalse(self.widget._loading_active)
+        self.assertTrue(self.widget.loading_screen.isHidden())
+
+        self.widget.shutdown()
+        self.assertFalse(self.widget._loading_active)
+        self.assertFalse(self.widget.loading_screen.isHidden())
+        self.assertTrue(self.widget.loading_progress.isHidden())
+
+    def test_retry_and_reused_scene_show_the_loading_screen(self):
+        class FakeWebView:
+            def update(self):
+                return None
+
+        class FakeRetryWebView:
+            def __init__(self):
+                self.loaded = []
+
+            def load(self, url):
+                self.loaded.append(url)
+
+        class FakeServer:
+            def url_for_generation(self, generation):
+                return preview_module.QUrl(
+                    "http://127.0.0.1:12345/token/preview"
+                    f"?generation={generation}"
+                )
+
+        self.widget._web_view = FakeWebView()
+        self.widget._server = object()
+        self.widget._shell_ready = True
+        self.widget._session_reusable = True
+        self.widget._api_key = "same-key"
+        self.widget._hide_loading()
+        try:
+            with patch.object(self.widget, "_schedule_render") as render:
+                self.assertTrue(
+                    self.widget.set_scene(scene_with_two_traces(), "same-key")
+                )
+
+            self.assertTrue(self.widget._loading_active)
+            self.assertEqual(self.widget.loading_message.text(), "Preparing preview…")
+            render.assert_called_once_with(immediate=True)
+
+            self.widget._hide_loading()
+            retry_web_view = FakeRetryWebView()
+            self.widget._web_view = retry_web_view
+            self.widget._server = FakeServer()
+            with patch.object(preview_module, "WEBENGINE_AVAILABLE", True):
+                self.assertTrue(self.widget._reload_shell())
+
+            self.assertTrue(self.widget._loading_active)
+            self.assertEqual(self.widget.loading_message.text(), "Preparing preview…")
+            self.assertEqual(len(retry_web_view.loaded), 1)
+        finally:
+            self.widget._web_view = None
+            self.widget._server = None
+
     def test_bridge_sanitises_policy_violation_before_emitting(self):
         bridge = MapPreviewBridge()
         violations = QSignalSpy(bridge.security_policy_violation)

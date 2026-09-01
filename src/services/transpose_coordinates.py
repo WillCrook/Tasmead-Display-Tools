@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import math
 from pathlib import Path
 from typing import Sequence
 import warnings
@@ -43,7 +44,7 @@ class TranspositionJob:
     output_path: Path
     aircraft_name: str
     aircraft_slug: str
-    target_airfield_slug: str
+    target_airfield_slug: str | None
     overwrite_existing: bool = False
     source_runway: RunwayReference | None = None
 
@@ -89,6 +90,86 @@ class TranspositionFileStatus(str, Enum):
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class AlignmentMethod(str, Enum):
+    """The horizontal reference model used for one input KML."""
+
+    RUNWAY = "runway"
+    MANUAL = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class RunwayTranspositionAlignment:
+    """Reviewed runway-to-runway alignment for one input KML."""
+
+    source_runway: RunwayReference
+    target_runway: RunwayReference
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_runway, RunwayReference):
+            raise TypeError("source_runway must be a RunwayReference.")
+        if not isinstance(self.target_runway, RunwayReference):
+            raise TypeError("target_runway must be a RunwayReference.")
+
+    @property
+    def method(self) -> AlignmentMethod:
+        return AlignmentMethod.RUNWAY
+
+
+@dataclass(frozen=True, slots=True)
+class ManualTranspositionAlignment:
+    """First-point-to-target translation plus a clockwise trace rotation."""
+
+    target_latitude: float
+    target_longitude: float
+    clockwise_rotation_deg: float
+    ground_reference_elevation_m: float | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            latitude = float(self.target_latitude)
+            longitude = float(self.target_longitude)
+            rotation = float(self.clockwise_rotation_deg)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Manual target coordinates and rotation must be finite numbers."
+            ) from error
+        if not all(math.isfinite(value) for value in (latitude, longitude, rotation)):
+            raise ValueError(
+                "Manual target coordinates and rotation must be finite numbers."
+            )
+        if not -90.0 <= latitude <= 90.0:
+            raise ValueError("Manual target latitude must be between -90 and 90 degrees.")
+        if not -180.0 <= longitude <= 180.0:
+            raise ValueError(
+                "Manual target longitude must be between -180 and 180 degrees."
+            )
+        if not 0.0 <= rotation <= 360.0:
+            raise ValueError("Clockwise rotation must be between 0 and 360 degrees.")
+        elevation = self.ground_reference_elevation_m
+        if elevation is not None:
+            try:
+                elevation = float(elevation)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Ground reference elevation must be a finite number."
+                ) from error
+            if not math.isfinite(elevation):
+                raise ValueError("Ground reference elevation must be a finite number.")
+        object.__setattr__(self, "target_latitude", latitude)
+        object.__setattr__(self, "target_longitude", longitude)
+        object.__setattr__(self, "clockwise_rotation_deg", rotation % 360.0)
+        object.__setattr__(self, "ground_reference_elevation_m", elevation)
+
+    @property
+    def method(self) -> AlignmentMethod:
+        return AlignmentMethod.MANUAL
+
+
+TranspositionAlignment = (
+    RunwayTranspositionAlignment | ManualTranspositionAlignment
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +270,7 @@ PreparedTranspositionItem = (
 class PreparedTranspositionBatch:
     """Ordered in-memory preparation results for a transposition batch."""
 
-    target_runway: RunwayReference
+    target_runway: RunwayReference | None
     items: tuple[PreparedTranspositionItem, ...]
 
     @property
@@ -229,10 +310,16 @@ def _slug_component(value: str, fallback: str) -> str:
 
 def _output_stem(
     aircraft_slug: str,
-    target_airfield_slug: str,
+    target_airfield_slug: str | None,
     sequence: int,
 ) -> str:
     suffix = "" if sequence == 1 else f"-{sequence}"
+    if target_airfield_slug is None:
+        manual_suffix = "-transposed"
+        aircraft = aircraft_slug[
+            : MAX_OUTPUT_STEM_LENGTH - len(manual_suffix) - len(suffix)
+        ].rstrip("-") or "aircraft"
+        return f"{aircraft}{manual_suffix}{suffix}"
     separator = "-at-"
     max_aircraft_length = (
         MAX_OUTPUT_STEM_LENGTH
@@ -247,7 +334,7 @@ def _output_stem(
 def _next_available_output_path(
     output_directory: Path,
     aircraft_slug: str,
-    target_airfield_slug: str,
+    target_airfield_slug: str | None,
     occupied_names: set[str],
 ) -> Path:
     sequence = 1
@@ -261,27 +348,51 @@ def _next_available_output_path(
 def create_transposition_plan(
     input_files: list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...],
     output_directory: str | os.PathLike[str],
-    target_airfield: str,
+    target_airfield: str | None = None,
+    *,
+    target_airfields: Sequence[str | None] | None = None,
 ) -> TranspositionPlan:
-    """Plan one collision-free output per KML input without writing files."""
+    """Plan one collision-free output per KML input without writing files.
+
+    ``target_airfield`` preserves the historical shared runway destination.
+    New mixed-alignment callers provide ``target_airfields`` in input order;
+    ``None`` selects the manual ``-transposed`` filename for that input.
+    """
     if not input_files:
         raise ValueError("At least one input KML file is required.")
+
+    if target_airfields is not None and target_airfield is not None:
+        raise TypeError("Do not mix target_airfield with target_airfields.")
+    if target_airfields is None:
+        destinations: tuple[str | None, ...] = (
+            ("" if target_airfield is None else target_airfield),
+        ) * len(input_files)
+    else:
+        destinations = tuple(target_airfields)
+        if len(destinations) != len(input_files):
+            raise ValueError(
+                "Provide exactly one target-airfield name or manual marker per input KML file."
+            )
 
     output_dir = Path(output_directory)
     if not output_dir.is_dir():
         raise ValueError(f'Output directory does not exist: "{output_dir}".')
 
     occupied_names = {entry.name.casefold() for entry in output_dir.iterdir()}
-    target_slug = _slug_component(target_airfield, "airfield")
     jobs: list[TranspositionJob] = []
 
-    for input_file in input_files:
+    for input_file, destination in zip(input_files, destinations, strict=True):
         input_path = Path(input_file)
         if input_path.suffix.lower() != ".kml":
             raise ValueError(f'{input_path.name}: expected a KML file.')
 
         aircraft_name = input_path.stem
         aircraft_slug = _slug_component(aircraft_name, "aircraft")
+        target_slug = (
+            None
+            if destination is None
+            else _slug_component(destination, "airfield")
+        )
         output_path = _next_available_output_path(
             output_dir,
             aircraft_slug,
@@ -504,10 +615,14 @@ def read_config(config_file):
 
 def _waypoints_for_transposition(
     track: KmlTrack,
-    source_runway: RunwayReference,
+    ground_reference_elevation_m: float | RunwayReference | None,
 ) -> tuple[list[tuple[float, float, float]], tuple[str, ...]]:
     """Convert encoded KML heights to output relative-to-ground heights."""
-    if track.altitude_mode == "absolute" and source_runway.elevation_m is None:
+    if isinstance(ground_reference_elevation_m, RunwayReference):
+        # Compatibility for focused callers of this formerly runway-coupled
+        # private helper. New code passes the elevation value directly.
+        ground_reference_elevation_m = ground_reference_elevation_m.elevation_m
+    if track.altitude_mode == "absolute" and ground_reference_elevation_m is None:
         raise ValueError(
             "Source ground-reference elevation is required for a KML using absolute altitude."
         )
@@ -518,7 +633,7 @@ def _waypoints_for_transposition(
             if point.altitude_m is None:
                 omitted_missing_altitudes += 1
                 continue
-            altitude = point.altitude_m - source_runway.elevation_m
+            altitude = point.altitude_m - ground_reference_elevation_m
         elif track.altitude_mode == "relativeToGround":
             altitude = point.altitude_m if point.altitude_m is not None else 0.0
         elif track.altitude_mode == "clampToGround":
@@ -605,13 +720,35 @@ def prepare_transposition(
     *,
     input_files: Sequence[str | os.PathLike[str]] | None = None,
     source_runways: Sequence[RunwayReference | None] | None = None,
+    alignments: Sequence[TranspositionAlignment | None] | None = None,
 ) -> PreparedTranspositionBatch:
     """Prepare transposed KML documents in memory without writing files.
 
     Existing callers can provide a reviewed plan. Preview-first callers can
     provide ordered inputs and source runways before selecting an output folder.
     """
-    if target_runway is None:
+    if alignments is not None:
+        if plan is not None or source_runways is not None or target_runway is not None:
+            raise TypeError(
+                "Do not mix per-file alignments with a plan or shared runway arguments."
+            )
+        if input_files is None:
+            raise TypeError("Per-file alignment preparation requires input_files.")
+        if not input_files:
+            raise ValueError("At least one input KML file is required.")
+        if len(input_files) != len(alignments):
+            raise ValueError(
+                "Provide exactly one transposition alignment for each input KML file."
+            )
+        sources = tuple(
+            (Path(input_path), Path(input_path).stem, alignment)
+            for input_path, alignment in zip(input_files, alignments, strict=True)
+        )
+        shared_target_runway = None
+        missing_alignment_message = (
+            "Alignment settings are incomplete or invalid for this input."
+        )
+    elif target_runway is None:
         raise TypeError("target_runway is required.")
     if plan is not None:
         if input_files is not None or source_runways is not None:
@@ -621,10 +758,20 @@ def prepare_transposition(
         if not plan.jobs:
             raise ValueError("A transposition plan must contain at least one job.")
         sources = tuple(
-            (job.input_path, job.aircraft_name, job.source_runway)
+            (
+                job.input_path,
+                job.aircraft_name,
+                None
+                if job.source_runway is None
+                else RunwayTranspositionAlignment(job.source_runway, target_runway),
+            )
             for job in plan.jobs
         )
-    else:
+        shared_target_runway = target_runway
+        missing_alignment_message = (
+            "Source runway alignment has not been reviewed for this input."
+        )
+    elif alignments is None:
         if input_files is None or source_runways is None:
             raise TypeError(
                 "Preview-first preparation requires input_files and source_runways."
@@ -636,21 +783,25 @@ def prepare_transposition(
                 "Provide exactly one source runway review for each input KML file."
             )
         sources = tuple(
-            (Path(input_path), Path(input_path).stem, source_runway)
+            (
+                Path(input_path),
+                Path(input_path).stem,
+                None
+                if source_runway is None
+                else RunwayTranspositionAlignment(source_runway, target_runway),
+            )
             for input_path, source_runway in zip(
                 input_files, source_runways, strict=True
             )
         )
-
-    anchor = KmlCoordinate(
-        longitude=target_runway.longitude,
-        latitude=target_runway.latitude,
-        altitude_m=0.0,
-    )
+        shared_target_runway = target_runway
+        missing_alignment_message = (
+            "Source runway alignment has not been reviewed for this input."
+        )
     items: list[PreparedTranspositionItem] = []
     label_counts = Counter(aircraft_name for _, aircraft_name, _ in sources)
 
-    for index, (input_path, aircraft_name, reviewed_source) in enumerate(sources):
+    for index, (input_path, aircraft_name, alignment) in enumerate(sources):
         LOGGER.info("Preparing transposition for %s", input_path)
         try:
             track = parse_kml_track(input_path)
@@ -663,20 +814,44 @@ def prepare_transposition(
             continue
 
         try:
-            if reviewed_source is None:
-                raise ValueError(
-                    "Source runway alignment has not been reviewed for this input."
+            if alignment is None:
+                raise ValueError(missing_alignment_message)
+            if isinstance(alignment, RunwayTranspositionAlignment):
+                source_origin = (
+                    alignment.source_runway.latitude,
+                    alignment.source_runway.longitude,
                 )
+                target_origin = (
+                    alignment.target_runway.latitude,
+                    alignment.target_runway.longitude,
+                )
+                clockwise_rotation_deg = (
+                    alignment.target_runway.true_heading_deg
+                    - alignment.source_runway.true_heading_deg
+                )
+                ground_reference_elevation_m = alignment.source_runway.elevation_m
+            elif isinstance(alignment, ManualTranspositionAlignment):
+                first_point = track.points[0]
+                source_origin = (first_point.latitude, first_point.longitude)
+                target_origin = (
+                    alignment.target_latitude,
+                    alignment.target_longitude,
+                )
+                clockwise_rotation_deg = alignment.clockwise_rotation_deg
+                ground_reference_elevation_m = (
+                    alignment.ground_reference_elevation_m
+                )
+            else:
+                raise TypeError("Unsupported transposition alignment.")
             waypoints, processing_warnings = _waypoints_for_transposition(
                 track,
-                reviewed_source,
+                ground_reference_elevation_m,
             )
             adjusted_waypoints = transpose_wgs84_enu_points(
                 waypoints,
-                (reviewed_source.latitude, reviewed_source.longitude),
-                (target_runway.latitude, target_runway.longitude),
-                target_runway.true_heading_deg
-                - reviewed_source.true_heading_deg,
+                source_origin,
+                target_origin,
+                clockwise_rotation_deg,
             )
             document = _transposition_document(
                 adjusted_waypoints,
@@ -694,7 +869,11 @@ def prepare_transposition(
                     if label_counts[aircraft_name] == 1
                     else f"{aircraft_name} — {input_path.parent}"
                 ),
-                anchor=anchor,
+                anchor=KmlCoordinate(
+                    longitude=target_origin[1],
+                    latitude=target_origin[0],
+                    altitude_m=0.0,
+                ),
                 base_document=document,
             )
         except Exception as error:
@@ -717,7 +896,7 @@ def prepare_transposition(
         )
 
     return PreparedTranspositionBatch(
-        target_runway=target_runway,
+        target_runway=shared_target_runway,
         items=tuple(items),
     )
 

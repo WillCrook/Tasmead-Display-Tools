@@ -168,6 +168,28 @@ class ThemeControllerTests(unittest.TestCase):
         self.assertIn(DARK_TOKENS.error, stylesheet)
         self.assertIn("QPushButton#primaryButton:pressed", stylesheet)
         self.assertIn("QListWidget::item:selected", stylesheet)
+        self.assertIn(
+            'QLabel#previewOffsetStatusDot[offsetState="active"]',
+            stylesheet,
+        )
+        self.assertIn(
+            'QLabel#previewOffsetStatusDot[offsetState="mismatch"]',
+            stylesheet,
+        )
+        self.assertIn(
+            'QLabel#runwayDetectionStatusDot[detectionState="high"]',
+            stylesheet,
+        )
+        self.assertIn(
+            'QLabel#runwayDetectionStatusDot[detectionState="moderate"]',
+            stylesheet,
+        )
+        self.assertIn(
+            'QLabel#runwayDetectionStatusDot[detectionState="low"]',
+            stylesheet,
+        )
+        self.assertIn("QDialog#persistentInfoPopup", stylesheet)
+        self.assertIn("QLabel#persistentInfoPopupText", stylesheet)
         self.assertIn("border-left: 3px solid #2DD4BF", stylesheet)
         self.assertNotEqual(DARK_TOKENS.primary, DARK_TOKENS.success)
 

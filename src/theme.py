@@ -161,10 +161,30 @@ QToolTip {{
     border-radius: 6px;
     padding: 4px 7px;
 }}
+QDialog#persistentInfoPopup {{
+    background: {tokens.surface_alt};
+    color: {tokens.body_text};
+    border: 1px solid {tokens.border};
+    border-radius: 6px;
+}}
+QLabel#persistentInfoPopupText {{
+    background: transparent;
+    color: {tokens.body_text};
+    border: none;
+}}
 QFrame#appHeader {{
     background: {tokens.surface};
     border: none;
     border-bottom: 1px solid {tokens.border};
+}}
+QFrame#previewLoadingScreen {{
+    background: {tokens.background};
+    border: none;
+}}
+QFrame#previewLoadingCard {{
+    background: {tokens.surface};
+    border: 1px solid {tokens.border};
+    border-radius: 12px;
 }}
 QFrame#modeSwitch, QFrame#themeSwitch {{
     background: {tokens.surface_alt};
@@ -346,6 +366,31 @@ QLabel[status="warning"] {{
 QLabel#warningText {{
     color: {tokens.warning_text};
     font-weight: 650;
+}}
+QLabel#previewOffsetStatusDot {{
+    background: {tokens.muted_text};
+    border: none;
+    border-radius: 5px;
+}}
+QLabel#previewOffsetStatusDot[offsetState="active"] {{
+    background: {tokens.success};
+}}
+QLabel#previewOffsetStatusDot[offsetState="mismatch"] {{
+    background: {tokens.error};
+}}
+QLabel#runwayDetectionStatusDot {{
+    background: {tokens.muted_text};
+    border: none;
+    border-radius: 5px;
+}}
+QLabel#runwayDetectionStatusDot[detectionState="high"] {{
+    background: {tokens.success};
+}}
+QLabel#runwayDetectionStatusDot[detectionState="moderate"] {{
+    background: {tokens.warning};
+}}
+QLabel#runwayDetectionStatusDot[detectionState="low"] {{
+    background: {tokens.error};
 }}
 QFrame#dropZone[status="ready"] {{
     border: 2px solid {tokens.success};

@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
-from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -36,16 +36,17 @@ from file_dialog_state import (
 )
 from icon_utils import AppIcon, set_button_icon
 from pages.coordinate_input import CoordinatePairInput
+from pages.info_popup import PersistentInfoPopupController
 from pages.preset_ui import PresetUiMixin
 from pages.unit_fields import MetreFeetFieldPair
 from services import (
-    AirfieldPresetData,
     AirfieldPresetError,
     CoordinateInputError,
     PresetError,
     PresetImportExportService,
     PresetRepository,
-    normalise_runway_designator,
+    RunwayPresetSection,
+    TranspositionPresetData,
 )
 
 
@@ -62,6 +63,17 @@ def format_optional_number(value: float | None, places: int = 8) -> str:
     if value is None:
         return ""
     return f"{value:.{places}f}".rstrip("0").rstrip(".")
+
+
+def friendly_altitude_mode(mode: str | None) -> str:
+    """Return a concise user-facing label for a KML altitude mode."""
+    return {
+        "absolute": "Absolute",
+        "relativeToGround": "Relative to ground",
+        "clampToGround": "Clamped to ground",
+        "relativeToSeaFloor": "Relative to sea floor (unsupported)",
+        "clampToSeaFloor": "Clamped to sea floor (unsupported)",
+    }.get(mode, mode or "Unknown")
 
 
 def confirm_nonstandard_runways(
@@ -89,29 +101,12 @@ def confirm_nonstandard_runways(
     return False
 
 
-class InferenceDetailsPopup(QDialog):
-    """Small click-open popup for inference evidence and warnings."""
-
-    def __init__(self, text: str, parent: QWidget):
-        super().__init__(parent, Qt.WindowType.Popup)
-        self.setObjectName("inferencePopup")
-        self.setWindowTitle("Inference details")
-        layout = QVBoxLayout(self)
-        heading = QLabel("Inference evidence and warnings")
-        heading.setObjectName("popupHeading")
-        layout.addWidget(heading)
-        details = QLabel(text or "No additional inference details are available.")
-        details.setWordWrap(True)
-        details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        details.setMaximumWidth(440)
-        layout.addWidget(details)
-
-
 class AirfieldCard(QFrame):
     """Reusable card for an original or target directional runway."""
 
     user_edited = pyqtSignal()
     preset_apply_requested = pyqtSignal()
+    preset_save_requested = pyqtSignal()
     restore_auto_requested = pyqtSignal()
 
     def __init__(
@@ -121,16 +116,16 @@ class AirfieldCard(QFrame):
         *,
         include_elevation: bool,
         show_inference: bool,
+        include_altitude_mode: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("airfieldCard")
         self.include_elevation = include_elevation
         self._details_text = ""
-        self._details_popup: InferenceDetailsPopup | None = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
+        root.setContentsMargins(10, 16, 10, 16)
         root.setSpacing(12)
 
         header = QHBoxLayout()
@@ -145,13 +140,19 @@ class AirfieldCard(QFrame):
         header.addLayout(titles, 1)
         root.addLayout(header)
 
-        preset_row = QHBoxLayout()
+        self.preset_label = QLabel("Preset name")
+        root.addWidget(self.preset_label)
         self.preset_combo = QComboBox()
-        self.preset_combo.setAccessibleName(f"{title} preset")
+        self.preset_combo.setAccessibleName(f"{title} preset name")
         self.preset_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.preset_combo.setMinimumContentsLength(16)
+        self.preset_combo.setMinimumContentsLength(4)
         self.preset_combo.activated.connect(self._apply_activated_preset)
+        self.save_preset_btn = QPushButton("Save preset")
+        self.save_preset_btn.setAccessibleName(f"Save {title} inputs as preset")
+        self.save_preset_btn.clicked.connect(self.preset_save_requested)
+        preset_row = QHBoxLayout()
         preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.save_preset_btn)
         root.addLayout(preset_row)
 
         fields = QGridLayout()
@@ -159,12 +160,6 @@ class AirfieldCard(QFrame):
         fields.setVerticalSpacing(7)
         fields.setColumnStretch(1, 1)
 
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("e.g. Farnborough")
-        self.name_input.setAccessibleName(f"{title} airfield name")
-        self.runway_input = QLineEdit()
-        self.runway_input.setPlaceholderText("e.g. 24 or 24R")
-        self.runway_input.setAccessibleName(f"{title} runway identifier")
         self.coordinate_input = CoordinatePairInput(
             f"{title} departure runway threshold coordinates"
         )
@@ -172,18 +167,29 @@ class AirfieldCard(QFrame):
         self.heading_input.setPlaceholderText("0–360° true")
         self.heading_input.setAccessibleName(f"{title} true heading")
 
-        fields.addWidget(QLabel("Airfield name"), 0, 0)
-        fields.addWidget(self.name_input, 0, 1)
-        fields.addWidget(QLabel("Airfield runway"), 1, 0)
-        fields.addWidget(self.runway_input, 1, 1)
-        fields.addWidget(QLabel("Departure threshold"), 2, 0)
-        fields.addWidget(self.coordinate_input, 2, 1)
-        fields.addWidget(QLabel("True heading"), 3, 0)
-        fields.addWidget(self.heading_input, 3, 1)
+        fields.addWidget(QLabel("Runway coordinates"), 0, 0)
+        fields.addWidget(self.coordinate_input, 0, 1)
+        fields.addWidget(QLabel("True heading"), 1, 0)
+        fields.addWidget(self.heading_input, 1, 1)
+
+        next_row = 2
+        self.altitude_mode_label: QLabel | None = None
+        self.altitude_mode_output: QLineEdit | None = None
+        if include_altitude_mode:
+            self.altitude_mode_label = QLabel("Altitude mode")
+            self.altitude_mode_output = QLineEdit()
+            self.altitude_mode_output.setReadOnly(True)
+            self.altitude_mode_output.setAccessibleName(
+                f"{title} KML altitude mode"
+            )
+            fields.addWidget(self.altitude_mode_label, next_row, 0)
+            fields.addWidget(self.altitude_mode_output, next_row, 1)
+            next_row += 1
 
         self.elevation_m_input: QLineEdit | None = None
         self.elevation_ft_input: QLineEdit | None = None
         self.elevation_units: MetreFeetFieldPair | None = None
+        self.elevation_label: QLabel | None = None
         if include_elevation:
             elevation_row = QHBoxLayout()
             self.elevation_m_input = QLineEdit()
@@ -194,19 +200,14 @@ class AirfieldCard(QFrame):
             self.elevation_ft_input.setAccessibleName(f"{title} elevation feet")
             elevation_row.addWidget(self.elevation_m_input)
             elevation_row.addWidget(self.elevation_ft_input)
-            fields.addWidget(QLabel("Elevation (m / ft)"), 4, 0)
-            fields.addLayout(elevation_row, 4, 1)
+            self.elevation_label = QLabel("Elevation (m / ft)")
+            fields.addWidget(self.elevation_label, next_row, 0)
+            fields.addLayout(elevation_row, next_row, 1)
             self.elevation_units = MetreFeetFieldPair(
                 self.elevation_m_input,
                 self.elevation_ft_input,
             )
         root.addLayout(fields)
-
-        self.runway_warning = QLabel()
-        self.runway_warning.setObjectName("warningText")
-        self.runway_warning.setWordWrap(True)
-        self.runway_warning.setAccessibleName(f"{title} runway validation status")
-        root.addWidget(self.runway_warning)
 
         self.status_frame = QFrame()
         self.status_frame.setObjectName("statusPanel")
@@ -216,24 +217,26 @@ class AirfieldCard(QFrame):
         status_top = QHBoxLayout()
         self.status_label = QLabel("Waiting for a KML file")
         self.status_label.setObjectName("statusBadge")
-        self.confidence_label = QLabel()
-        self.confidence_label.setObjectName("mutedText")
         status_top.addWidget(self.status_label)
-        status_top.addWidget(self.confidence_label)
-        status_top.addStretch()
-        status_layout.addLayout(status_top)
-        status_actions = QHBoxLayout()
+        self.detection_status_dot = QLabel()
+        self.detection_status_dot.setObjectName("runwayDetectionStatusDot")
+        self.detection_status_dot.setFixedSize(10, 10)
+        self.detection_status_dot.hide()
+        status_top.addWidget(self.detection_status_dot)
         self.details_button = QToolButton()
-        self.details_button.setText("Evidence and warnings")
-        self.details_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.details_button.setAutoRaise(True)
+        self.details_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.details_button.setAccessibleName("Runway detection details")
         set_button_icon(self.details_button, AppIcon.INFO_CIRCLE)
-        self.details_button.clicked.connect(self._show_details)
+        self.details_popup = PersistentInfoPopupController(self.details_button)
+        self.details_button.hide()
+        status_top.addWidget(self.details_button)
         self.restore_button = QPushButton("Restore auto-detected")
         self.restore_button.clicked.connect(self.restore_auto_requested)
-        status_actions.addWidget(self.details_button)
-        status_actions.addWidget(self.restore_button)
-        status_actions.addStretch()
-        status_layout.addLayout(status_actions)
+        self.restore_button.hide()
+        status_top.addWidget(self.restore_button)
+        status_top.addStretch()
+        status_layout.addLayout(status_top)
         self.status_frame.setVisible(show_inference)
         root.addWidget(self.status_frame)
 
@@ -245,14 +248,9 @@ class AirfieldCard(QFrame):
 
         for field in self.editable_fields():
             field.textEdited.connect(self.user_edited)
-        self.runway_input.textChanged.connect(self._update_runway_warning)
-        self.runway_input.editingFinished.connect(self._normalise_runway)
-        self._update_runway_warning("")
 
     def editable_fields(self) -> tuple[QLineEdit, ...]:
         fields: list[QLineEdit] = [
-            self.name_input,
-            self.runway_input,
             self.coordinate_input,
             self.heading_input,
         ]
@@ -262,8 +260,6 @@ class AirfieldCard(QFrame):
 
     def values(self) -> AirfieldFormValues:
         return AirfieldFormValues(
-            airfield_name=self.name_input.text(),
-            runway=self.runway_input.text(),
             threshold=self.coordinate_input.text(),
             true_heading=self.heading_input.text(),
             elevation_m=(
@@ -274,8 +270,6 @@ class AirfieldCard(QFrame):
         )
 
     def set_values(self, values: AirfieldFormValues) -> None:
-        self.name_input.setText(values.airfield_name)
-        self.runway_input.setText(values.runway)
         self.coordinate_input.setText(values.threshold)
         self.heading_input.setText(values.true_heading)
         if self.elevation_units is not None:
@@ -287,11 +281,18 @@ class AirfieldCard(QFrame):
 
     def clear_values(self) -> None:
         self.set_values(AirfieldFormValues())
+        if self.altitude_mode_output is not None:
+            self.altitude_mode_output.clear()
+
+    def set_altitude_mode(self, mode: str | None) -> None:
+        if self.altitude_mode_output is not None:
+            self.altitude_mode_output.setText(friendly_altitude_mode(mode))
 
     def set_fields_enabled(self, enabled: bool) -> None:
         for field in self.editable_fields():
             field.setEnabled(enabled)
         self.preset_combo.setEnabled(enabled)
+        self.save_preset_btn.setEnabled(enabled)
 
     def _apply_activated_preset(self, index: int) -> None:
         """Apply only explicit user selections, not programmatic refreshes."""
@@ -302,52 +303,43 @@ class AirfieldCard(QFrame):
         self,
         status: str,
         *,
-        confidence: str = "",
         details: str = "",
+        detection_state: str | None = None,
+        detection_description: str = "",
         can_restore: bool = False,
     ) -> None:
+        self.details_popup.close()
         self.status_label.setText(status)
         self.status_label.setProperty("status", status.casefold().replace(" ", "-"))
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
-        self.confidence_label.setText(confidence)
         self._details_text = details
+        self.detection_status_dot.setVisible(detection_state is not None)
+        self.detection_status_dot.setProperty(
+            "detectionState",
+            detection_state or "unavailable",
+        )
+        self.detection_status_dot.setAccessibleName(
+            detection_description or "Runway detection confidence unavailable"
+        )
+        self.detection_status_dot.setAccessibleDescription(detection_description)
+        self.detection_status_dot.setToolTip("")
+        dot_style = self.detection_status_dot.style()
+        dot_style.unpolish(self.detection_status_dot)
+        dot_style.polish(self.detection_status_dot)
+        self.detection_status_dot.update()
+        self.details_button.setToolTip(details)
+        self.details_button.setAccessibleDescription(details)
+        self.details_popup.set_text(details)
+        self.details_button.setVisible(bool(details) and not can_restore)
         self.details_button.setEnabled(bool(details))
         self.restore_button.setVisible(can_restore)
 
     def set_error(self, message: str) -> None:
         self.error_label.setText(message)
 
-    def _normalise_runway(self) -> None:
-        designator = normalise_runway_designator(self.runway_input.text())
-        if designator.conventional and designator.value != self.runway_input.text():
-            self.runway_input.setText(designator.value)
-
-    def _update_runway_warning(self, value: str) -> None:
-        designator = normalise_runway_designator(value)
-        nonstandard = bool(designator.value and not designator.conventional)
-        self.runway_input.setProperty("nonstandard", nonstandard)
-        self.runway_input.style().unpolish(self.runway_input)
-        self.runway_input.style().polish(self.runway_input)
-        self.runway_warning.setText(
-            "Non-standard identifier — explicit confirmation will be required."
-            if nonstandard
-            else ""
-        )
-
-    def _show_details(self) -> None:
-        if not self._details_text:
-            return
-        self._details_popup = InferenceDetailsPopup(self._details_text, self)
-        position = self.details_button.mapToGlobal(
-            QPoint(0, self.details_button.height() + 4)
-        )
-        self._details_popup.move(position)
-        self._details_popup.show()
-
-
 class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
-    """Create, edit, transfer, and delete every managed airfield preset."""
+    """Create, edit, transfer, and delete shared transposition presets."""
 
     def __init__(
         self,
@@ -356,7 +348,7 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
         parent: QWidget | None = None,
     ) -> None:
         QDialog.__init__(self, parent)
-        self.setWindowTitle("Manage Airfields")
+        self.setWindowTitle("Manage Presets")
         self.resize(900, 590)
         self.preset_repository = repository
         self.preset_store = repository
@@ -366,12 +358,12 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
         self._editing_id: UUID | None = None
 
         root = QVBoxLayout(self)
-        heading = QLabel("Manage Airfield Presets")
+        heading = QLabel("Manage Transposition Presets")
         heading.setObjectName("dialogTitle")
         root.addWidget(heading)
         explanation = QLabel(
-            "Each preset describes one directional runway end. Imported legacy "
-            "presets remain unchanged until you save them."
+            "Presets can contain runway, original-trace, and target-trace inputs. "
+            "This editor updates the runway section without changing other sections."
         )
         explanation.setObjectName("mutedText")
         explanation.setWordWrap(True)
@@ -384,12 +376,12 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
         library_layout = QVBoxLayout(library)
         library_layout.setContentsMargins(0, 0, 8, 0)
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search airfields…")
-        self.search_input.setAccessibleName("Search airfield presets")
+        self.search_input.setPlaceholderText("Search presets…")
+        self.search_input.setAccessibleName("Search transposition presets")
         self.search_input.textChanged.connect(self._filter_changed)
         library_layout.addWidget(self.search_input)
         self.preset_list = QListWidget()
-        self.preset_list.setAccessibleName("Managed airfield presets")
+        self.preset_list.setAccessibleName("Managed transposition presets")
         self.preset_list.currentItemChanged.connect(self._selection_changed)
         library_layout.addWidget(self.preset_list, 1)
         list_actions = QHBoxLayout()
@@ -406,12 +398,14 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
         editor_layout = QVBoxLayout(editor)
         editor_layout.setContentsMargins(8, 0, 0, 0)
         self.editor_form = AirfieldCard(
-            "Airfield details",
-            "Complete all five fields before saving this preset.",
+            "Runway details",
+            "Edit the runway geometry stored in this preset.",
             include_elevation=True,
             show_inference=False,
         )
         self.editor_form.preset_combo.hide()
+        self.editor_form.preset_label.hide()
+        self.editor_form.save_preset_btn.hide()
         editor_layout.addWidget(self.editor_form)
         self.editor_note = QLabel()
         self.editor_note.setObjectName("warningText")
@@ -453,11 +447,7 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
         for record in sorted(
             self.presets.values(), key=lambda item: item.preset.name.casefold()
         ):
-            try:
-                payload, _ = AirfieldPresetData.from_mapping(record.preset.data)
-                searchable = f"{record.preset.name} {payload.airfield_name} {payload.runway}"
-            except AirfieldPresetError:
-                searchable = record.preset.name
+            searchable = record.preset.name
             if query and query not in searchable.casefold():
                 continue
             item = QListWidgetItem(record.preset.name)
@@ -469,34 +459,32 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
 
     def apply_preset_data(self, data: Mapping[str, object]) -> None:
         try:
-            payload, warnings = AirfieldPresetData.from_mapping(data)
+            payload, warnings = TranspositionPresetData.from_mapping(data)
         except AirfieldPresetError as error:
             self.editor_form.clear_values()
             self.editor_note.setText(str(error))
             return
-        threshold = ""
-        if payload.threshold_latitude is not None and payload.threshold_longitude is not None:
-            threshold = (
-                f"{format_optional_number(payload.threshold_latitude)}, "
-                f"{format_optional_number(payload.threshold_longitude)}"
+        runway = payload.runway
+        if runway is None:
+            self.editor_form.clear_values()
+            self.editor_note.setText(
+                "This preset does not yet contain runway inputs. Enter them and save to add that section."
             )
+            return
+        threshold = ""
+        threshold = (
+            f"{format_optional_number(runway.threshold_latitude)}, "
+            f"{format_optional_number(runway.threshold_longitude)}"
+        )
         self.editor_form.set_values(
             AirfieldFormValues(
-                airfield_name=payload.airfield_name,
-                runway=payload.runway,
                 threshold=threshold,
-                true_heading=format_optional_number(payload.true_heading_deg),
-                elevation_m=format_optional_number(payload.elevation_m, 2),
+                true_heading=format_optional_number(runway.true_heading_deg),
+                elevation_m=format_optional_number(runway.elevation_m, 2),
             )
         )
         notes = list(warnings)
-        designator = normalise_runway_designator(payload.runway)
-        if designator.value and not designator.conventional:
-            notes.append(
-                "This preset uses a non-standard runway identifier and will require "
-                "confirmation when saved or used."
-            )
-        if payload.elevation_m is None:
+        if runway.elevation_m is None:
             notes.append("Enter an elevation before using this preset as an original airfield.")
         self.editor_note.setText("\n".join(notes))
 
@@ -528,42 +516,38 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
         values = self.editor_form.values()
         try:
             threshold = self.editor_form.coordinate_input.coordinates()
-            payload = AirfieldPresetData.validated(
-                airfield_name=values.airfield_name,
-                runway=values.runway,
+            runway = RunwayPresetSection.validated(
                 threshold=threshold,
                 true_heading_deg=values.true_heading,
                 elevation_m=values.elevation_m,
+                elevation_required=True,
             )
         except (AirfieldPresetError, CoordinateInputError) as error:
             self.editor_form.set_error(str(error))
             return
-        designator = normalise_runway_designator(payload.runway)
-        if not designator.conventional and not confirm_nonstandard_runways(
-            self,
-            ((payload.airfield_name or "Airfield", payload.runway, self.editor_form.runway_input),),
-            action="save this preset",
-        ):
-            return
-        self.editor_form.runway_input.setText(designator.value)
         try:
             if self._editing_id is None:
-                default_label = f"{payload.airfield_name} — RWY {payload.runway}"
                 label, accepted = QInputDialog.getText(
                     self,
-                    "Save Airfield Preset",
+                    "Save Transposition Preset",
                     "Preset name:",
-                    text=default_label,
                 )
                 if not accepted:
                     return
+                payload = TranspositionPresetData(runway=runway)
                 record = self.preset_repository.create(label, payload.to_mapping())
             else:
+                existing = self.presets.get(self._editing_id)
+                if existing is None:
+                    raise AirfieldPresetError("The selected preset is no longer available.")
+                payload, _ = TranspositionPresetData.from_mapping(
+                    existing.preset.data
+                )
                 record = self.preset_repository.update_data(
                     self._editing_id,
-                    payload.to_mapping(),
+                    payload.with_runway(runway).to_mapping(),
                 )
-        except PresetError as error:
+        except (AirfieldPresetError, PresetError) as error:
             QMessageBox.critical(self, "Preset Error", str(error))
             return
         self.presets = self.preset_repository.load_all()
@@ -574,7 +558,7 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
     def _import_preset(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import Airfield Preset",
+            "Import Transposition Preset",
             remembered_directory(
                 FileDialogWorkflow.AIRFIELD_PRESET,
                 FileDialogDirection.INPUT,
@@ -599,7 +583,7 @@ class AirfieldPresetManagerDialog(QDialog, PresetUiMixin):
             return
         answer = QMessageBox.question(
             self,
-            "Delete airfield preset?",
+            "Delete transposition preset?",
             f'Delete "{record.preset.name}" from managed presets?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,

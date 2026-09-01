@@ -16,6 +16,7 @@ from services.kml_export import KmlCoordinate, KmlLineString, render_kml
 from services.map_preview import TraceAdjustment
 from services.runway_alignment import RunwayReference
 from services.transpose_coordinates import (
+    ManualTranspositionAlignment,
     PreparedTranspositionBatch,
     TranspositionErrorCode,
     create_transposition_plan,
@@ -151,6 +152,81 @@ class TranspositionPreparationTests(unittest.TestCase):
         labels = tuple(item.trace.label for item in batch.prepared)
         self.assertEqual(len(set(labels)), 2)
         self.assertTrue(all(label.startswith("display — ") for label in labels))
+
+    def test_manual_alignment_uses_first_point_target_and_clockwise_delta(self):
+        source = self.fixture("line_string_namespaced.kml")
+        alignment = ManualTranspositionAlignment(52.0, 0.25, 35.0)
+
+        with patch(
+            "services.transpose_coordinates.transpose_wgs84_enu_points",
+            side_effect=lambda waypoints, *_: tuple(waypoints),
+        ) as transpose:
+            batch = prepare_transposition(
+                input_files=(source,),
+                alignments=(alignment,),
+            )
+
+        self.assertEqual(batch.failure_count, 0)
+        waypoints, source_origin, target_origin, rotation = transpose.call_args.args
+        self.assertEqual(source_origin, (51.2, -0.7))
+        self.assertEqual(target_origin, (52.0, 0.25))
+        self.assertEqual(rotation, 35.0)
+        self.assertEqual(tuple(point[2] for point in waypoints), (0.0, 0.0))
+        self.assertEqual(
+            batch.prepared[0].trace.anchor,
+            KmlCoordinate(longitude=0.25, latitude=52.0, altitude_m=0.0),
+        )
+
+    def test_manual_absolute_input_requires_ground_and_outputs_relative_height(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "absolute.kml"
+            source.write_text(
+                """<?xml version="1.0"?><kml><Placemark><LineString>
+<altitudeMode>absolute</altitudeMode>
+<coordinates>-1,51,100 -0.99,51.01,125</coordinates>
+</LineString></Placemark></kml>""",
+                encoding="utf-8",
+            )
+            missing = prepare_transposition(
+                input_files=(source,),
+                alignments=(ManualTranspositionAlignment(52.0, 0.0, 0.0),),
+            )
+            self.assertEqual(missing.failure_count, 1)
+            self.assertIn("ground-reference elevation", missing.failed_items[0].message)
+
+            with patch(
+                "services.transpose_coordinates.transpose_wgs84_enu_points",
+                side_effect=lambda waypoints, *_: tuple(waypoints),
+            ):
+                prepared = prepare_transposition(
+                    input_files=(source,),
+                    alignments=(
+                        ManualTranspositionAlignment(52.0, 0.0, 0.0, 70.0),
+                    ),
+                )
+
+        geometry = prepared.prepared[0].document.placemarks[0].geometry
+        self.assertEqual(
+            tuple(point.altitude_m for point in geometry.coordinates),
+            (30.0, 55.0),
+        )
+
+    def test_mixed_output_plan_uses_runway_and_manual_default_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = create_transposition_plan(
+                [
+                    self.fixture("gx_track.kml"),
+                    self.fixture("line_string_namespaced.kml"),
+                ],
+                temp_dir,
+                target_airfields=("Fairford", None),
+            )
+
+        self.assertEqual(plan.jobs[0].output_path.name, "gx-track-at-fairford.kml")
+        self.assertEqual(
+            plan.jobs[1].output_path.name,
+            "line-string-namespaced-transposed.kml",
+        )
 
 
 if __name__ == "__main__":
