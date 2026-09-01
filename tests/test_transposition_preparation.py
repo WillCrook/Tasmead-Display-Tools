@@ -63,6 +63,27 @@ class TranspositionPreparationTests(unittest.TestCase):
         self.assertEqual(geometry.altitude_mode, "relativeToGround")
         self.assertTrue(geometry.extrude_to_ground)
 
+    def test_preview_trace_identity_is_stable_by_source_path_and_not_sensitive(self):
+        source = self.fixture("line_string_namespaced.kml")
+        first = self.prepare(("line_string_namespaced.kml",))
+        reordered = self.prepare(("gx_track.kml", "line_string_namespaced.kml"))
+
+        first_id = first.prepared[0].trace.trace_id
+        reordered_id = next(
+            item.trace.trace_id
+            for item in reordered.prepared
+            if item.input_path == source
+        )
+
+        self.assertEqual(first_id, reordered_id)
+        self.assertRegex(first_id, r"\Atransposition-[0-9a-f]{24}\Z")
+        self.assertNotIn(source.name, first_id)
+        self.assertNotIn(str(source.parent), first_id)
+        self.assertEqual(
+            len({item.trace.trace_id for item in reordered.prepared}),
+            reordered.prepared_count,
+        )
+
     def test_preparation_failures_are_carried_into_later_export(self):
         inputs = (
             self.fixture("line_string_namespaced.kml"),

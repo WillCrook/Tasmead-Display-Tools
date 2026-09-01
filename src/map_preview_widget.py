@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 import threading
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 from PyQt6.QtCore import QObject, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
@@ -21,12 +23,14 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 
+from services.geodesy import inverse_distance_bearing
 from services.map_preview import PreviewScene, TraceAdjustment, preview_payload
 
 try:  # WebEngine is optional until the user requests a preview.
@@ -242,7 +246,10 @@ _PREVIEW_HTML = r"""<!doctype html>
     const state = {
       bridge: null, googleReady: false, chunks: new Map(), pending: null,
       map: null, payload: null, latestRevision: -1, renderTimeout: null,
-      generation: initialGeneration, cspFailed: false, cspDiagnostics: new Map()
+      generation: initialGeneration, cspFailed: false, cspDiagnostics: new Map(),
+      libraries: null, renderedTraces: new Map(), awaitingRevision: null,
+      toolMode: 'navigate',
+      measurement: {payload: {points: []}, line: null, markers: []}
     };
     const status = document.getElementById('state');
     const host = document.getElementById('map-host');
@@ -390,109 +397,230 @@ _PREVIEW_HTML = r"""<!doctype html>
       state.map.tilt = 60;
       state.map.heading = 0;
     }
-    async function render(payload, revision) {
+    function removeElement(element) {
+      if (element && typeof element.remove === 'function') element.remove();
+    }
+    function removeRenderedTrace(rendered) {
+      for (const item of rendered.geometries.values()) removeElement(item.element);
+      removeElement(rendered.anchor);
+    }
+    function updateGeometry(element, geometry) {
+      const {AltitudeMode} = state.libraries;
+      element.altitudeMode = altitudeMode(AltitudeMode, geometry.altitudeMode);
+      element.strokeColor = geometry.style.strokeColor;
+      element.strokeWidth = geometry.style.strokeWidth;
+      element.path = geometry.coordinates;
+      if (geometry.type === 'polyline') {
+        element.extruded = Boolean(geometry.extrude);
+        element.geodesic = Boolean(geometry.tessellate);
+      } else {
+        // KML's default PolyStyle is opaque white when no fill is supplied.
+        element.fillColor = geometry.style.fillColor || '#ffffffff';
+      }
+    }
+    function createGeometry(geometry) {
+      const {Polyline3DElement, Polygon3DElement} = state.libraries;
+      const element = geometry.type === 'polyline'
+        ? new Polyline3DElement()
+        : new Polygon3DElement();
+      updateGeometry(element, geometry);
+      state.map.append(element);
+      return element;
+    }
+    function createPin(options) {
+      const {PinElement} = state.libraries;
+      return PinElement ? new PinElement(options) : null;
+    }
+    function updateAnchor(rendered, trace) {
+      const {AltitudeMode, Marker3DElement} = state.libraries;
+      if (!Marker3DElement) return;
+      if (!rendered.anchor) {
+        rendered.anchor = new Marker3DElement({drawsWhenOccluded: true});
+        const pin = createPin({
+          background: '#ff00ff', borderColor: '#ffffff',
+          glyphColor: '#ffffff', glyphText: 'A'
+        });
+        if (pin && rendered.anchor.append) rendered.anchor.append(pin);
+        state.map.append(rendered.anchor);
+      }
+      rendered.anchor.position = {
+        lat: trace.anchor.lat,
+        lng: trace.anchor.lng,
+        altitude: trace.anchor.altitude
+      };
+      rendered.anchor.altitudeMode = altitudeMode(
+        AltitudeMode, trace.anchor.altitudeMode
+      );
+      rendered.anchor.label = trace.anchor.label;
+    }
+    function reconcileScene(payload) {
+      const retainedTraceIds = new Set();
+      for (const trace of payload.traces) {
+        const traceId = String(trace.id);
+        retainedTraceIds.add(traceId);
+        let rendered = state.renderedTraces.get(traceId);
+        if (!rendered) {
+          rendered = {geometries: new Map(), anchor: null};
+          state.renderedTraces.set(traceId, rendered);
+        }
+        const retainedGeometryIds = new Set();
+        for (const geometry of trace.geometries) {
+          const geometryId = String(geometry.id);
+          retainedGeometryIds.add(geometryId);
+          let item = rendered.geometries.get(geometryId);
+          if (!item || item.type !== geometry.type) {
+            if (item) removeElement(item.element);
+            item = {type: geometry.type, element: createGeometry(geometry)};
+            rendered.geometries.set(geometryId, item);
+          } else {
+            updateGeometry(item.element, geometry);
+          }
+        }
+        for (const [geometryId, item] of rendered.geometries) {
+          if (!retainedGeometryIds.has(geometryId)) {
+            removeElement(item.element);
+            rendered.geometries.delete(geometryId);
+          }
+        }
+        updateAnchor(rendered, trace);
+      }
+      for (const [traceId, rendered] of state.renderedTraces) {
+        if (!retainedTraceIds.has(traceId)) {
+          removeRenderedTrace(rendered);
+          state.renderedTraces.delete(traceId);
+        }
+      }
+    }
+    function reconcileMeasurement(payload) {
+      state.measurement.payload = payload && Array.isArray(payload.points)
+        ? payload : {points: []};
+      if (!state.map || !state.libraries) return;
+      const points = state.measurement.payload.points;
+      const {AltitudeMode, Marker3DElement, Polyline3DElement} = state.libraries;
+      if (points.length >= 2) {
+        if (!state.measurement.line) {
+          state.measurement.line = new Polyline3DElement();
+          state.map.append(state.measurement.line);
+        }
+        state.measurement.line.path = points;
+        state.measurement.line.altitudeMode = altitudeMode(
+          AltitudeMode, 'CLAMP_TO_GROUND'
+        );
+        state.measurement.line.strokeColor = '#22d3eeff';
+        state.measurement.line.strokeWidth = 5;
+        state.measurement.line.geodesic = true;
+      } else if (state.measurement.line) {
+        removeElement(state.measurement.line);
+        state.measurement.line = null;
+      }
+      while (state.measurement.markers.length > points.length) {
+        removeElement(state.measurement.markers.pop());
+      }
+      if (!Marker3DElement) return;
+      for (let index = 0; index < points.length; index += 1) {
+        let marker = state.measurement.markers[index];
+        if (!marker) {
+          marker = new Marker3DElement({drawsWhenOccluded: true});
+          const pin = createPin({
+            background: '#0891b2', borderColor: '#ffffff',
+            glyphColor: '#ffffff', glyphText: String(index + 1)
+          });
+          if (pin && marker.append) marker.append(pin);
+          state.measurement.markers.push(marker);
+          state.map.append(marker);
+        }
+        marker.position = points[index];
+        marker.altitudeMode = altitudeMode(AltitudeMode, 'CLAMP_TO_GROUND');
+        marker.label = 'Measurement point ' + String(index + 1);
+      }
+    }
+    function acknowledgeRevisionIfReady(isSteady) {
+      const revision = state.latestRevision;
+      if (state.bridge && revision >= 0) {
+        state.bridge.presentationStateChanged(
+          state.generation, revision, Boolean(isSteady)
+        );
+      }
+      if (!isSteady || state.awaitingRevision !== revision) return;
+      state.awaitingRevision = null;
+      if (state.renderTimeout) clearTimeout(state.renderTimeout);
+      state.renderTimeout = null;
+      setStatus('', true);
+      if (state.bridge) {
+        state.bridge.renderAcknowledged(state.generation, revision);
+      }
+    }
+    function ensureMap(payload) {
+      if (state.map) return false;
+      const {Map3DElement, MapMode} = state.libraries;
+      const map = new Map3DElement({
+        center: {
+          lat: payload.traces[0].anchor.lat,
+          lng: payload.traces[0].anchor.lng,
+          altitude: 0
+        },
+        range: 1500,
+        tilt: 60,
+        heading: 0,
+        mode: (MapMode && MapMode.HYBRID) || 'HYBRID'
+      });
+      map.addEventListener('gmp-error', () => fail(
+        'render',
+        'Google Maps 3D could not initialise. Check WebGL support and the Google project configuration.'
+      ));
+      map.addEventListener('gmp-map-id-error', () => fail(
+        'authentication',
+        'Google rejected the map configuration. Check the API key, restrictions, Maps JavaScript API access, and billing.'
+      ));
+      map.addEventListener('gmp-steadychange', event => {
+        if (!state.cspFailed) acknowledgeRevisionIfReady(Boolean(event.isSteady));
+      });
+      map.addEventListener('gmp-click', event => {
+        if (state.toolMode === 'navigate' || !event.position) return;
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        const latitude = Number(event.position.lat);
+        const longitude = Number(event.position.lng);
+        if (state.bridge && Number.isFinite(latitude) && Number.isFinite(longitude)) {
+          state.bridge.mapClicked(state.generation, latitude, longitude);
+        }
+      });
+      host.append(map);
+      state.map = map;
+      reconcileMeasurement(state.measurement.payload);
+      return true;
+    }
+    async function render(payload, revision, fitRequested=false) {
       if (state.cspFailed) return;
-      if (!state.googleReady) { state.pending = {payload, revision}; return; }
+      if (!state.googleReady) {
+        state.pending = {payload, revision, fitRequested};
+        return;
+      }
       try {
         if (state.bridge) state.bridge.renderStarted(state.generation, Number(revision));
-        setStatus('Rendering WGS84 trace geometry…');
-        const [maps3d, markerLibrary] = await Promise.all([
-          google.maps.importLibrary('maps3d'),
-          google.maps.importLibrary('marker')
-        ]);
+        if (!state.map) setStatus('Rendering WGS84 trace geometry…');
+        if (!state.libraries) {
+          const [maps3d, markerLibrary] = await Promise.all([
+            google.maps.importLibrary('maps3d'),
+            google.maps.importLibrary('marker')
+          ]);
+          state.libraries = {...maps3d, PinElement: markerLibrary.PinElement};
+        }
         if (state.cspFailed || Number(revision) !== state.latestRevision) return;
-        const {Map3DElement, MapMode, AltitudeMode, Polyline3DElement, Polygon3DElement} = maps3d;
+        const {Map3DElement, Polyline3DElement, Polygon3DElement} = state.libraries;
         if (!Map3DElement || !Polyline3DElement || !Polygon3DElement) {
           throw new Error('Required Maps 3D elements are unavailable.');
         }
-        host.replaceChildren();
-        const map = new Map3DElement({
-          center: {lat: payload.traces[0].anchor.lat, lng: payload.traces[0].anchor.lng, altitude: 0},
-          range: 1500,
-          tilt: 60,
-          heading: 0,
-          mode: (MapMode && MapMode.HYBRID) || 'HYBRID'
-        });
-        map.addEventListener('gmp-error', () => {
-          if (Number(revision) === state.latestRevision) {
-            fail('render', 'Google Maps 3D could not initialise. Check WebGL support and the Google project configuration.');
-          }
-        });
-        map.addEventListener('gmp-map-id-error', () => {
-          if (Number(revision) === state.latestRevision) {
-            fail('authentication', 'Google rejected the map configuration. Check the API key, restrictions, Maps JavaScript API access, and billing.');
-          }
-        });
-        let acknowledged = false;
-        map.addEventListener('gmp-steadychange', event => {
-          if (state.cspFailed || Number(revision) !== state.latestRevision) return;
-          const isSteady = Boolean(event.isSteady);
-          if (state.bridge) {
-            state.bridge.presentationStateChanged(
-              state.generation, Number(revision), isSteady
-            );
-          }
-          if (!isSteady || acknowledged) return;
-          acknowledged = true;
-          if (state.renderTimeout) clearTimeout(state.renderTimeout);
-          state.renderTimeout = null;
-          setStatus('', true);
-          if (state.bridge) state.bridge.renderAcknowledged(state.generation, Number(revision));
-        });
-        host.append(map);
-        state.map = map;
-        state.payload = payload;
-
-        const renderedAnchors = new Set();
-        for (const trace of payload.traces) {
-          for (const geometry of trace.geometries) {
-            const common = {
-              altitudeMode: altitudeMode(AltitudeMode, geometry.altitudeMode),
-              strokeColor: geometry.style.strokeColor,
-              strokeWidth: geometry.style.strokeWidth
-            };
-            if (geometry.type === 'polyline') {
-              map.append(new Polyline3DElement({
-                ...common,
-                path: geometry.coordinates,
-                extruded: Boolean(geometry.extrude),
-                geodesic: Boolean(geometry.tessellate)
-              }));
-            } else if (geometry.type === 'polygon') {
-              map.append(new Polygon3DElement({
-                ...common,
-                path: geometry.coordinates,
-                // KML's default PolyStyle is opaque white when no polygon
-                // colour sub-style is supplied.
-                fillColor: geometry.style.fillColor || '#ffffffff'
-              }));
-            }
-          }
-          const MarkerClass = maps3d.Marker3DElement;
-          const anchorKey = JSON.stringify([
-            trace.anchor.lat, trace.anchor.lng, trace.anchor.altitude,
-            trace.anchor.altitudeMode
-          ]);
-          if (MarkerClass && !renderedAnchors.has(anchorKey)) {
-            renderedAnchors.add(anchorKey);
-            const marker = new MarkerClass({
-              position: {lat: trace.anchor.lat, lng: trace.anchor.lng, altitude: trace.anchor.altitude},
-              altitudeMode: altitudeMode(AltitudeMode, trace.anchor.altitudeMode),
-              label: trace.anchor.label,
-              drawsWhenOccluded: true
-            });
-            if (markerLibrary.PinElement && marker.append) {
-              marker.append(new markerLibrary.PinElement({
-                background: '#ff00ff', borderColor: '#ffffff', glyphColor: '#ffffff', glyphText: 'A'
-              }));
-            }
-            map.append(marker);
-          }
+        if (!payload || payload.version !== 2 || !Array.isArray(payload.traces) || !payload.traces.length) {
+          throw new Error('Unsupported preview payload.');
         }
-        fitScene();
+        const mapCreated = ensureMap(payload);
+        state.awaitingRevision = Number(revision);
+        state.payload = payload;
+        reconcileScene(payload);
+        if (mapCreated || Boolean(fitRequested)) fitScene();
         if (state.renderTimeout) clearTimeout(state.renderTimeout);
         state.renderTimeout = setTimeout(() => {
-          if (!acknowledged && Number(revision) === state.latestRevision) {
+          if (state.awaitingRevision === Number(revision) && Number(revision) === state.latestRevision) {
             fail('render', 'Google Maps did not reach a stable rendered state. Check WebGL support and try again.');
           }
         }, 20000);
@@ -524,7 +652,7 @@ _PREVIEW_HTML = r"""<!doctype html>
         const item = state.chunks.get(Number(revision));
         if (item) item.parts.push(String(chunk));
       },
-      finishScene(revision) {
+      finishScene(revision, fitRequested=false) {
         const key = Number(revision);
         const item = state.chunks.get(key);
         if (!item || item.parts.length !== item.total) {
@@ -534,16 +662,23 @@ _PREVIEW_HTML = r"""<!doctype html>
         state.chunks.delete(key);
         state.latestRevision = key;
         if (state.cspFailed) return;
-        try { render(JSON.parse(item.parts.join('')), key); }
+        try { render(JSON.parse(item.parts.join('')), key, Boolean(fitRequested)); }
         catch (_) { fail('transport', 'The preview scene data was invalid.'); }
       },
+      setToolMode(mode) {
+        const requested = String(mode);
+        state.toolMode = ['navigate', 'measure', 'move-anchor'].includes(requested)
+          ? requested : 'navigate';
+        host.dataset.toolMode = state.toolMode;
+      },
+      setMeasurement(payload) { reconcileMeasurement(payload); },
       fitScene
     };
     window.tasmeadGoogleReady = () => {
       state.googleReady = true;
       if (!state.cspFailed && state.pending) {
         const pending = state.pending; state.pending = null;
-        render(pending.payload, pending.revision);
+        render(pending.payload, pending.revision, pending.fitRequested);
       }
     };
     new QWebChannel(qt.webChannelTransport, channel => {
@@ -643,6 +778,7 @@ class MapPreviewBridge(QObject):
     security_policy_violation = pyqtSignal(
         int, str, str, str, str, int, int, int
     )
+    map_clicked = pyqtSignal(int, float, float)
 
     @pyqtSlot(int)
     def shellReady(self, generation: int) -> None:  # noqa: N802 - called from JavaScript
@@ -687,6 +823,33 @@ class MapPreviewBridge(QObject):
                 revision, minimum=0, maximum=2_147_483_647
             ),
             bool(is_steady),
+        )
+
+    @pyqtSlot(int, float, float)
+    def mapClicked(  # noqa: N802 - called from JavaScript
+        self,
+        generation: int,
+        latitude: float,
+        longitude: float,
+    ) -> None:
+        try:
+            latitude_value = float(latitude)
+            longitude_value = float(longitude)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (
+            not math.isfinite(latitude_value)
+            or not math.isfinite(longitude_value)
+            or not -90.0 <= latitude_value <= 90.0
+            or not -180.0 <= longitude_value <= 180.0
+        ):
+            return
+        self.map_clicked.emit(
+            _clamped_diagnostic_number(
+                generation, minimum=0, maximum=2_147_483_647
+            ),
+            latitude_value,
+            longitude_value,
         )
 
     @pyqtSlot(int, str, str, str, str, int, int, int)
@@ -776,6 +939,9 @@ class MapPreviewWidget(QWidget):
         self._loading_controls = False
         self._loading_active = False
         self._presentation_active = False
+        self._tool_mode = "navigate"
+        self._measurement_points: list[tuple[float, float]] = []
+        self._fit_scene_on_next_render = False
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -861,6 +1027,52 @@ class MapPreviewWidget(QWidget):
         self.trace_selector.currentIndexChanged.connect(self._selected_trace_changed)
         panel.addWidget(self.trace_selector)
 
+        panel.addWidget(QLabel("Map tools", objectName="panelTitle"))
+        self.tool_mode_control = QFrame()
+        self.tool_mode_control.setAccessibleName("Map tool")
+        tool_row = QHBoxLayout(self.tool_mode_control)
+        tool_row.setContentsMargins(0, 0, 0, 0)
+        tool_row.setSpacing(8)
+        self.navigate_tool_button = QRadioButton("Navigate")
+        self.measure_tool_button = QRadioButton("Measure")
+        self.move_anchor_tool_button = QRadioButton("Move anchor")
+        self.tool_mode_group = QButtonGroup(self)
+        self.tool_mode_group.setExclusive(True)
+        for button, mode in (
+            (self.navigate_tool_button, "navigate"),
+            (self.measure_tool_button, "measure"),
+            (self.move_anchor_tool_button, "move-anchor"),
+        ):
+            self.tool_mode_group.addButton(button)
+            button.toggled.connect(
+                lambda checked, selected_mode=mode: self._tool_mode_changed(
+                    selected_mode,
+                    checked,
+                )
+            )
+            tool_row.addWidget(button)
+        panel.addWidget(self.tool_mode_control)
+
+        self.tool_help_label = QLabel("Drag to navigate the map.")
+        self.tool_help_label.setObjectName("mutedText")
+        self.tool_help_label.setWordWrap(True)
+        panel.addWidget(self.tool_help_label)
+
+        self.measurement_label = QLabel("Click two or more points to measure distance.")
+        self.measurement_label.setObjectName("mutedText")
+        self.measurement_label.setWordWrap(True)
+        self.measurement_label.setAccessibleName("Distance measurement")
+        panel.addWidget(self.measurement_label)
+        measurement_actions = QHBoxLayout()
+        self.undo_measurement_button = QPushButton("Undo point")
+        self.clear_measurement_button = QPushButton("Clear")
+        self.undo_measurement_button.clicked.connect(self._undo_measurement_point)
+        self.clear_measurement_button.clicked.connect(self._clear_measurement)
+        measurement_actions.addWidget(self.undo_measurement_button)
+        measurement_actions.addWidget(self.clear_measurement_button)
+        panel.addLayout(measurement_actions)
+        self.navigate_tool_button.setChecked(True)
+
         self.axis_controls: dict[str, QDoubleSpinBox] = {}
         specifications = (
             ("east_m", "X / East", -100_000.0, 100_000.0, " m"),
@@ -929,6 +1141,7 @@ class MapPreviewWidget(QWidget):
         splitter.setStretchFactor(1, 0)
         splitter.setSizes((900, 340))
         self._set_apply_enabled(False)
+        self._render_measurement_state()
 
         self._idle_message = (
             "The Google Maps 3D renderer starts only when a preview is requested."
@@ -1001,6 +1214,7 @@ class MapPreviewWidget(QWidget):
             bridge.security_policy_violation.connect(
                 self._on_security_policy_violation
             )
+            bridge.map_clicked.connect(self._on_map_clicked)
             web_view.loadFinished.connect(self._on_load_finished)
             if hasattr(page, "renderProcessTerminated"):
                 page.renderProcessTerminated.connect(
@@ -1021,6 +1235,7 @@ class MapPreviewWidget(QWidget):
     def _dispose_web_runtime(self) -> None:
         self._shell_ready_timer.stop()
         self._stop_presentation_watchdog(clear_activity=True)
+        self._fit_scene_on_next_render = False
         if self._web_view is not None:
             web_view = self._web_view
             self._web_view = None
@@ -1037,7 +1252,13 @@ class MapPreviewWidget(QWidget):
     def set_scene(self, scene: PreviewScene, api_key: str) -> bool:
         if not scene.traces:
             raise ValueError("A preview scene requires at least one trace.")
-        self._show_loading("Preparing preview…")
+        previous_trace_ids = (
+            frozenset(trace.trace_id for trace in self._scene.traces)
+            if self._scene is not None
+            else frozenset()
+        )
+        next_trace_ids = frozenset(trace.trace_id for trace in scene.traces)
+        trace_identity_changed = previous_trace_ids != next_trace_ids
         key = str(api_key).strip()
         reuse_session = (
             self._session_reusable
@@ -1046,6 +1267,10 @@ class MapPreviewWidget(QWidget):
             and self._server is not None
             and key == self._api_key
         )
+        if not reuse_session:
+            self._show_loading("Preparing preview…")
+        if trace_identity_changed:
+            self._clear_measurement()
         self._scene = scene
         self._committed_scene = scene
         self._api_key = key
@@ -1063,7 +1288,10 @@ class MapPreviewWidget(QWidget):
             )
             return False
         if reuse_session:
-            self._schedule_render(immediate=True)
+            self._schedule_render(
+                immediate=True,
+                fit_scene=trace_identity_changed,
+            )
             return True
         return self._reload_shell()
 
@@ -1145,9 +1373,15 @@ class MapPreviewWidget(QWidget):
         self._run_javascript(
             f"window.tasmead.loadGoogleMaps({json.dumps(self._api_key)});"
         )
+        self._sync_tool_mode()
         self._schedule_render(immediate=True)
 
-    def _schedule_render(self, *, immediate: bool = False) -> None:
+    def _schedule_render(
+        self,
+        *,
+        immediate: bool = False,
+        fit_scene: bool = False,
+    ) -> None:
         if (
             self._failed_generation == self._page_generation
             or self._csp_failed_generation == self._page_generation
@@ -1155,6 +1389,9 @@ class MapPreviewWidget(QWidget):
             self._set_apply_enabled(False)
             return
         self._session_reusable = False
+        self._fit_scene_on_next_render = (
+            self._fit_scene_on_next_render or fit_scene
+        )
         self._revision += 1
         self._acknowledged_revision = -1
         self._set_apply_enabled(False)
@@ -1189,16 +1426,26 @@ class MapPreviewWidget(QWidget):
             return
         chunks = [encoded[index:index + _CHUNK_SIZE] for index in range(0, len(encoded), _CHUNK_SIZE)] or [""]
         revision = self._revision
+        fit_scene = self._fit_scene_on_next_render
+        self._fit_scene_on_next_render = False
         self._run_javascript(f"window.tasmead.beginScene({revision}, {len(chunks)});")
         for chunk in chunks:
             self._run_javascript(
                 f"window.tasmead.appendSceneChunk({revision}, {json.dumps(chunk)});"
             )
-        self._run_javascript(f"window.tasmead.finishScene({revision});")
+        self._run_javascript(
+            "window.tasmead.finishScene("
+            f"{revision}, {'true' if fit_scene else 'false'}"
+            ");"
+        )
 
     def _run_javascript(self, source: str) -> None:
-        if self._web_view is not None:
-            self._web_view.page().runJavaScript(source)
+        if self._web_view is None:
+            return
+        page_getter = getattr(self._web_view, "page", None)
+        page = page_getter() if callable(page_getter) else None
+        if page is not None:
+            page.runJavaScript(source)
 
     def _on_render_started(self, generation: int, revision: int) -> None:
         if (
@@ -1229,12 +1476,12 @@ class MapPreviewWidget(QWidget):
             and self._server is not None
         )
         self.status_label.setText(
-            "Preview matches the quantized WGS84 geometry that will be exported. "
-            "The magenta anchor is a preview-only guide."
+            "Preview matches the quantized WGS84 geometry that will be exported."
         )
         self.retry_button.hide()
         self.open_settings_button.hide()
         self._set_apply_enabled(True)
+        self._sync_measurement_overlay()
 
     def _on_render_failed(self, generation: int, kind: str, message: str) -> None:
         if (
@@ -1380,6 +1627,177 @@ class MapPreviewWidget(QWidget):
         self.apply_button.setEnabled(enabled)
         self.apply_export_button.setEnabled(enabled)
 
+    def _tool_mode_changed(self, mode: str, checked: bool) -> None:
+        if not checked:
+            return
+        self._tool_mode = mode
+        if mode == "measure":
+            self.tool_help_label.setText(
+                "Click points on the map to measure a WGS84 surface path."
+            )
+        elif mode == "move-anchor":
+            self.tool_help_label.setText(
+                "Click a new map position for the selected trace anchor."
+            )
+        else:
+            self.tool_help_label.setText("Drag to navigate the map.")
+        self._render_measurement_state()
+        self._sync_tool_mode()
+
+    def _sync_tool_mode(self) -> None:
+        self._run_javascript(
+            "window.tasmead.setToolMode("
+            f"{json.dumps(self._tool_mode)}"
+            ");"
+        )
+
+    def _on_map_clicked(
+        self,
+        generation: int,
+        latitude: float,
+        longitude: float,
+    ) -> None:
+        if (
+            generation != self._page_generation
+            or self._failed_generation == generation
+            or self._csp_failed_generation == generation
+        ):
+            return
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90.0 <= latitude <= 90.0
+            or not -180.0 <= longitude <= 180.0
+        ):
+            return
+        if self._tool_mode == "measure":
+            self._measurement_points.append((latitude, longitude))
+            self._render_measurement_state()
+            self._sync_measurement_overlay()
+        elif self._tool_mode == "move-anchor":
+            self._move_selected_anchor(latitude, longitude)
+
+    def _move_selected_anchor(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> None:
+        if self._scene is None:
+            return
+        index = self.trace_selector.currentIndex()
+        if not 0 <= index < len(self._scene.traces):
+            return
+        try:
+            moved_trace = self._scene.traces[index].with_anchor_destination(
+                latitude,
+                longitude,
+            )
+        except (TypeError, ValueError) as error:
+            self.tool_help_label.setText(
+                str(error) or "The selected anchor position is invalid."
+            )
+            return
+
+        self._loading_controls = True
+        try:
+            self.axis_controls["east_m"].setValue(
+                moved_trace.adjustment.east_m
+            )
+            self.axis_controls["north_m"].setValue(
+                moved_trace.adjustment.north_m
+            )
+        finally:
+            self._loading_controls = False
+        adjustment = TraceAdjustment(
+            east_m=self.axis_controls["east_m"].value(),
+            north_m=self.axis_controls["north_m"].value(),
+            up_m=self.axis_controls["up_m"].value(),
+            yaw_deg=self.axis_controls["yaw_deg"].value(),
+        )
+        traces = list(self._scene.traces)
+        traces[index] = traces[index].with_adjustment(adjustment)
+        self._scene = PreviewScene(tuple(traces))
+        self.tool_help_label.setText(
+            "Anchor moved. Click another position to refine it, or switch to Navigate."
+        )
+        self._schedule_render(immediate=True)
+
+    @staticmethod
+    def _format_metric_distance(distance_m: float) -> str:
+        if distance_m < 1_000.0:
+            return f"{distance_m:.1f} m"
+        return f"{distance_m / 1_000.0:.3f} km"
+
+    @staticmethod
+    def _format_nautical_distance(distance_m: float) -> str:
+        nautical_miles = distance_m / 1_852.0
+        places = 3 if nautical_miles < 10.0 else 2
+        return f"{nautical_miles:.{places}f} NM"
+
+    def _measurement_distances(self) -> tuple[float, float]:
+        distances = tuple(
+            inverse_distance_bearing(*start, *end)[0]
+            for start, end in zip(
+                self._measurement_points,
+                self._measurement_points[1:],
+            )
+        )
+        return (distances[-1], sum(distances)) if distances else (0.0, 0.0)
+
+    def _render_measurement_state(self) -> None:
+        point_count = len(self._measurement_points)
+        visible = self._tool_mode == "measure" or point_count > 0
+        self.measurement_label.setVisible(visible)
+        self.undo_measurement_button.setVisible(visible)
+        self.clear_measurement_button.setVisible(visible)
+        self.undo_measurement_button.setEnabled(point_count > 0)
+        self.clear_measurement_button.setEnabled(point_count > 0)
+        if point_count == 0:
+            self.measurement_label.setText(
+                "Click two or more points to measure distance."
+            )
+        elif point_count == 1:
+            self.measurement_label.setText(
+                "1 point selected. Click another point to measure a leg."
+            )
+        else:
+            last_leg_m, total_m = self._measurement_distances()
+            self.measurement_label.setText(
+                f"Last leg: {self._format_nautical_distance(last_leg_m)} / "
+                f"{self._format_metric_distance(last_leg_m)}\n"
+                f"Total: {self._format_nautical_distance(total_m)} / "
+                f"{self._format_metric_distance(total_m)}"
+            )
+
+    def _sync_measurement_overlay(self) -> None:
+        payload = {
+            "points": [
+                {"lat": latitude, "lng": longitude, "altitude": 0.0}
+                for latitude, longitude in self._measurement_points
+            ]
+        }
+        self._run_javascript(
+            "window.tasmead.setMeasurement("
+            f"{json.dumps(payload, separators=(',', ':'))}"
+            ");"
+        )
+
+    def _undo_measurement_point(self, _checked: bool = False) -> None:
+        if self._measurement_points:
+            self._measurement_points.pop()
+        self._render_measurement_state()
+        self._sync_measurement_overlay()
+
+    def _clear_measurement(self, _checked: bool = False) -> None:
+        self._measurement_points.clear()
+        self._render_measurement_state()
+        self._sync_measurement_overlay()
+
     def _selected_trace_changed(self, _index: int) -> None:
         self._load_selected_adjustment()
 
@@ -1473,6 +1891,14 @@ class MapPreviewWidget(QWidget):
         self._api_key = ""
         self._scene = None
         self._committed_scene = None
+        self._measurement_points.clear()
+        self._fit_scene_on_next_render = False
+        self.navigate_tool_button.blockSignals(True)
+        self.navigate_tool_button.setChecked(True)
+        self.navigate_tool_button.blockSignals(False)
+        self._tool_mode = "navigate"
+        self.tool_help_label.setText("Drag to navigate the map.")
+        self._render_measurement_state()
         self._show_idle_state()
 
 

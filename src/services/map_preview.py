@@ -13,7 +13,7 @@ import math
 import re
 from typing import Any
 
-from .geodesy import EnuCoordinate, LocalEnuFrame
+from .geodesy import EnuCoordinate, LocalEnuFrame, inverse_distance_bearing
 from .kml_export import (
     KmlCoordinate,
     KmlDocument,
@@ -327,6 +327,67 @@ class PreparedTrace:
 
         return replace(self, adjustment=adjustment)
 
+    @property
+    def adjusted_anchor(self) -> KmlCoordinate:
+        """Return the trace anchor after its current ENU translation."""
+
+        frame = LocalEnuFrame(self.anchor.latitude, self.anchor.longitude)
+        latitude, longitude = frame.to_wgs84(
+            EnuCoordinate(
+                east_m=self.adjustment.east_m,
+                north_m=self.adjustment.north_m,
+                up_m=0.0,
+            )
+        )
+        altitude = (
+            self.adjustment.up_m
+            if self.anchor_altitude_mode == "clampToGround"
+            and self.adjustment.up_m != 0.0
+            else self.anchor.altitude_m + self.adjustment.up_m
+        )
+        return KmlCoordinate(longitude, latitude, altitude)
+
+    @property
+    def adjusted_anchor_altitude_mode(self) -> str:
+        if (
+            self.anchor_altitude_mode == "clampToGround"
+            and self.adjustment.up_m != 0.0
+        ):
+            return "relativeToGround"
+        return self.anchor_altitude_mode
+
+    def with_anchor_destination(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> PreparedTrace:
+        """Move the anchor to one WGS84 destination without cumulative drift."""
+
+        destination = _validated_coordinate(
+            KmlCoordinate(longitude, latitude, self.anchor.altitude_m),
+            "Anchor destination",
+        )
+        surface_distance_m, _ = inverse_distance_bearing(
+            self.anchor.latitude,
+            self.anchor.longitude,
+            destination.latitude,
+            destination.longitude,
+        )
+        if surface_distance_m > math.sqrt(2.0) * MAX_HORIZONTAL_OFFSET_M:
+            raise ValueError(
+                "Anchor destination is outside the supported "
+                "±100000 m East/North adjustment bounds."
+            )
+        frame = LocalEnuFrame(self.anchor.latitude, self.anchor.longitude)
+        position = frame.to_enu(destination.latitude, destination.longitude)
+        return self.with_adjustment(
+            replace(
+                self.adjustment,
+                east_m=position.east_m,
+                north_m=position.north_m,
+            )
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PreviewScene:
@@ -389,9 +450,11 @@ def _style_payload(style: KmlStyle) -> dict[str, object]:
 def _geometry_payload(
     placemark: KmlPlacemark,
     style: KmlStyle,
+    geometry_id: str,
 ) -> dict[str, object]:
     geometry = placemark.geometry
     common: dict[str, object] = {
+        "id": geometry_id,
         "name": placemark.name,
         "description": placemark.description,
         "style": _style_payload(style),
@@ -434,7 +497,7 @@ def preview_payload(scene: PreviewScene) -> dict[str, Any]:
                 raise ValueError(f'Duplicate KML style ID "{style.style_id}".')
             styles[style.style_id] = style
         geometries: list[dict[str, object]] = []
-        for placemark in document.placemarks:
+        for geometry_index, placemark in enumerate(document.placemarks):
             if not placemark.style_url.startswith("#"):
                 raise ValueError(
                     f'Placemark "{placemark.name}" has an invalid style URL.'
@@ -445,9 +508,15 @@ def preview_payload(scene: PreviewScene) -> dict[str, Any]:
                 raise ValueError(
                     f'Placemark "{placemark.name}" references an unknown KML style.'
                 ) from error
-            geometries.append(_geometry_payload(placemark, style))
+            geometries.append(
+                _geometry_payload(
+                    placemark,
+                    style,
+                    f"geometry-{geometry_index}",
+                )
+            )
 
-        anchor = _quantized_coordinate(trace.anchor)
+        anchor = _quantized_coordinate(trace.adjusted_anchor)
         traces.append(
             {
                 "id": trace.trace_id,
@@ -461,15 +530,15 @@ def preview_payload(scene: PreviewScene) -> dict[str, Any]:
                 "anchor": {
                     **_coordinate_payload(anchor),
                     "altitudeMode": _maps_altitude_mode(
-                        trace.anchor_altitude_mode
+                        trace.adjusted_anchor_altitude_mode
                     ),
-                    "label": "Fixed anchor",
+                    "label": "Trace anchor",
                     "color": "#ff00ffff",
                 },
                 "geometries": geometries,
             }
         )
-    return {"version": 1, "traces": traces}
+    return {"version": 2, "traces": traces}
 
 
 __all__ = [

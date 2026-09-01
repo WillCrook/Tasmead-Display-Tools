@@ -63,6 +63,14 @@ Maps 3D's closest available geodesic-line behaviour, and Maps 3D does not expose
 an independent KML PolyStyle colour for an extruded LineString curtain; these
 renderer-only differences do not alter the exported vertices or KML values.
 
+The preview retains its map and camera while offsets are edited. **Measure**
+collects a transient WGS84 surface path and reports nautical miles with metric
+units; **Move anchor** repositions the selected trace with a map click using the
+same local ENU transformation as the numeric East and North controls. Use
+**Recentre view** to fit the active traces explicitly. Measurements are never
+saved or exported, and moving an anchor changes only the adjusted preview and
+export document, not the source KML file.
+
 ## Authors
 Will Crook – Tasmead Display Tool
 [GitHub](https://github.com/WillCrook)

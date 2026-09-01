@@ -8,7 +8,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from services.geodesy import EnuCoordinate, LocalEnuFrame
+from services.geodesy import (
+    EnuCoordinate,
+    LocalEnuFrame,
+    destination_point,
+    inverse_distance_bearing,
+)
 from services.kml_export import (
     KML_NAMESPACE,
     KmlCoordinate,
@@ -231,6 +236,115 @@ class EnuAdjustmentTests(unittest.TestCase):
         self.assertEqual(second.adjusted_document, direct.adjusted_document)
         self.assertEqual(second.adjustment.east_m, 0.0)
 
+    def test_anchor_destination_preserves_up_and_yaw_and_is_non_cumulative(self):
+        trace = PreparedTrace(
+            "route",
+            "Route",
+            ANCHOR,
+            _document(),
+            TraceAdjustment(east_m=20.0, north_m=30.0, up_m=45.0, yaw_deg=12.0),
+        )
+        first_destination = destination_point(
+            ANCHOR.latitude,
+            ANCHOR.longitude,
+            750.0,
+            105.0,
+        )
+        second_destination = destination_point(
+            ANCHOR.latitude,
+            ANCHOR.longitude,
+            1_250.0,
+            315.0,
+        )
+
+        first = trace.with_anchor_destination(*first_destination)
+        second = first.with_anchor_destination(*second_destination)
+        direct = trace.with_anchor_destination(*second_destination)
+
+        self.assertEqual(first.adjustment.up_m, 45.0)
+        self.assertEqual(first.adjustment.yaw_deg, 12.0)
+        self.assertEqual(second.adjustment, direct.adjustment)
+        self.assertEqual(second.adjusted_document, direct.adjusted_document)
+        self.assertAlmostEqual(
+            first.adjusted_anchor.latitude,
+            first_destination[0],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            first.adjusted_anchor.longitude,
+            first_destination[1],
+            places=6,
+        )
+        line = first.adjusted_document.placemarks[0].geometry
+        first_point = LocalEnuFrame(
+            ANCHOR.latitude,
+            ANCHOR.longitude,
+        ).to_enu(line.coordinates[0].latitude, line.coordinates[0].longitude)
+        second_point = LocalEnuFrame(
+            ANCHOR.latitude,
+            ANCHOR.longitude,
+        ).to_enu(line.coordinates[1].latitude, line.coordinates[1].longitude)
+        yaw = math.radians(first.adjustment.yaw_deg)
+        expected_east_delta = 10.0 * math.cos(yaw) + 20.0 * math.sin(yaw)
+        expected_north_delta = -10.0 * math.sin(yaw) + 20.0 * math.cos(yaw)
+        self.assertAlmostEqual(
+            second_point.east_m - first_point.east_m,
+            expected_east_delta,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            second_point.north_m - first_point.north_m,
+            expected_north_delta,
+            places=2,
+        )
+
+    def test_anchor_destination_enforces_existing_horizontal_bounds(self):
+        trace = PreparedTrace("route", "Route", ANCHOR, _document())
+        destination = destination_point(
+            ANCHOR.latitude,
+            ANCHOR.longitude,
+            150_000.0,
+            90.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "adjustment bounds"):
+            trace.with_anchor_destination(*destination)
+
+        with self.assertRaisesRegex(ValueError, "adjustment bounds"):
+            trace.with_anchor_destination(-ANCHOR.latitude, 179.0)
+
+        self.assertTrue(trace.adjustment.is_zero)
+
+    def test_anchor_destination_handles_high_latitude_antimeridian_crossing(self):
+        anchor = KmlCoordinate(179.99, 82.0, 0.0)
+        frame = LocalEnuFrame(anchor.latitude, anchor.longitude)
+        start = _point(frame, 0.0, 0.0, 10.0)
+        document = KmlDocument(
+            name="Polar",
+            styles=(KmlStyle("path", "ffffffff", 1.0),),
+            placemarks=(
+                KmlPlacemark(
+                    "Path",
+                    "#path",
+                    KmlLineString((start, start), "absolute"),
+                ),
+            ),
+        )
+        trace = PreparedTrace("polar", "Polar", anchor, document)
+        destination = destination_point(anchor.latitude, anchor.longitude, 25_000.0, 90.0)
+
+        moved = trace.with_anchor_destination(*destination)
+
+        self.assertLess(destination[1], 0.0)
+        anchor_error_m, _ = inverse_distance_bearing(
+            moved.adjusted_anchor.latitude,
+            moved.adjusted_anchor.longitude,
+            *destination,
+        )
+        self.assertLess(anchor_error_m, 1.0)
+        self.assertLess(abs(moved.adjustment.east_m), 100_000.0)
+        self.assertLess(abs(moved.adjustment.north_m), 100_000.0)
+
     def test_high_latitude_antimeridian_adjustment_remains_in_requested_enu_frame(self):
         anchor = KmlCoordinate(179.9999, 82.0, 0.0)
         frame = LocalEnuFrame(anchor.latitude, anchor.longitude)
@@ -297,11 +411,22 @@ class CanonicalPayloadTests(unittest.TestCase):
         line_payload, polygon_payload = payload_trace["geometries"]
         line = trace.adjusted_document.placemarks[0].geometry
         polygon = trace.adjusted_document.placemarks[1].geometry
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], 2)
         self.assertEqual(payload_trace["id"], "route-1")
-        self.assertEqual(payload_trace["anchor"]["label"], "Fixed anchor")
+        self.assertEqual(payload_trace["anchor"]["label"], "Trace anchor")
         self.assertEqual(payload_trace["anchor"]["color"], "#ff00ffff")
         self.assertEqual(payload_trace["anchor"]["altitudeMode"], "ABSOLUTE")
+        self.assertAlmostEqual(
+            payload_trace["anchor"]["lat"],
+            round(trace.adjusted_anchor.latitude, 7),
+        )
+        self.assertAlmostEqual(
+            payload_trace["anchor"]["lng"],
+            round(trace.adjusted_anchor.longitude, 7),
+        )
+        self.assertEqual(payload_trace["anchor"]["altitude"], 84.5)
+        self.assertEqual(line_payload["id"], "geometry-0")
+        self.assertEqual(polygon_payload["id"], "geometry-1")
         self.assertEqual(line_payload["type"], "polyline")
         self.assertEqual(line_payload["altitudeMode"], "ABSOLUTE")
         self.assertTrue(line_payload["extrude"])
@@ -320,6 +445,20 @@ class CanonicalPayloadTests(unittest.TestCase):
         self.assertEqual(polygon_payload["style"]["strokeWidth"], 2.501)
         self.assertEqual(polygon_payload["style"]["fillColor"], "#20304080")
         self.assertEqual(len(polygon_payload["coordinates"]), len(polygon.outer_ring))
+
+    def test_payload_anchor_uses_relative_mode_when_a_clamped_trace_is_lifted(self):
+        trace = PreparedTrace(
+            "route-1",
+            "Route 1",
+            ANCHOR,
+            _document(),
+            TraceAdjustment(up_m=15.0),
+        )
+
+        anchor = preview_payload(PreviewScene((trace,)))["traces"][0]["anchor"]
+
+        self.assertEqual(anchor["altitude"], 15.0)
+        self.assertEqual(anchor["altitudeMode"], "RELATIVE_TO_GROUND")
 
     def test_colour_conversion_is_exact_and_rejects_invalid_input(self):
         self.assertEqual(kml_colour_to_css("aaff00ff"), "#ff00ffaa")

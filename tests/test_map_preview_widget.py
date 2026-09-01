@@ -43,8 +43,11 @@ from services import (
     KmlLineString,
     KmlPlacemark,
     KmlStyle,
+    LocalEnuFrame,
     PreparedTrace,
     PreviewScene,
+    TraceAdjustment,
+    destination_point,
 )
 
 
@@ -237,7 +240,138 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertIn("gmp-steadychange", _PREVIEW_HTML)
         self.assertIn("presentationStateChanged", _PREVIEW_HTML)
         self.assertIn("Number(revision) !== state.latestRevision", _PREVIEW_HTML)
-        self.assertIn("geodesic: Boolean(geometry.tessellate)", _PREVIEW_HTML)
+        self.assertIn("element.geodesic = Boolean(geometry.tessellate)", _PREVIEW_HTML)
+
+    def test_shell_retains_map_and_reconciles_overlays_by_stable_identity(self):
+        self.assertEqual(_PREVIEW_HTML.count("new Map3DElement("), 1)
+        self.assertNotIn("host.replaceChildren()", _PREVIEW_HTML)
+        self.assertIn("renderedTraces: new Map()", _PREVIEW_HTML)
+        self.assertIn("const geometryId = String(geometry.id)", _PREVIEW_HTML)
+        self.assertIn("element.path = geometry.coordinates", _PREVIEW_HTML)
+        self.assertIn("removeElement(item.element)", _PREVIEW_HTML)
+        self.assertIn(
+            "if (mapCreated || Boolean(fitRequested)) fitScene();",
+            _PREVIEW_HTML,
+        )
+
+    def test_map_tool_modes_are_accessible_exclusive_and_default_to_navigation(self):
+        self.assertTrue(self.widget.tool_mode_group.exclusive())
+        self.assertTrue(self.widget.navigate_tool_button.isChecked())
+        self.assertEqual(self.widget.tool_mode_control.accessibleName(), "Map tool")
+
+        self.widget.measure_tool_button.setChecked(True)
+        self.assertFalse(self.widget.navigate_tool_button.isChecked())
+        self.assertTrue(self.widget.measure_tool_button.isChecked())
+        self.assertEqual(self.widget._tool_mode, "measure")
+
+        self.widget.move_anchor_tool_button.setChecked(True)
+        self.assertFalse(self.widget.measure_tool_button.isChecked())
+        self.assertTrue(self.widget.move_anchor_tool_button.isChecked())
+        self.assertEqual(self.widget._tool_mode, "move-anchor")
+
+    def test_bridge_emits_only_valid_map_click_coordinates(self):
+        bridge = MapPreviewBridge()
+        clicks = QSignalSpy(bridge.map_clicked)
+
+        bridge.mapClicked(7, 51.25, -1.5)
+        bridge.mapClicked(7, float("nan"), -1.5)
+        bridge.mapClicked(7, 91.0, -1.5)
+        bridge.mapClicked(7, 51.25, 181.0)
+
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(list(clicks[0]), [7, 51.25, -1.5])
+
+    def test_measurement_collects_wgs84_legs_and_remains_until_cleared(self):
+        self.widget._page_generation = 3
+        with patch.object(self.widget, "_run_javascript") as javascript:
+            self.widget.measure_tool_button.setChecked(True)
+            initial_revision = self.widget._revision
+            self.widget._on_map_clicked(3, 51.0, -1.0)
+            self.widget._on_map_clicked(3, 51.001, -1.0)
+
+            self.assertEqual(len(self.widget._measurement_points), 2)
+            self.assertEqual(self.widget._revision, initial_revision)
+            self.assertIn("Last leg:", self.widget.measurement_label.text())
+            self.assertIn("Total:", self.widget.measurement_label.text())
+            self.assertIn(" NM", self.widget.measurement_label.text())
+            self.assertIn(" m", self.widget.measurement_label.text())
+
+            self.widget.navigate_tool_button.setChecked(True)
+            self.widget._on_map_clicked(3, 51.002, -1.0)
+            self.assertEqual(len(self.widget._measurement_points), 2)
+            self.assertFalse(self.widget.measurement_label.isHidden())
+
+            self.widget.measure_tool_button.setChecked(True)
+            self.widget._on_map_clicked(3, 51.02, -1.0)
+            self.assertIn(" km", self.widget.measurement_label.text())
+            self.widget.undo_measurement_button.click()
+            self.assertEqual(len(self.widget._measurement_points), 2)
+            self.widget.clear_measurement_button.click()
+            self.assertFalse(self.widget._measurement_points)
+
+        self.assertTrue(
+            any("setMeasurement" in call.args[0] for call in javascript.call_args_list)
+        )
+
+    def test_widget_ignores_stale_and_invalid_map_clicks(self):
+        self.widget._page_generation = 5
+        self.widget.measure_tool_button.setChecked(True)
+
+        self.widget._on_map_clicked(4, 51.0, -1.0)
+        self.widget._on_map_clicked(5, float("inf"), -1.0)
+        self.widget._on_map_clicked(5, 51.0, 200.0)
+
+        self.assertFalse(self.widget._measurement_points)
+
+    def test_move_anchor_updates_selected_trace_controls_and_scene_in_place(self):
+        scene = scene_with_two_traces()
+        traces = list(scene.traces)
+        traces[0] = traces[0].with_adjustment(
+            TraceAdjustment(up_m=25.0, yaw_deg=7.5)
+        )
+        scene = PreviewScene(tuple(traces))
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(scene, "test-key")
+        self.widget._failed_generation = None
+        self.widget._page_generation = 4
+        self.widget.move_anchor_tool_button.setChecked(True)
+        destination = destination_point(51.0, -1.0, 1_000.0, 90.0)
+
+        with patch.object(self.widget, "_schedule_render") as render:
+            self.widget._on_map_clicked(4, *destination)
+
+        moved = self.widget.scene.traces[0]
+        position = LocalEnuFrame(51.0, -1.0).to_enu(*destination)
+        self.assertAlmostEqual(moved.adjustment.east_m, position.east_m, places=1)
+        self.assertAlmostEqual(moved.adjustment.north_m, position.north_m, places=1)
+        self.assertEqual(moved.adjustment.up_m, 25.0)
+        self.assertEqual(moved.adjustment.yaw_deg, 7.5)
+        self.assertTrue(self.widget.scene.traces[1].adjustment.is_zero)
+        self.assertEqual(
+            self.widget.axis_controls["east_m"].value(),
+            moved.adjustment.east_m,
+        )
+        self.assertEqual(
+            self.widget.axis_controls["north_m"].value(),
+            moved.adjustment.north_m,
+        )
+        render.assert_called_once_with(immediate=True)
+
+    def test_out_of_bounds_anchor_click_leaves_scene_unchanged(self):
+        scene = scene_with_two_traces()
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(scene, "test-key")
+        self.widget._failed_generation = None
+        self.widget._page_generation = 4
+        self.widget.move_anchor_tool_button.setChecked(True)
+        destination = destination_point(51.0, -1.0, 150_000.0, 90.0)
+
+        with patch.object(self.widget, "_schedule_render") as render:
+            self.widget._on_map_clicked(4, *destination)
+
+        self.assertIs(self.widget.scene, scene)
+        self.assertIn("adjustment bounds", self.widget.tool_help_label.text())
+        render.assert_not_called()
 
     def test_authentication_failure_offers_settings_and_disables_apply(self):
         self.widget._on_render_acknowledged(
@@ -350,7 +484,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertFalse(self.widget.loading_screen.isHidden())
         self.assertTrue(self.widget.loading_progress.isHidden())
 
-    def test_retry_and_reused_scene_show_the_loading_screen(self):
+    def test_retry_shows_loader_but_reused_scene_keeps_existing_map_visible(self):
         class FakeWebView:
             def update(self):
                 return None
@@ -374,6 +508,8 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.widget._shell_ready = True
         self.widget._session_reusable = True
         self.widget._api_key = "same-key"
+        self.widget._scene = scene_with_two_traces()
+        self.widget._measurement_points = [(51.0, -1.0), (51.001, -1.0)]
         self.widget._hide_loading()
         try:
             with patch.object(self.widget, "_schedule_render") as render:
@@ -381,9 +517,21 @@ class MapPreviewControlsTests(unittest.TestCase):
                     self.widget.set_scene(scene_with_two_traces(), "same-key")
                 )
 
-            self.assertTrue(self.widget._loading_active)
-            self.assertEqual(self.widget.loading_message.text(), "Preparing preview…")
-            render.assert_called_once_with(immediate=True)
+            self.assertFalse(self.widget._loading_active)
+            self.assertTrue(self.widget.loading_screen.isHidden())
+            self.assertEqual(len(self.widget._measurement_points), 2)
+            render.assert_called_once_with(immediate=True, fit_scene=False)
+
+            different_scene = PreviewScene(
+                (scene_with_two_traces().traces[0],)
+            )
+            with patch.object(self.widget, "_schedule_render") as render:
+                self.assertTrue(
+                    self.widget.set_scene(different_scene, "same-key")
+                )
+
+            self.assertFalse(self.widget._measurement_points)
+            render.assert_called_once_with(immediate=True, fit_scene=True)
 
             self.widget._hide_loading()
             retry_web_view = FakeRetryWebView()
@@ -579,7 +727,7 @@ class MapPreviewControlsTests(unittest.TestCase):
                 )
 
             self.assertTrue(started)
-            render.assert_called_once_with(immediate=True)
+            render.assert_called_once_with(immediate=True, fit_scene=True)
             reload_shell.assert_not_called()
         finally:
             self.widget._web_view = None
@@ -784,6 +932,36 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertIn("too large", self.widget.status_label.text())
         self.assertIn("No vertices were simplified", self.widget.status_label.text())
         self.assertFalse(self.widget.apply_button.isEnabled())
+
+    def test_render_transport_coalesces_fit_requests_and_consumes_them_once(self):
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(scene_with_two_traces(), "test-key")
+        self.widget._failed_generation = None
+        self.widget._shell_ready = True
+
+        with patch.object(self.widget, "_run_javascript") as javascript:
+            self.widget._schedule_render(fit_scene=True)
+            self.widget._render_timer.stop()
+            self.widget._schedule_render()
+            self.widget._render_timer.stop()
+            self.widget._render_scene()
+            first_finish = next(
+                call.args[0]
+                for call in reversed(javascript.call_args_list)
+                if "finishScene" in call.args[0]
+            )
+            self.assertIn("true", first_finish)
+
+            javascript.reset_mock()
+            self.widget._schedule_render()
+            self.widget._render_timer.stop()
+            self.widget._render_scene()
+            second_finish = next(
+                call.args[0]
+                for call in reversed(javascript.call_args_list)
+                if "finishScene" in call.args[0]
+            )
+            self.assertIn("false", second_finish)
 
 
 @unittest.skipUnless(
@@ -1000,6 +1178,44 @@ class LiveGoogleMapsCspSmokeTests(unittest.TestCase):
         QTimer.singleShot(milliseconds, loop.quit)
         loop.exec()
 
+    def _evaluate_javascript(self, widget, source, timeout_ms=5_000):
+        results = []
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(timeout_ms)
+        widget._web_view.page().runJavaScript(
+            source,
+            lambda value: (results.append(value), loop.quit()),
+        )
+        if not results:
+            loop.exec()
+        timer.stop()
+        self.assertTrue(results, "The live Maps JavaScript probe timed out.")
+        return results[0]
+
+    def _map_snapshot(self, widget):
+        return self._evaluate_javascript(
+            widget,
+            "(() => {"
+            "const map = document.querySelector('gmp-map-3d');"
+            "const line = map && map.querySelector('gmp-polyline-3d');"
+            "const path = line && line.path;"
+            "const point = path && (Array.isArray(path) ? path[0] : "
+            "(typeof path.getAt === 'function' ? path.getAt(0) : null));"
+            "const scalar = value => typeof value === 'function' ? value() : value;"
+            "return map ? {"
+            "retained: Boolean(map.__tasmeadRetainedSmoke),"
+            "center: {lat: scalar(map.center.lat), lng: scalar(map.center.lng), "
+            "altitude: scalar(map.center.altitude || 0)},"
+            "range: Number(map.range), tilt: Number(map.tilt), heading: Number(map.heading),"
+            "point: point ? {lat: scalar(point.lat), lng: scalar(point.lng), "
+            "altitude: scalar(point.altitude || 0)} : null"
+            "} : null;"
+            "})()",
+        )
+
     def test_live_map_reaches_steady_state_without_csp_failures(self):
         widget = MapPreviewWidget()
         try:
@@ -1020,6 +1236,21 @@ class LiveGoogleMapsCspSmokeTests(unittest.TestCase):
             self._settle_events()
             self.assertTrue(widget.apply_button.isEnabled())
             self.assertEqual(len(violations), 0)
+
+            configured = self._evaluate_javascript(
+                widget,
+                "(() => {"
+                "const map = document.querySelector('gmp-map-3d');"
+                "map.__tasmeadRetainedSmoke = true;"
+                "map.center = {lat: 51.005, lng: -1.005, altitude: 100};"
+                "map.range = 3210; map.tilt = 47; map.heading = 19;"
+                "return true;"
+                "})()",
+            )
+            self.assertTrue(configured)
+            self._settle_events()
+            before_adjustment = self._map_snapshot(widget)
+            self.assertIsNotNone(before_adjustment["point"])
 
             first_generation = widget._page_generation
             widget.hide()
@@ -1055,6 +1286,18 @@ class LiveGoogleMapsCspSmokeTests(unittest.TestCase):
             self.assertGreater(widget._revision, first_revision)
             self.assertTrue(widget.apply_button.isEnabled())
             self.assertEqual(len(violations), 0)
+            after_adjustment = self._map_snapshot(widget)
+            self.assertTrue(after_adjustment["retained"])
+            for axis in ("lat", "lng", "altitude"):
+                self.assertAlmostEqual(
+                    after_adjustment["center"][axis],
+                    before_adjustment["center"][axis],
+                    places=7,
+                )
+            self.assertAlmostEqual(after_adjustment["range"], 3210.0)
+            self.assertAlmostEqual(after_adjustment["tilt"], 47.0)
+            self.assertAlmostEqual(after_adjustment["heading"], 19.0)
+            self.assertNotEqual(after_adjustment["point"], before_adjustment["point"])
         finally:
             widget.shutdown()
             widget.close()

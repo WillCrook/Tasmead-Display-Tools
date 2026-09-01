@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -34,6 +35,14 @@ MAX_OUTPUT_COMPONENT_LENGTH = 96
 MAX_OUTPUT_STEM_LENGTH = 200
 TRANSPOSITION_FALLBACK_LINE_COLOUR = "aa00ffff"
 LOGGER = logging.getLogger(__name__)
+
+
+def _preview_trace_id(input_path: Path) -> str:
+    """Return a stable browser-safe identity without exposing the source path."""
+
+    resolved = os.path.normcase(str(input_path.resolve(strict=False)))
+    digest = hashlib.sha256(os.fsencode(resolved)).hexdigest()
+    return f"transposition-{digest[:24]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -863,7 +872,7 @@ def prepare_transposition(
                 ),
             )
             trace = PreparedTrace(
-                trace_id=f"transposition-{index}",
+                trace_id=_preview_trace_id(input_path),
                 label=(
                     aircraft_name
                     if label_counts[aircraft_name] == 1
