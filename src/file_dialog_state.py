@@ -16,6 +16,7 @@ class FileDialogWorkflow(str, Enum):
     DEBRIS = "debris"
     AIRFIELD_PRESET = "airfield-preset"
     DEBRIS_PRESET = "debris-preset"
+    KML_EDITOR = "kml-editor"
 
 
 class FileDialogDirection(str, Enum):

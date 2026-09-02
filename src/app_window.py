@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from pages import DebrisPage, TransposePage
+from pages import DebrisPage, KmlEditorPage, TransposePage
 from google_maps_settings import GoogleMapsSettings
 from icon_utils import refresh_icons
 from map_preview_widget import MapPreviewWidget, WEBENGINE_AVAILABLE
@@ -104,6 +104,7 @@ class App(QMainWindow):
 
         self.transpose_page = TransposePage()
         self.debris_page = DebrisPage()
+        self.kml_editor_page = KmlEditorPage()
         self.map_preview = MapPreviewWidget()
         self.workspace_stack.addWidget(self.map_preview)
         self.map_preview.close_requested.connect(self.close_map_preview)
@@ -128,6 +129,7 @@ class App(QMainWindow):
         self.page_scrolls = {
             self.transpose_page: self._create_page_scroll(self.transpose_page),
             self.debris_page: self._create_page_scroll(self.debris_page),
+            self.kml_editor_page: self._create_page_scroll(self.kml_editor_page),
         }
 
         self.set_page(self.transpose_page)
@@ -187,7 +189,7 @@ class App(QMainWindow):
 
         self.mode_switch = QFrame()
         self.mode_switch.setObjectName("modeSwitch")
-        self.mode_switch.setFixedSize(440, 52)
+        self.mode_switch.setFixedSize(660, 52)
         switch_layout = QHBoxLayout(self.mode_switch)
         switch_layout.setContentsMargins(4, 4, 4, 4)
         switch_layout.setSpacing(0)
@@ -197,13 +199,19 @@ class App(QMainWindow):
         self.mode_selection.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents,
         )
-        self.mode_selection.setGeometry(4, 4, 216, 44)
+        self.mode_selection.setGeometry(4, 4, 217, 44)
 
         # Keep these long-standing attribute names for compatibility with the
         # page-switching and simulation-lockout tests.
         self.rb_transpose = QPushButton("Transpose to Airfield")
         self.rb_debris = QPushButton("Debris Trajectory")
-        for button in (self.rb_transpose, self.rb_debris):
+        self.rb_kml_editor = QPushButton("KML Editor")
+        self.top_level_mode_buttons = (
+            self.rb_transpose,
+            self.rb_debris,
+            self.rb_kml_editor,
+        )
+        for button in self.top_level_mode_buttons:
             button.setObjectName("modeSegment")
             button.setCheckable(True)
             switch_layout.addWidget(button, 1)
@@ -212,9 +220,11 @@ class App(QMainWindow):
 
         self.mode_group.addButton(self.rb_transpose)
         self.mode_group.addButton(self.rb_debris)
+        self.mode_group.addButton(self.rb_kml_editor)
 
-        self.rb_transpose.toggled.connect(self.switch_mode)
-        self.rb_transpose.toggled.connect(self._sync_mode_selection)
+        for button in self.top_level_mode_buttons:
+            button.toggled.connect(self.switch_mode)
+            button.toggled.connect(self._sync_mode_selection)
 
         bar.addWidget(
             self.mode_switch,
@@ -241,9 +251,17 @@ class App(QMainWindow):
         self.root_layout.addWidget(self.header)
         self._update_header_responsiveness()
 
-    def _sync_mode_selection(self, transpose_selected):
-        segment_width = (self.mode_switch.width() - 8) // 2
-        selection_x = 4 if transpose_selected else 4 + segment_width
+    def _sync_mode_selection(self, *_args):
+        segment_width = (self.mode_switch.width() - 8) // 3
+        selected_index = next(
+            (
+                index
+                for index, button in enumerate(self.top_level_mode_buttons)
+                if button.isChecked()
+            ),
+            0,
+        )
+        selection_x = 4 + selected_index * segment_width
         self.mode_selection.setGeometry(
             selection_x,
             4,
@@ -256,12 +274,12 @@ class App(QMainWindow):
         if self.width() < self.COMPACT_HEADER_BREAKPOINT:
             self.header.setFixedHeight(64)
             self.header.layout().setContentsMargins(10, 8, 10, 8)
-            self.mode_switch.setFixedSize(360, 48)
+            self.mode_switch.setFixedSize(600, 48)
         else:
             self.header.setFixedHeight(80)
             self.header.layout().setContentsMargins(18, 13, 18, 13)
-            self.mode_switch.setFixedSize(440, 52)
-        self._sync_mode_selection(self.rb_transpose.isChecked())
+            self.mode_switch.setFixedSize(660, 52)
+        self._sync_mode_selection()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -431,8 +449,10 @@ class App(QMainWindow):
     def switch_mode(self):
         if self.rb_transpose.isChecked():
             self.set_page(self.transpose_page)
-        else:
+        elif self.rb_debris.isChecked():
             self.set_page(self.debris_page)
+        else:
+            self.set_page(self.kml_editor_page)
 
     def _on_debris_simulation_busy_changed(self, busy):
         for button in self.mode_group.buttons():
@@ -442,6 +462,10 @@ class App(QMainWindow):
 
     def closeEvent(self, event):
         if not self.debris_page.has_active_simulation():
+            if not self.kml_editor_page.confirm_close():
+                self._close_pending = False
+                event.ignore()
+                return
             self.map_preview.shutdown()
             event.accept()
             return

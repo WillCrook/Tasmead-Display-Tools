@@ -552,6 +552,7 @@ class AppCloseLifecycleTests(unittest.TestCase):
         self.window.debris_page._set_simulation_state(SimulationUiState.RUNNING)
         self.assertFalse(self.window.rb_transpose.isEnabled())
         self.assertFalse(self.window.rb_debris.isEnabled())
+        self.assertFalse(self.window.rb_kml_editor.isEnabled())
 
     def tearDown(self):
         self.window._close_pending = False
@@ -599,6 +600,32 @@ class AppCloseLifecycleTests(unittest.TestCase):
         with patch("app_window.QTimer.singleShot") as single_shot:
             self.window._on_debris_simulation_busy_changed(False)
         single_shot.assert_called_once_with(0, self.window.close)
+
+    def test_editor_dirty_confirmation_runs_after_simulation_is_idle(self):
+        running_event = QCloseEvent()
+        with (
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No),
+            patch.object(self.window.kml_editor_page, "confirm_close") as confirm,
+        ):
+            self.window.closeEvent(running_event)
+        confirm.assert_not_called()
+
+        self.window.debris_page._set_simulation_state(SimulationUiState.IDLE)
+        self.window._close_pending = True
+        cancelled_event = QCloseEvent()
+        with patch.object(self.window.kml_editor_page, "confirm_close", return_value=False):
+            self.window.closeEvent(cancelled_event)
+        self.assertFalse(cancelled_event.isAccepted())
+        self.assertFalse(self.window._close_pending)
+
+        accepted_event = QCloseEvent()
+        with (
+            patch.object(self.window.kml_editor_page, "confirm_close", return_value=True),
+            patch.object(self.window.map_preview, "shutdown") as shutdown,
+        ):
+            self.window.closeEvent(accepted_event)
+        self.assertTrue(accepted_event.isAccepted())
+        shutdown.assert_called_once_with()
 
 
 class ResponsivePageLayoutTests(unittest.TestCase):
@@ -670,22 +697,23 @@ class ResponsivePageLayoutTests(unittest.TestCase):
         self.assertFalse(self.window.debris_page.run_btn.hasFocus())
         self._assert_visible_in_scroll(scroll, self.app.focusWidget())
 
-    def test_both_pages_survive_mode_switching_and_desktop_resizes(self):
+    def test_all_pages_survive_mode_switching_and_desktop_resizes(self):
         transpose_scroll = self.window.page_scrolls[self.window.transpose_page]
         debris_scroll = self.window.page_scrolls[self.window.debris_page]
+        editor_scroll = self.window.page_scrolls[self.window.kml_editor_page]
 
         for width, height in ((900, 600), (1000, 700), (1280, 768), (1440, 900)):
             self.window.resize(width, height)
             self.app.processEvents()
             if width < self.window.COMPACT_HEADER_BREAKPOINT:
-                self.assertEqual(self.window.mode_switch.width(), 360)
+                self.assertEqual(self.window.mode_switch.width(), 600)
                 self.assertEqual(self.window.header.height(), 64)
             else:
-                self.assertEqual(self.window.mode_switch.width(), 440)
+                self.assertEqual(self.window.mode_switch.width(), 660)
                 self.assertEqual(self.window.header.height(), 80)
             self.assertEqual(
                 self.window.mode_selection.width(),
-                (self.window.mode_switch.width() - 8) // 2,
+                (self.window.mode_switch.width() - 8) // 3,
             )
             self.assertLessEqual(self.window.transpose_page.width(), transpose_scroll.viewport().width())
 
@@ -697,6 +725,40 @@ class ResponsivePageLayoutTests(unittest.TestCase):
             self.assertIs(self.window.page_stack.currentWidget(), transpose_scroll)
             self.assertIs(transpose_scroll.widget(), self.window.transpose_page)
             self.assertIs(debris_scroll.widget(), self.window.debris_page)
+            self.window.rb_kml_editor.click()
+            self.app.processEvents()
+            self.assertIs(self.window.page_stack.currentWidget(), editor_scroll)
+            self.assertLessEqual(
+                self.window.kml_editor_page.width(),
+                editor_scroll.viewport().width(),
+            )
+            self.assertIs(editor_scroll.widget(), self.window.kml_editor_page)
+
+    def test_kml_editor_keyboard_focus_reaches_sidebar_and_workspace(self):
+        self.window.rb_kml_editor.click()
+        self.window.kml_editor_page.model.add_paths(
+            [PROJECT_ROOT / "tests" / "fixtures" / "kml" / "gx_track.kml"]
+        )
+        self.app.processEvents()
+        scroll = self.window.page_scrolls[self.window.kml_editor_page]
+        scroll.setFocus()
+        self.app.processEvents()
+
+        focused_names = set()
+        for _ in range(20):
+            QTest.keyClick(scroll, Qt.Key.Key_Tab)
+            self.app.processEvents()
+            focused = self.app.focusWidget()
+            if focused is not None:
+                focused_names.add(focused.accessibleName())
+
+        self.assertIn("KML Editor input files", focused_names)
+        self.assertIn("Add KML files", focused_names)
+        self.assertIn("Save active KML file as", focused_names)
+        self.assertLessEqual(
+            self.window.kml_editor_page.width(),
+            scroll.viewport().width(),
+        )
 
 
 if __name__ == "__main__":

@@ -327,6 +327,7 @@ class ModernHeaderTests(unittest.TestCase):
         self.assertLessEqual(abs(switch_center - self.window.rect().center().x()), 1)
         self.assertEqual(self.window.rb_transpose.text(), "Transpose to Airfield")
         self.assertEqual(self.window.rb_debris.text(), "Debris Trajectory")
+        self.assertEqual(self.window.rb_kml_editor.text(), "KML Editor")
         self.assertEqual(self.window.settings_button.accessibleName(), "Open settings")
         self.assertGreater(
             self.window.settings_button.mapTo(self.window, self.window.settings_button.pos()).x(),
@@ -339,10 +340,24 @@ class ModernHeaderTests(unittest.TestCase):
             self.window.page_stack.currentWidget(),
             self.window.page_scrolls[self.window.debris_page],
         )
+        self.window.rb_kml_editor.click()
+        self.assertIs(
+            self.window.page_stack.currentWidget(),
+            self.window.page_scrolls[self.window.kml_editor_page],
+        )
         self.window._on_debris_simulation_busy_changed(True)
         self.assertFalse(self.window.rb_transpose.isEnabled())
         self.assertFalse(self.window.rb_debris.isEnabled())
+        self.assertFalse(self.window.rb_kml_editor.isEnabled())
         self.assertTrue(self.window.settings_button.isEnabled())
+
+    def test_three_segment_selection_indicator_tracks_the_checked_workspace(self):
+        segment_width = (self.window.mode_switch.width() - 8) // 3
+        for index, button in enumerate(self.window.top_level_mode_buttons):
+            button.click()
+            self.app.processEvents()
+            self.assertEqual(self.window.mode_selection.x(), 4 + index * segment_width)
+            self.assertEqual(self.window.mode_selection.width(), segment_width)
 
     def test_settings_cog_reuses_one_modal_dialog(self):
         with patch.object(SettingsDialog, "exec", return_value=0) as execute:

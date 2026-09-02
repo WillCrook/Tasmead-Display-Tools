@@ -53,7 +53,15 @@ class FileDialogStateTests(unittest.TestCase):
         transpose_input = self.root / "transpose-input"
         transpose_output = self.root / "transpose-output"
         debris_input = self.root / "debris-input"
-        for directory in (transpose_input, transpose_output, debris_input):
+        editor_input = self.root / "editor-input"
+        editor_output = self.root / "editor-output"
+        for directory in (
+            transpose_input,
+            transpose_output,
+            debris_input,
+            editor_input,
+            editor_output,
+        ):
             directory.mkdir()
 
         remember_file_selection(
@@ -70,6 +78,16 @@ class FileDialogStateTests(unittest.TestCase):
             FileDialogWorkflow.DEBRIS,
             FileDialogDirection.INPUT,
             debris_input / "track.kml",
+        )
+        remember_file_selection(
+            FileDialogWorkflow.KML_EDITOR,
+            FileDialogDirection.INPUT,
+            editor_input / "edit.kml",
+        )
+        remember_directory(
+            FileDialogWorkflow.KML_EDITOR,
+            FileDialogDirection.OUTPUT,
+            editor_output,
         )
 
         self.assertEqual(
@@ -99,6 +117,17 @@ class FileDialogStateTests(unittest.TestCase):
                 "editable-name.kml",
             ),
             str(transpose_output / "editable-name.kml"),
+        )
+        self.assertEqual(
+            remembered_directory(
+                FileDialogWorkflow.KML_EDITOR,
+                FileDialogDirection.INPUT,
+            ),
+            str(editor_input),
+        )
+        self.assertEqual(
+            suggested_save_path(FileDialogWorkflow.KML_EDITOR, "saved.kml"),
+            str(editor_output / "saved.kml"),
         )
 
     def test_missing_saved_directory_falls_back_without_reusing_other_workflow(self):
