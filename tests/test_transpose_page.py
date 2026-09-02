@@ -291,6 +291,25 @@ class TransposePageTests(unittest.TestCase):
         self.assertTrue(self.page.runway_alignment_button.isChecked())
         self.assertEqual(self.page.alignment_stack.currentIndex(), 0)
 
+    def test_manual_alignment_uses_rotation_language(self):
+        labels = [
+            label.text()
+            for label in self.page.target_trace_card.findChildren(QLabel)
+        ]
+
+        self.assertIn("Rotation (degrees)", labels)
+        self.assertEqual(
+            self.page.target_trace_card.rotation_input.placeholderText(),
+            "0–360°",
+        )
+        self.assertEqual(
+            self.page.target_trace_card.rotation_input.accessibleName(),
+            "Target trace rotation in degrees",
+        )
+        user_copy = " ".join(labels).lower()
+        self.assertNotIn("yaw", user_copy)
+        self.assertNotIn("clockwise", user_copy)
+
     def test_manual_alignment_uses_first_file_point_and_preserves_per_file_drafts(self):
         first = self.root / "first.kml"
         second = self.root / "second.kml"
@@ -668,8 +687,8 @@ class TransposePageTests(unittest.TestCase):
         )
 
         expected = (
-            "East +12.2 m · North -3.0 m · Up +4.5 m · "
-            "Yaw +6.8° clockwise"
+            "East +12.2 m · North -3.0 m · Height +4.5 m · "
+            "Rotation +6.8°"
         )
         for summary in (
             self.page.runway_offset_summary,
@@ -820,9 +839,14 @@ class TransposePageTests(unittest.TestCase):
         self.page.target_trace_card.rotation_input.setText("40")
         self.page._manual_form_edited()
         self.assertIn(
-            "clockwise rotation",
+            "rotation",
             self.page.manual_offset_summary.status_tooltip_button
             .accessibleDescription(),
+        )
+        self.assertNotIn(
+            "clockwise",
+            self.page.manual_offset_summary.status_tooltip_button
+            .accessibleDescription().lower(),
         )
         self.assertNotIn(
             "true heading",
@@ -1382,15 +1406,20 @@ class TransposePageTests(unittest.TestCase):
             self.assertIsNone(self.page._choose_transposition_inputs())
             self.assertEqual(dialog_class.call_args.args[1], (first_path,))
 
-    def test_preview_prepares_only_the_current_file(self):
+    def test_preview_prepares_all_ready_files_with_current_file_first(self):
         first = self.root / "first.kml"
-        unrelated = self.root / "broken.kml"
-        self.add_inferred_files(first, unrelated)
-        unrelated_state = self.page.source_states[str(unrelated.resolve())]
-        unrelated_state.analysed = True
-        unrelated_state.parse_error = "Unrelated file is broken."
-        self.page._sync_file_item_error(unrelated)
+        second = self.root / "second.kml"
+        self.add_inferred_files(first, second)
         self.configure_target()
+        second_state = self.page.source_states[str(second.resolve())]
+        second_state.analysed = True
+        second_state.altitude_mode = "absolute"
+        second_state.values = AirfieldFormValues(
+            threshold="51.0, -1.0",
+            true_heading="90",
+            elevation_m="30",
+        )
+        self.page.file_list.setCurrentRow(1)
         scenes = []
         self.page.preview_requested.connect(scenes.append)
 
@@ -1405,11 +1434,96 @@ class TransposePageTests(unittest.TestCase):
 
         self.assertEqual(
             prepare.call_args.kwargs["input_files"],
-            (str(first.resolve()),),
+            (str(first.resolve()), str(second.resolve())),
         )
         self.assertEqual(len(scenes), 1)
-        self.assertEqual(len(scenes[0].traces), 1)
+        self.assertEqual(len(scenes[0].traces), 2)
+        self.assertEqual(scenes[0].traces[0].label, "second")
+        self.assertEqual(scenes[0].traces[1].label, "first")
+        self.assertEqual(self.page._prepared_batch.prepared_count, 2)
+        self.assertEqual(
+            tuple(
+                str(item.input_path.resolve())
+                for item in self.page._prepared_batch.prepared
+            ),
+            (str(first.resolve()), str(second.resolve())),
+        )
         warning.assert_not_called()
+
+        with patch.object(self.page, "_run_transposition_for_paths") as run:
+            self.page.export_committed_scene()
+
+        run.assert_called_once_with((str(first.resolve()), str(second.resolve())))
+
+    def test_preview_skips_invalid_files_and_export_keeps_only_ready_files(self):
+        first = self.root / "first.kml"
+        incomplete = self.root / "incomplete.kml"
+        self.add_inferred_files(first, incomplete)
+        self.configure_target()
+        incomplete_state = self.page.source_states[str(incomplete.resolve())]
+        incomplete_state.analysed = True
+        incomplete_state.altitude_mode = "absolute"
+        incomplete_state.values = AirfieldFormValues(
+            threshold="51.0, -1.0",
+            true_heading="90",
+            elevation_m="30",
+        )
+        incomplete_state.runway_target_values = AirfieldFormValues()
+        scenes = []
+        self.page.preview_requested.connect(scenes.append)
+
+        with patch.object(QMessageBox, "warning") as warning:
+            self.page.open_preview()
+
+        self.assertEqual(len(scenes), 1)
+        self.assertEqual(len(scenes[0].traces), 1)
+        self.assertEqual(scenes[0].traces[0].label, "first")
+        self.assertEqual(self.page._prepared_batch.prepared_count, 1)
+        self.assertEqual(self.page._prepared_batch.failure_count, 0)
+        warning.assert_called_once()
+        self.assertEqual(
+            warning.call_args.args[1],
+            "Some KML files are not ready",
+        )
+        warning_text = warning.call_args.args[2]
+        self.assertIn(
+            "Complete the highlighted transposition details for these KML files "
+            "before they can be visualised.",
+            warning_text,
+        )
+        self.assertIn("incomplete.kml", warning_text)
+        self.assertIn("target airfield departure threshold", warning_text)
+        self.assertIn("Enter a latitude and longitude", warning_text)
+        self.assertIn(
+            "target airfield departure threshold",
+            incomplete_state.target_error,
+        )
+
+        with patch.object(self.page, "_run_transposition_for_paths") as run:
+            self.page.export_committed_scene()
+
+        run.assert_called_once_with((str(first.resolve()),))
+
+    def test_preview_does_not_open_when_no_file_is_ready(self):
+        first = self.root / "first.kml"
+        second = self.root / "second.kml"
+        self.add_inferred_files(first, second)
+        scenes = []
+        self.page.preview_requested.connect(scenes.append)
+
+        with (
+            patch("pages.transpose_page.prepare_transposition") as prepare,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.open_preview()
+
+        prepare.assert_not_called()
+        self.assertFalse(scenes)
+        warning.assert_called_once()
+        warning_text = warning.call_args.args[2]
+        self.assertIn("first.kml", warning_text)
+        self.assertIn("second.kml", warning_text)
+        self.assertIn("before they can be visualised", warning_text)
 
     def test_preview_export_uses_its_file_without_opening_selection_dialog(self):
         source = self.root / "source.kml"

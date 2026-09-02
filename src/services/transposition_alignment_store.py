@@ -143,12 +143,12 @@ class PreviewTargetSnapshot:
                 raise ValueError("Runway preview targets require a true heading.")
             if self.clockwise_rotation is not None:
                 raise ValueError(
-                    "Runway preview targets cannot contain clockwise rotation."
+                    "Runway preview targets cannot contain rotation."
                 )
         else:
             if not isinstance(self.clockwise_rotation, str):
                 raise ValueError(
-                    "Manual preview targets require a clockwise rotation."
+                    "Manual preview targets require a rotation."
                 )
             if self.true_heading is not None:
                 raise ValueError("Manual preview targets cannot contain a true heading.")

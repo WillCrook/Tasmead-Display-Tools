@@ -23,9 +23,9 @@ configure_webengine_runtime()
 
 import map_preview_widget as preview_module
 
-from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtCore import QEventLoop, QTimer, Qt
 from PyQt6.QtTest import QSignalSpy
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from map_preview_widget import (
     MapPreviewBridge,
@@ -214,7 +214,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertEqual(len(applied), 1)
         self.assertIs(applied[0][0], self.widget.scene)
 
-    def test_reset_selected_and_reset_all_do_not_move_other_trace_unintentionally(self):
+    def test_reset_selected_and_reset_all_require_confirmation(self):
         with patch.object(self.widget, "_ensure_web_view", return_value=False):
             self.widget.set_scene(scene_with_two_traces(), "test-key")
         self.widget.axis_controls["north_m"].setValue(50.0)
@@ -228,9 +228,47 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertEqual(self.widget.scene.traces[0].adjustment.north_m, 50.0)
         self.assertTrue(self.widget.scene.traces[1].adjustment.is_zero)
 
-        self.widget._reset_all()
-        self.widget._render_timer.stop()
+        scene_before_cancel = self.widget.scene
+        revision_before_cancel = self.widget._revision
+        selected_before_reset = self.widget.trace_selector.currentIndex()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as question,
+            patch.object(self.widget, "_schedule_render") as render,
+        ):
+            self.widget._reset_all()
+
+        self.assertIs(self.widget.scene, scene_before_cancel)
+        self.assertEqual(self.widget._revision, revision_before_cancel)
+        self.assertEqual(self.widget.trace_selector.currentIndex(), selected_before_reset)
+        render.assert_not_called()
+        self.assertEqual(question.call_args.args[1], "Reset all KML offsets?")
+        self.assertEqual(
+            question.call_args.args[2],
+            "Reset the position, height and rotation changes for every KML "
+            "file in this preview?",
+        )
+        self.assertEqual(
+            question.call_args.args[4],
+            QMessageBox.StandardButton.Cancel,
+        )
+
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(self.widget, "_schedule_render") as render,
+        ):
+            self.widget._reset_all()
+
         self.assertTrue(all(trace.adjustment.is_zero for trace in self.widget.scene.traces))
+        self.assertEqual(self.widget.trace_selector.currentIndex(), selected_before_reset)
+        render.assert_called_once_with(immediate=True)
 
     def test_shell_requires_a_sized_steady_current_revision_before_apply(self):
         self.assertIn("gmp-map-3d { width: 100%; height: 100%; display: block; }", _PREVIEW_HTML)
@@ -253,6 +291,66 @@ class MapPreviewControlsTests(unittest.TestCase):
             "if (mapCreated || Boolean(fitRequested)) fitScene();",
             _PREVIEW_HTML,
         )
+        self.assertIn("selectedTraceId", _PREVIEW_HTML)
+        self.assertIn("function applyTraceVisibility()", _PREVIEW_HTML)
+        self.assertIn("setElementAttached(item.element, visible)", _PREVIEW_HTML)
+        self.assertIn("setSelectedTrace(traceId, fitRequested=false)", _PREVIEW_HTML)
+
+    def test_trace_selection_switches_controls_clears_measurement_and_recentres(self):
+        scene = scene_with_two_traces()
+        traces = list(scene.traces)
+        traces[1] = traces[1].with_adjustment(
+            TraceAdjustment(east_m=24.0, yaw_deg=8.0)
+        )
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(PreviewScene(tuple(traces)), "test-key")
+        self.widget._measurement_points.extend(((51.0, -1.0), (51.001, -1.0)))
+        revision = self.widget._revision
+
+        with patch.object(self.widget, "_run_javascript") as javascript:
+            self.widget.trace_selector.setCurrentIndex(1)
+
+        self.assertEqual(len(self.widget.scene.traces), 2)
+        self.assertEqual(self.widget._revision, revision)
+        self.assertEqual(self.widget.axis_controls["east_m"].value(), 24.0)
+        self.assertEqual(self.widget.axis_controls["yaw_deg"].value(), 8.0)
+        self.assertFalse(self.widget._measurement_points)
+        scripts = [call.args[0] for call in javascript.call_args_list]
+        self.assertTrue(any("setMeasurement" in script for script in scripts))
+        self.assertTrue(
+            any('setSelectedTrace("second", true)' in script for script in scripts)
+        )
+
+    def test_preview_copy_uses_friendly_user_facing_terms(self):
+        labels = [label.text() for label in self.widget.findChildren(QLabel)]
+
+        for expected in (
+            "Google Maps 3D preview",
+            "KML file",
+            "Tools",
+            "East / West",
+            "North / South",
+            "Height",
+            "Rotation",
+        ):
+            self.assertIn(expected, labels)
+        self.assertEqual(
+            self.widget.trace_selector.accessibleName(),
+            "KML file to preview",
+        )
+        self.widget.measure_tool_button.setChecked(True)
+        self.assertEqual(
+            self.widget.tool_help_label.text(),
+            "Click points on the map to measure distance.",
+        )
+        self.widget.move_anchor_tool_button.setChecked(True)
+        self.assertEqual(
+            self.widget.tool_help_label.text(),
+            "Click the map to move the selected KML file.",
+        )
+        visible_copy = " ".join(labels + [self.widget.tool_help_label.text()])
+        self.assertNotIn("Yaw", visible_copy)
+        self.assertNotIn("clockwise", visible_copy.lower())
 
     def test_map_tool_modes_are_accessible_exclusive_and_default_to_navigation(self):
         self.assertTrue(self.widget.tool_mode_group.exclusive())
@@ -729,6 +827,35 @@ class MapPreviewControlsTests(unittest.TestCase):
             self.assertTrue(started)
             render.assert_called_once_with(immediate=True, fit_scene=True)
             reload_shell.assert_not_called()
+        finally:
+            self.widget._web_view = None
+            self.widget._server = None
+
+    def test_reopening_same_scene_with_another_leading_trace_recentres_it(self):
+        class FakeWebView:
+            def update(self):
+                return None
+
+        scene = scene_with_two_traces()
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(scene, "same-key")
+        self.widget._api_key = "same-key"
+        self.widget._shell_ready = True
+        self.widget._session_reusable = True
+        self.widget._web_view = FakeWebView()
+        self.widget._server = object()
+        self.widget._measurement_points = [(51.0, -1.0), (51.001, -1.0)]
+        reordered = PreviewScene(tuple(reversed(scene.traces)))
+        try:
+            with patch.object(self.widget, "_schedule_render") as render:
+                self.assertTrue(self.widget.set_scene(reordered, "same-key"))
+
+            self.assertEqual(
+                self.widget.trace_selector.currentData(Qt.ItemDataRole.UserRole),
+                "second",
+            )
+            self.assertFalse(self.widget._measurement_points)
+            render.assert_called_once_with(immediate=True, fit_scene=True)
         finally:
             self.widget._web_view = None
             self.widget._server = None

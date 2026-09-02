@@ -90,7 +90,7 @@ class TraceAdjustment:
             "up_m",
             _bounded_float(
                 self.up_m,
-                "Up offset",
+                "Height offset",
                 MAX_VERTICAL_OFFSET_M,
             ),
         )
@@ -99,7 +99,7 @@ class TraceAdjustment:
             "yaw_deg",
             _bounded_float(
                 self.yaw_deg,
-                "Yaw",
+                "Rotation",
                 MAX_ABSOLUTE_YAW_DEG,
             ),
         )

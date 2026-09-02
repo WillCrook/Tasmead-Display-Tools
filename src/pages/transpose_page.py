@@ -266,8 +266,8 @@ class PreviewOffsetSummary(QFrame):
         self.values_label.setText(
             f"East {adjustment.east_m:+.1f} m · "
             f"North {adjustment.north_m:+.1f} m · "
-            f"Up {adjustment.up_m:+.1f} m · "
-            f"Yaw {adjustment.yaw_deg:+.1f}° clockwise"
+            f"Height {adjustment.up_m:+.1f} m · "
+            f"Rotation {adjustment.yaw_deg:+.1f}°"
         )
         self.restore_button.setEnabled(restore_available)
         self.restore_button.setToolTip(
@@ -483,7 +483,7 @@ class OriginalTraceCard(QFrame):
 
 
 class TargetTraceCard(QFrame):
-    """Manual destination anchor and clockwise trace rotation."""
+    """Manual destination anchor and trace rotation."""
 
     user_edited = pyqtSignal()
     preset_apply_requested = pyqtSignal()
@@ -499,7 +499,7 @@ class TargetTraceCard(QFrame):
         title = QLabel("Target trace")
         title.setObjectName("cardTitle")
         subtitle = QLabel(
-            "Move the source anchor here, then rotate the complete trace clockwise."
+            "Choose where to place the trace, then set its rotation."
         )
         subtitle.setObjectName("mutedText")
         subtitle.setWordWrap(True)
@@ -529,11 +529,11 @@ class TargetTraceCard(QFrame):
         fields.setColumnStretch(1, 1)
         self.coordinate_input = CoordinatePairInput("Target trace coordinates")
         self.rotation_input = QLineEdit("0")
-        self.rotation_input.setPlaceholderText("0–360° clockwise")
-        self.rotation_input.setAccessibleName("Target trace clockwise rotation degrees")
+        self.rotation_input.setPlaceholderText("0–360°")
+        self.rotation_input.setAccessibleName("Target trace rotation in degrees")
         fields.addWidget(QLabel("Target coordinates"), 0, 0)
         fields.addWidget(self.coordinate_input, 0, 1)
-        fields.addWidget(QLabel("Clockwise rotation"), 1, 0)
+        fields.addWidget(QLabel("Rotation (degrees)"), 1, 0)
         fields.addWidget(self.rotation_input, 1, 1)
         root.addLayout(fields)
 
@@ -2038,8 +2038,8 @@ class TransposePage(QWidget):
                     "or restore the original runway values."
                 )
             return (
-                "Preview Mismatch: The current target trace coordinates or clockwise "
-                "rotation no longer match these preview offsets. Clear the offsets or "
+                "Preview Mismatch: The current target trace coordinates or rotation "
+                "no longer match these preview offsets. Clear the offsets or "
                 "restore the original manual target values."
             )
         if state.fingerprint != self._source_fingerprint(state.path):
@@ -2559,7 +2559,7 @@ class TransposePage(QWidget):
                         raise ValueError
                 except ValueError:
                     message = (
-                        f"{Path(path).name} clockwise rotation must be a finite "
+                        f"{Path(path).name} rotation must be a finite "
                         "number between 0 and 360 degrees."
                     )
                     state.manual_target_error = " ".join(
@@ -2817,45 +2817,114 @@ class TransposePage(QWidget):
 
     def open_preview(self) -> None:
         current_path = self._current_source_path
-        if current_path is None:
+        if current_path is None or not self.input_files:
             QMessageBox.warning(
                 self,
-                "No file selected",
-                "Select one KML file in the input list to preview it.",
+                "No KML files",
+                "Add at least one KML file before opening the preview.",
             )
             return
-        input_files = (current_path,)
+
+        input_files = tuple(self.input_files)
         alignments = self._validated_inputs_for_paths(input_files)
-        signature = self._preparation_signature(input_files, alignments)
-        try:
-            batch = prepare_transposition(
-                input_files=input_files,
-                alignments=alignments,
-            )
-            batch = self._apply_committed_adjustments(batch, alignments)
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Preview preparation failed",
-                str(error) or "The transposition preview could not be prepared.",
-            )
-            return
-        failures = self._record_preparation_failures(batch)
-        if failures:
-            self._show_source_failures(
-                failures,
-                title="Preview file needs attention",
-                introduction="The selected file cannot be previewed:",
-            )
-            return
-        self._prepared_batch = batch
-        self._prepared_signature = signature
-        self._prepared_alignments = tuple(alignments)
-        self._prepared_target_snapshots = self._preview_target_snapshots_for_paths(
-            input_files
+        ready = tuple(
+            (path, alignment)
+            for path, alignment in zip(input_files, alignments, strict=True)
+            if alignment is not None
         )
+        skipped = [
+            (
+                path,
+                self._source_error(
+                    self.source_states[str(Path(path).resolve(strict=False))]
+                )
+                or "Complete the highlighted transposition details.",
+            )
+            for path, alignment in zip(input_files, alignments, strict=True)
+            if alignment is None
+        ]
+
+        batch = None
+        successful_files = ()
+        successful_alignments = ()
+        if ready:
+            ready_files = tuple(path for path, _alignment in ready)
+            ready_alignments = tuple(alignment for _path, alignment in ready)
+            alignment_by_path = {
+                str(Path(path).resolve(strict=False)): alignment
+                for path, alignment in ready
+            }
+            try:
+                batch = prepare_transposition(
+                    input_files=ready_files,
+                    alignments=ready_alignments,
+                )
+                batch = self._apply_committed_adjustments(batch, ready_alignments)
+            except Exception as error:
+                QMessageBox.critical(
+                    self,
+                    "Preview preparation failed",
+                    str(error) or "The transposition preview could not be prepared.",
+                )
+                return
+            skipped.extend(self._record_preparation_failures(batch))
+            successful_files = tuple(
+                str(item.input_path.resolve(strict=False)) for item in batch.prepared
+            )
+            successful_alignments = tuple(
+                alignment_by_path[path] for path in successful_files
+            )
+
+        if skipped:
+            details = "\n".join(
+                f"• {Path(path).name}: {message}" for path, message in skipped
+            )
+            message = (
+                "Complete the highlighted transposition details for these KML files "
+                "before they can be visualised.\n\n"
+                f"{details}"
+            )
+            if not successful_files:
+                message += "\n\nSelect a marked input file to review its error."
+            QMessageBox.warning(
+                self,
+                "Some KML files are not ready",
+                message,
+            )
+
+        if batch is None or not successful_files:
+            self._invalidate_prepared_preview()
+            if skipped:
+                self._select_source_path(
+                    str(Path(skipped[0][0]).resolve(strict=False))
+                )
+            return
+
+        successful_batch = replace(batch, items=tuple(batch.prepared))
+        signature = self._preparation_signature(
+            successful_files,
+            successful_alignments,
+        )
+        self._prepared_batch = successful_batch
+        self._prepared_signature = signature
+        self._prepared_alignments = successful_alignments
+        self._prepared_target_snapshots = self._preview_target_snapshots_for_paths(
+            successful_files
+        )
+
+        ordered_items = successful_batch.prepared
+        current_resolved = str(Path(current_path).resolve(strict=False))
+        if current_resolved in successful_files:
+            ordered_items = tuple(
+                sorted(
+                    ordered_items,
+                    key=lambda item: str(
+                        item.input_path.resolve(strict=False)
+                    ) != current_resolved,
+                )
+            )
         self.preview_requested.emit(
-            PreviewScene(tuple(item.trace for item in batch.prepared))
+            PreviewScene(tuple(item.trace for item in ordered_items))
         )
 
     def accept_preview_scene(self, scene) -> None:

@@ -316,10 +316,10 @@ class TargetTracePresetSection:
         target: CoordinatePair,
         rotation_deg: object,
     ) -> "TargetTracePresetSection":
-        rotation = _optional_float(rotation_deg, "Clockwise rotation")
+        rotation = _optional_float(rotation_deg, "Rotation")
         if rotation is None or not 0.0 <= rotation <= 360.0:
             raise AirfieldPresetError(
-                "Clockwise rotation must be between 0 and 360 degrees."
+                "Rotation must be between 0 and 360 degrees."
             )
         try:
             reference = RunwayReference(

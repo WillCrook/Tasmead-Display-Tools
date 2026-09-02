@@ -109,8 +109,8 @@ class TraceAdjustmentTests(unittest.TestCase):
         cases = (
             (lambda: TraceAdjustment(east_m=float("nan")), "East offset"),
             (lambda: TraceAdjustment(north_m=float("inf")), "North offset"),
-            (lambda: TraceAdjustment(up_m=20_000.1), "Up offset"),
-            (lambda: TraceAdjustment(yaw_deg=180.1), "Yaw"),
+            (lambda: TraceAdjustment(up_m=20_000.1), "Height offset"),
+            (lambda: TraceAdjustment(yaw_deg=180.1), "Rotation"),
             (lambda: TraceAdjustment(east_m=-100_000.1), "East offset"),
         )
         for operation, message in cases:

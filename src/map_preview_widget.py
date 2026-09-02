@@ -248,7 +248,7 @@ _PREVIEW_HTML = r"""<!doctype html>
       map: null, payload: null, latestRevision: -1, renderTimeout: null,
       generation: initialGeneration, cspFailed: false, cspDiagnostics: new Map(),
       libraries: null, renderedTraces: new Map(), awaitingRevision: null,
-      toolMode: 'navigate',
+      toolMode: 'navigate', selectedTraceId: null,
       measurement: {payload: {points: []}, line: null, markers: []}
     };
     const status = document.getElementById('state');
@@ -356,18 +356,26 @@ _PREVIEW_HTML = r"""<!doctype html>
     function altitudeMode(AltitudeMode, value) {
       return AltitudeMode[value] || value;
     }
-    function allCoordinates(payload) {
+    function selectedTrace(payload) {
+      const traces = payload && Array.isArray(payload.traces) ? payload.traces : [];
+      if (!traces.length) return null;
+      return traces.find(trace => String(trace.id) === state.selectedTraceId)
+        || traces[0];
+    }
+    function allCoordinates(trace) {
       const points = [];
-      for (const trace of payload.traces || []) {
-        for (const geometry of trace.geometries || []) points.push(...(geometry.coordinates || []));
+      for (const geometry of trace.geometries || []) {
+        points.push(...(geometry.coordinates || []));
       }
       return points;
     }
     function fitScene() {
       if (!state.map || !state.payload) return;
-      const points = allCoordinates(state.payload);
+      const trace = selectedTrace(state.payload);
+      if (!trace) return;
+      const points = allCoordinates(trace);
       if (!points.length) return;
-      const anchor = state.payload.traces[0].anchor;
+      const anchor = trace.anchor;
       const originLat = Number(anchor.lat);
       const originLng = Number(anchor.lng);
       let eastMin = 0, eastMax = 0, northMin = 0, northMax = 0;
@@ -403,6 +411,26 @@ _PREVIEW_HTML = r"""<!doctype html>
     function removeRenderedTrace(rendered) {
       for (const item of rendered.geometries.values()) removeElement(item.element);
       removeElement(rendered.anchor);
+    }
+    function setElementAttached(element, attached) {
+      if (!element || !state.map) return;
+      if (attached && element.parentElement !== state.map) {
+        state.map.append(element);
+      } else if (!attached && element.parentElement === state.map) {
+        removeElement(element);
+      }
+    }
+    function applyTraceVisibility() {
+      if (!state.map || !state.payload) return;
+      const trace = selectedTrace(state.payload);
+      state.selectedTraceId = trace ? String(trace.id) : null;
+      for (const [traceId, rendered] of state.renderedTraces) {
+        const visible = traceId === state.selectedTraceId;
+        for (const item of rendered.geometries.values()) {
+          setElementAttached(item.element, visible);
+        }
+        setElementAttached(rendered.anchor, visible);
+      }
     }
     function updateGeometry(element, geometry) {
       const {AltitudeMode} = state.libraries;
@@ -490,6 +518,7 @@ _PREVIEW_HTML = r"""<!doctype html>
           state.renderedTraces.delete(traceId);
         }
       }
+      applyTraceVisibility();
     }
     function reconcileMeasurement(payload) {
       state.measurement.payload = payload && Array.isArray(payload.points)
@@ -597,7 +626,7 @@ _PREVIEW_HTML = r"""<!doctype html>
       }
       try {
         if (state.bridge) state.bridge.renderStarted(state.generation, Number(revision));
-        if (!state.map) setStatus('Rendering WGS84 trace geometry…');
+        if (!state.map) setStatus('Opening KML preview…');
         if (!state.libraries) {
           const [maps3d, markerLibrary] = await Promise.all([
             google.maps.importLibrary('maps3d'),
@@ -672,6 +701,11 @@ _PREVIEW_HTML = r"""<!doctype html>
         host.dataset.toolMode = state.toolMode;
       },
       setMeasurement(payload) { reconcileMeasurement(payload); },
+      setSelectedTrace(traceId, fitRequested=false) {
+        state.selectedTraceId = String(traceId);
+        applyTraceVisibility();
+        if (Boolean(fitRequested)) fitScene();
+      },
       fitScene
     };
     window.tasmeadGoogleReady = () => {
@@ -959,7 +993,7 @@ class MapPreviewWidget(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
         header = QHBoxLayout()
-        title = QLabel("Google Maps 3D trace preview")
+        title = QLabel("Google Maps 3D preview")
         title.setObjectName("dialogTitle")
         header.addWidget(title)
         header.addStretch()
@@ -1021,13 +1055,13 @@ class MapPreviewWidget(QWidget):
         panel = QVBoxLayout(controls)
         panel.setContentsMargins(16, 16, 16, 16)
         panel.setSpacing(10)
-        panel.addWidget(QLabel("Trace", objectName="panelTitle"))
+        panel.addWidget(QLabel("KML file", objectName="panelTitle"))
         self.trace_selector = QComboBox()
-        self.trace_selector.setAccessibleName("Trace to adjust")
+        self.trace_selector.setAccessibleName("KML file to preview")
         self.trace_selector.currentIndexChanged.connect(self._selected_trace_changed)
         panel.addWidget(self.trace_selector)
 
-        panel.addWidget(QLabel("Map tools", objectName="panelTitle"))
+        panel.addWidget(QLabel("Tools", objectName="panelTitle"))
         self.tool_mode_control = QFrame()
         self.tool_mode_control.setAccessibleName("Map tool")
         tool_row = QHBoxLayout(self.tool_mode_control)
@@ -1053,7 +1087,7 @@ class MapPreviewWidget(QWidget):
             tool_row.addWidget(button)
         panel.addWidget(self.tool_mode_control)
 
-        self.tool_help_label = QLabel("Drag to navigate the map.")
+        self.tool_help_label = QLabel("Drag the map to move around.")
         self.tool_help_label.setObjectName("mutedText")
         self.tool_help_label.setWordWrap(True)
         panel.addWidget(self.tool_help_label)
@@ -1075,10 +1109,10 @@ class MapPreviewWidget(QWidget):
 
         self.axis_controls: dict[str, QDoubleSpinBox] = {}
         specifications = (
-            ("east_m", "X / East", -100_000.0, 100_000.0, " m"),
-            ("north_m", "Y / North", -100_000.0, 100_000.0, " m"),
-            ("up_m", "Z / Up", -20_000.0, 20_000.0, " m"),
-            ("yaw_deg", "Yaw / clockwise", -180.0, 180.0, "°"),
+            ("east_m", "East / West", -100_000.0, 100_000.0, " m"),
+            ("north_m", "North / South", -100_000.0, 100_000.0, " m"),
+            ("up_m", "Height", -20_000.0, 20_000.0, " m"),
+            ("yaw_deg", "Rotation", -180.0, 180.0, "°"),
         )
         for key, label, minimum, maximum, suffix in specifications:
             panel.addWidget(QLabel(label))
@@ -1093,8 +1127,8 @@ class MapPreviewWidget(QWidget):
             self.axis_controls[key] = spin
 
         self.up_warning = QLabel(
-            "A non-zero Up offset lifts ground-clamped lines and polygons by "
-            "exporting them relative to the ground. Negative values may be hidden by terrain."
+            "Changing the height raises or lowers items that normally follow the "
+            "ground. Lowered items may be hidden by the terrain."
         )
         self.up_warning.setObjectName("mutedText")
         self.up_warning.setWordWrap(True)
@@ -1102,7 +1136,7 @@ class MapPreviewWidget(QWidget):
         panel.addWidget(self.up_warning)
 
         reset_row = QHBoxLayout()
-        self.reset_selected_button = QPushButton("Reset selected")
+        self.reset_selected_button = QPushButton("Reset selected KML")
         self.reset_all_button = QPushButton("Reset all")
         self.reset_selected_button.clicked.connect(self._reset_selected)
         self.reset_all_button.clicked.connect(self._reset_all)
@@ -1114,7 +1148,7 @@ class MapPreviewWidget(QWidget):
         self.fit_button.clicked.connect(self.fit_traces)
         panel.addWidget(self.fit_button)
 
-        self.status_label = QLabel("Waiting for a preview scene.")
+        self.status_label = QLabel("Choose a KML file to begin.")
         self.status_label.setObjectName("mutedText")
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
@@ -1129,7 +1163,7 @@ class MapPreviewWidget(QWidget):
         panel.addWidget(self.open_settings_button)
         panel.addStretch()
 
-        self.apply_button = QPushButton("Apply offsets")
+        self.apply_button = QPushButton("Apply changes")
         self.apply_button.setObjectName("primaryButton")
         self.apply_export_button = QPushButton("Apply and export KML…")
         self.apply_button.clicked.connect(self._apply)
@@ -1144,7 +1178,7 @@ class MapPreviewWidget(QWidget):
         self._render_measurement_state()
 
         self._idle_message = (
-            "The Google Maps 3D renderer starts only when a preview is requested."
+            "The map will open when you choose View preview."
             if WEBENGINE_AVAILABLE
             else
                 "PyQt6-WebEngine is not installed. Install the dependencies in "
@@ -1252,6 +1286,9 @@ class MapPreviewWidget(QWidget):
     def set_scene(self, scene: PreviewScene, api_key: str) -> bool:
         if not scene.traces:
             raise ValueError("A preview scene requires at least one trace.")
+        previous_selected_trace_id = self.trace_selector.currentData(
+            Qt.ItemDataRole.UserRole
+        )
         previous_trace_ids = (
             frozenset(trace.trace_id for trace in self._scene.traces)
             if self._scene is not None
@@ -1259,6 +1296,10 @@ class MapPreviewWidget(QWidget):
         )
         next_trace_ids = frozenset(trace.trace_id for trace in scene.traces)
         trace_identity_changed = previous_trace_ids != next_trace_ids
+        selected_trace_changed = (
+            isinstance(previous_selected_trace_id, str)
+            and previous_selected_trace_id != scene.traces[0].trace_id
+        )
         key = str(api_key).strip()
         reuse_session = (
             self._session_reusable
@@ -1269,7 +1310,7 @@ class MapPreviewWidget(QWidget):
         )
         if not reuse_session:
             self._show_loading("Preparing preview…")
-        if trace_identity_changed:
+        if trace_identity_changed or selected_trace_changed:
             self._clear_measurement()
         self._scene = scene
         self._committed_scene = scene
@@ -1281,6 +1322,7 @@ class MapPreviewWidget(QWidget):
         self.trace_selector.blockSignals(False)
         self.trace_selector.setCurrentIndex(0)
         self._load_selected_adjustment()
+        self._sync_selected_trace(fit_scene=False)
         if not self._ensure_web_view():
             self._show_error(
                 "dependency",
@@ -1290,7 +1332,7 @@ class MapPreviewWidget(QWidget):
         if reuse_session:
             self._schedule_render(
                 immediate=True,
-                fit_scene=trace_identity_changed,
+                fit_scene=trace_identity_changed or selected_trace_changed,
             )
             return True
         return self._reload_shell()
@@ -1334,7 +1376,7 @@ class MapPreviewWidget(QWidget):
         self._set_apply_enabled(False)
         self.retry_button.hide()
         self.open_settings_button.hide()
-        self.status_label.setText("Initialising secure local preview…")
+        self.status_label.setText("Opening map preview…")
         self._show_loading("Preparing preview…")
         page_url = self._server.url_for_generation(self._page_generation)
         self._shell_ready_timer.start()
@@ -1374,6 +1416,7 @@ class MapPreviewWidget(QWidget):
             f"window.tasmead.loadGoogleMaps({json.dumps(self._api_key)});"
         )
         self._sync_tool_mode()
+        self._sync_selected_trace(fit_scene=False)
         self._schedule_render(immediate=True)
 
     def _schedule_render(
@@ -1476,7 +1519,7 @@ class MapPreviewWidget(QWidget):
             and self._server is not None
         )
         self.status_label.setText(
-            "Preview matches the quantized WGS84 geometry that will be exported."
+            "Preview matches the KML that will be exported."
         )
         self.retry_button.hide()
         self.open_settings_button.hide()
@@ -1633,14 +1676,14 @@ class MapPreviewWidget(QWidget):
         self._tool_mode = mode
         if mode == "measure":
             self.tool_help_label.setText(
-                "Click points on the map to measure a WGS84 surface path."
+                "Click points on the map to measure distance."
             )
         elif mode == "move-anchor":
             self.tool_help_label.setText(
-                "Click a new map position for the selected trace anchor."
+                "Click the map to move the selected KML file."
             )
         else:
-            self.tool_help_label.setText("Drag to navigate the map.")
+            self.tool_help_label.setText("Drag the map to move around.")
         self._render_measurement_state()
         self._sync_tool_mode()
 
@@ -1723,7 +1766,7 @@ class MapPreviewWidget(QWidget):
         traces[index] = traces[index].with_adjustment(adjustment)
         self._scene = PreviewScene(tuple(traces))
         self.tool_help_label.setText(
-            "Anchor moved. Click another position to refine it, or switch to Navigate."
+            "KML moved. Click another position to refine it, or choose Navigate."
         )
         self._schedule_render(immediate=True)
 
@@ -1800,6 +1843,18 @@ class MapPreviewWidget(QWidget):
 
     def _selected_trace_changed(self, _index: int) -> None:
         self._load_selected_adjustment()
+        self._clear_measurement()
+        self._sync_selected_trace(fit_scene=True)
+
+    def _sync_selected_trace(self, *, fit_scene: bool) -> None:
+        trace_id = self.trace_selector.currentData(Qt.ItemDataRole.UserRole)
+        if not isinstance(trace_id, str) or not trace_id:
+            return
+        self._run_javascript(
+            "window.tasmead.setSelectedTrace("
+            f"{json.dumps(trace_id)}, {'true' if fit_scene else 'false'}"
+            ");"
+        )
 
     def _load_selected_adjustment(self) -> None:
         if self._scene is None or not (0 <= self.trace_selector.currentIndex() < len(self._scene.traces)):
@@ -1845,6 +1900,16 @@ class MapPreviewWidget(QWidget):
 
     def _reset_all(self) -> None:
         if self._scene is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Reset all KML offsets?",
+            "Reset the position, height and rotation changes for every KML "
+            "file in this preview?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
             return
         self._scene = PreviewScene(
             tuple(trace.with_adjustment(TraceAdjustment()) for trace in self._scene.traces)
@@ -1897,7 +1962,7 @@ class MapPreviewWidget(QWidget):
         self.navigate_tool_button.setChecked(True)
         self.navigate_tool_button.blockSignals(False)
         self._tool_mode = "navigate"
-        self.tool_help_label.setText("Drag to navigate the map.")
+        self.tool_help_label.setText("Drag the map to move around.")
         self._render_measurement_state()
         self._show_idle_state()
 

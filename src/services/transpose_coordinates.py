@@ -155,7 +155,7 @@ class ManualTranspositionAlignment:
                 "Manual target longitude must be between -180 and 180 degrees."
             )
         if not 0.0 <= rotation <= 360.0:
-            raise ValueError("Clockwise rotation must be between 0 and 360 degrees.")
+            raise ValueError("Rotation must be between 0 and 360 degrees.")
         elevation = self.ground_reference_elevation_m
         if elevation is not None:
             try:
