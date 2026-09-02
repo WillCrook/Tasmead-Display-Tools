@@ -463,7 +463,7 @@ class GroundElevationInferenceTests(unittest.TestCase):
 
     def test_critically_weak_heading_signal_caps_weighted_result(self):
         signals = (
-            DetectionSignalScore("Heading consistency", 18, "test signal"),
+            DetectionSignalScore("Heading consistency", 19, "test signal"),
             DetectionSignalScore("Cross-track fit", 96, "test signal"),
             DetectionSignalScore("Straightness", 96, "test signal"),
             DetectionSignalScore("Aligned length", 93, "test signal"),
@@ -481,6 +481,40 @@ class GroundElevationInferenceTests(unittest.TestCase):
         self.assertIs(assessment.rating, RunwayConfidence.LOW)
         self.assertEqual(assessment.weakest_signal.name, "Heading consistency")
         self.assertIn("critically weak", assessment.cap_reason)
+
+    def test_heading_signal_at_twenty_percent_is_not_critically_capped(self):
+        signals = (
+            DetectionSignalScore("Heading consistency", 20, "test signal"),
+            DetectionSignalScore("Cross-track fit", 96, "test signal"),
+            DetectionSignalScore("Straightness", 96, "test signal"),
+            DetectionSignalScore("Aligned length", 93, "test signal"),
+        )
+        with patch(
+            "services.runway_alignment._heading_detection_scores",
+            return_value=(91.0, signals),
+        ):
+            result = infer_departure_runway(
+                runway_track(altitude_mode="relativeToGround")
+            )
+
+        assessment = result.candidate.detection_assessment
+        self.assertGreaterEqual(assessment.overall_percent, 80)
+        self.assertIs(assessment.rating, RunwayConfidence.HIGH)
+        self.assertIsNone(assessment.cap_reason)
+
+    def test_low_threshold_score_is_weak_but_not_critically_capped(self):
+        with patch(
+            "services.runway_alignment._threshold_confidence",
+            return_value=RunwayConfidence.LOW,
+        ):
+            result = infer_departure_runway(
+                runway_track(altitude_mode="relativeToGround")
+            )
+
+        assessment = result.candidate.detection_assessment
+        self.assertEqual(assessment.threshold_percent, 35)
+        self.assertNotIn("critically weak", assessment.cap_reason)
+        self.assertIn("threshold detection is weak", assessment.cap_reason)
 
 
 class AltitudeModeTests(unittest.TestCase):

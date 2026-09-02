@@ -29,6 +29,7 @@ GROUND_ELEVATION_CROSS_TRACK_M = 30.0
 MIN_GROUND_ELEVATION_SAMPLES = 5
 MIN_GROUND_ELEVATION_SPAN_M = 75.0
 MAX_GROUND_ELEVATION_SPAN_M = 400.0
+CRITICALLY_WEAK_DETECTION_PERCENT = 20.0
 MAX_GROUND_ELEVATION_SPREAD_M = 4.0
 MAX_GROUND_ELEVATION_SLOPE = 0.02
 MIN_SLOPE_PAIR_DISTANCE_M = 10.0
@@ -651,19 +652,19 @@ def _runway_detection_assessment(
     cap = 100.0
     cap_reason = None
     critical_heading = min(heading_signals[:2], key=lambda signal: signal.percent)
-    if critical_heading.percent < 25:
+    if critical_heading.percent < CRITICALLY_WEAK_DETECTION_PERCENT:
         cap = 59.0
         cap_reason = (
             f"Capped because {critical_heading.name.lower()} is critically weak "
             f"at {critical_heading.percent}%."
         )
-    elif heading < 40.0:
+    elif heading < CRITICALLY_WEAK_DETECTION_PERCENT:
         cap = 59.0
         cap_reason = (
             "Capped because heading detection is critically weak at "
             f"{_rounded_score(heading)}%."
         )
-    elif threshold < 40.0:
+    elif threshold < CRITICALLY_WEAK_DETECTION_PERCENT:
         cap = 59.0
         cap_reason = (
             "Capped because threshold detection is critically weak at "
