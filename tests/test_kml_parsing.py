@@ -18,6 +18,8 @@ from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from file_dialog_state import FileDialogDirection, FileDialogWorkflow
 from services import (
     KmlCoordinateError,
+    KmlDiagnosticCode,
+    KmlDiagnosticSeverity,
     KmlPoint,
     KmlStructureError,
     KmlTrack,
@@ -26,6 +28,7 @@ from services import (
     apply_source_runways,
     load_last_two_points_from_kml,
     parse_kml,
+    parse_kml_text,
     parse_kml_track,
 )
 from services.transpose_coordinates import (
@@ -65,6 +68,36 @@ class KmlParserTests(unittest.TestCase):
 
         self.assertEqual(track.geometry_kind, "line_string")
         self.assertEqual([point.altitude_m for point in track.points], [None, 125.0])
+
+    def test_file_and_text_entry_points_share_the_same_semantics(self):
+        path = self.fixture("line_string_namespaced.kml")
+        self.assertEqual(
+            parse_kml_text(path.read_text(encoding="utf-8"), source_name=path.name),
+            parse_kml_track(path),
+        )
+
+    def test_explicit_legacy_google_21_namespace_and_prefix_are_supported(self):
+        track = parse_kml_track(self.fixture("line_string_legacy_google_21.kml"))
+        self.assertEqual(track.placemark_name, "Legacy route")
+        self.assertEqual(len(track.points), 2)
+        self.assertEqual(
+            load_last_two_points_from_kml(
+                self.fixture("line_string_legacy_google_21.kml")
+            ),
+            (51.2, -0.7, 51.3, -0.6, 125.0),
+        )
+
+    def test_legacy_namespace_is_used_for_gx_track_timestamps(self):
+        source = """<kml xmlns="http://earth.google.com/kml/2.1"
+xmlns:gx="http://www.google.com/kml/ext/2.2"><Placemark><gx:Track>
+<when>2026-01-01T00:00:00Z</when><when>2026-01-01T00:00:01Z</when>
+<gx:coord>-0.7 51.2 100</gx:coord><gx:coord>-0.6 51.3 125</gx:coord>
+</gx:Track></Placemark></kml>"""
+        track = parse_kml_text(source, source_name="legacy-track.kml")
+        self.assertEqual(
+            [point.timestamp for point in track.points],
+            ["2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"],
+        )
 
     def test_gx_prefix_is_irrelevant_and_track_order_is_preserved(self):
         track = parse_kml_track(self.fixture("gx_track.kml"))
@@ -120,6 +153,16 @@ class KmlParserTests(unittest.TestCase):
 
         self.assertIn("line 1, column", str(raised.exception))
 
+        text = "<kml>\n<Placemark></kml>"
+        with self.assertRaises(KmlXmlError) as text_raised:
+            parse_kml_text(text, source_name="broken.kml")
+        diagnostic = text_raised.exception.diagnostic
+        self.assertEqual(diagnostic.code, KmlDiagnosticCode.XML_MALFORMED)
+        self.assertEqual(diagnostic.severity, KmlDiagnosticSeverity.ERROR)
+        self.assertEqual(diagnostic.location.line, 2)
+        self.assertTrue(diagnostic.explanation)
+        self.assertTrue(diagnostic.suggestion)
+
     def test_structure_errors_are_explicit(self):
         cases = [
             ("foreign_namespace.kml", "unsupported KML namespace"),
@@ -148,6 +191,45 @@ class KmlParserTests(unittest.TestCase):
                 message = str(raised.exception)
                 self.assertIn(filename, message)
                 self.assertIn(fragment, message)
+
+    def test_structured_diagnostics_distinguish_namespace_geometry_and_coordinates(self):
+        cases = (
+            ("foreign_namespace.kml", KmlStructureError, KmlDiagnosticCode.NAMESPACE_UNSUPPORTED),
+            ("no_path.kml", KmlStructureError, KmlDiagnosticCode.GEOMETRY_MISSING),
+            ("multiple_paths.kml", KmlStructureError, KmlDiagnosticCode.GEOMETRY_AMBIGUOUS),
+            ("non_numeric.kml", KmlCoordinateError, KmlDiagnosticCode.COORDINATE_NON_NUMERIC),
+            ("out_of_range.kml", KmlCoordinateError, KmlDiagnosticCode.COORDINATE_OUT_OF_RANGE),
+        )
+        for filename, error_type, code in cases:
+            with self.subTest(filename=filename):
+                path = self.fixture(filename)
+                with self.assertRaises(error_type) as raised:
+                    parse_kml_text(path.read_text(encoding="utf-8"), source_name=filename)
+                diagnostic = raised.exception.diagnostic
+                self.assertEqual(diagnostic.code, code)
+                self.assertEqual(diagnostic.severity, KmlDiagnosticSeverity.ERROR)
+                self.assertTrue(diagnostic.message)
+                self.assertTrue(diagnostic.explanation)
+                self.assertTrue(diagnostic.suggestion)
+
+    def test_standalone_coordinate_token_has_exact_location_and_no_automatic_edit(self):
+        path = self.fixture("standalone_coordinate_token.kml")
+        source = path.read_text(encoding="utf-8")
+        with self.assertRaises(KmlCoordinateError) as raised:
+            parse_kml_text(source, source_name=path.name)
+
+        diagnostic = raised.exception.diagnostic
+        self.assertEqual(diagnostic.code, KmlDiagnosticCode.COORDINATE_ARITY)
+        self.assertEqual((diagnostic.location.line, diagnostic.location.column), (15, 4))
+        self.assertEqual(
+            source[
+                diagnostic.location.offset :
+                diagnostic.location.offset + diagnostic.location.length
+            ],
+            "68",
+        )
+        self.assertIn("removed", diagnostic.suggestion)
+        self.assertFalse(hasattr(diagnostic, "replacement"))
 
     def test_kmz_is_rejected_without_attempting_archive_or_network_access(self):
         with self.assertRaises(KmlStructureError) as raised:
@@ -182,6 +264,7 @@ class TranspositionKmlTests(unittest.TestCase):
     def test_both_supported_geometry_types_reach_geodesic_contract(self):
         cases = [
             ("line_string_namespaced.kml", ((51.2, -0.7, 0.0), (51.3, -0.6, 0.0))),
+            ("line_string_legacy_google_21.kml", ((51.2, -0.7, 100.0), (51.3, -0.6, 125.0))),
             ("gx_track.kml", ((51.2, -0.7, 0.0), (51.3, -0.6, 0.0))),
         ]
         for filename, expected in cases:

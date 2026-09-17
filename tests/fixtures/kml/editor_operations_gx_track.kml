@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
+  <Placemark><name>Timed flight</name><gx:Track>
+    <when>2026-01-01T00:00:00Z</when><when>2026-01-01T00:00:01Z</when><when>2026-01-01T00:00:10Z</when>
+    <gx:coord>0 51 100</gx:coord><gx:coord>0.001 51 100</gx:coord><gx:coord>0.002 51 100</gx:coord>
+    <gx:angles>0 0 0</gx:angles><gx:angles>1 0 0</gx:angles><gx:angles>2 0 0</gx:angles>
+    <ExtendedData><SchemaData><gx:SimpleArrayData name="power">
+      <gx:value>10</gx:value><gx:value>20</gx:value><gx:value>30</gx:value>
+    </gx:SimpleArrayData></SchemaData></ExtendedData>
+  </gx:Track></Placemark>
+</kml>

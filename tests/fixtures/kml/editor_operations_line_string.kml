@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <!-- This comment, style and point must survive path edits exactly. -->
+    <Style id="route"><LineStyle><color>ff00ffff</color><width>4</width></LineStyle></Style>
+    <Placemark><name>Flight</name><styleUrl>#route</styleUrl><LineString>
+      <altitudeMode>absolute</altitudeMode>
+      <coordinates>0,51,100 0.001,51.0001,102 0.002,51.0005,160 0.003,51.0001,104 0.004,51,106</coordinates>
+    </LineString></Placemark>
+    <Placemark><name>Possible companion</name><Point><coordinates>0,51,0</coordinates></Point></Placemark>
+  </Document>
+</kml>

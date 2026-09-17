@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -24,7 +25,7 @@ configure_webengine_runtime()
 import map_preview_widget as preview_module
 
 from PyQt6.QtCore import QEventLoop, QTimer, Qt
-from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from map_preview_widget import (
@@ -45,6 +46,7 @@ from services import (
     KmlStyle,
     LocalEnuFrame,
     PreparedTrace,
+    PreviewPresentation,
     PreviewScene,
     TraceAdjustment,
     destination_point,
@@ -185,6 +187,7 @@ class MapPreviewControlsTests(unittest.TestCase):
 
     def tearDown(self):
         self.widget.shutdown()
+        self.widget._payload_pool.waitForDone(1000)
         self.widget.close()
 
     def test_per_trace_controls_recompute_from_base_and_apply_acknowledged_scene(self):
@@ -213,6 +216,52 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.widget.apply_button.click()
         self.assertEqual(len(applied), 1)
         self.assertIs(applied[0][0], self.widget.scene)
+
+    def test_read_only_presentation_reuses_map_but_hides_geometry_mutation_controls(self):
+        presentation = PreviewPresentation(
+            read_only=True,
+            title="KML Editor comparison preview",
+            ready_message="Read-only editor comparison.",
+            legend=("Bright — retained", "Grey — excluded"),
+        )
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(scene_with_two_traces(), "test-key", presentation)
+
+        self.assertEqual(self.widget.title_label.text(), presentation.title)
+        self.assertEqual(self.widget.close_button.text(), "Close")
+        self.assertTrue(self.widget.move_anchor_tool_button.isHidden())
+        self.assertTrue(self.widget.apply_button.isHidden())
+        self.assertTrue(self.widget.apply_export_button.isHidden())
+        self.assertTrue(self.widget.legend_label.text())
+        self.assertFalse(self.widget.navigate_tool_button.isHidden())
+        self.assertFalse(self.widget.measure_tool_button.isHidden())
+
+    def test_embedded_crop_presentation_is_streamlined_and_disables_measurement(self):
+        presentation = PreviewPresentation(
+            read_only=True,
+            embedded=True,
+            measurement_enabled=False,
+            title="Crop comparison",
+            legend=("Bright — retained", "Grey — excluded"),
+        )
+        self.widget._measurement_points = [(51.0, -1.0), (51.001, -1.0)]
+        self.widget.measure_tool_button.setChecked(True)
+
+        with patch.object(self.widget, "_ensure_web_view", return_value=False):
+            self.widget.set_scene(scene_with_two_traces(), "test-key", presentation)
+
+        self.assertTrue(self.widget.header.isHidden())
+        self.assertTrue(self.widget.trace_selector_heading.isHidden())
+        self.assertTrue(self.widget.trace_selector.isHidden())
+        self.assertTrue(self.widget.tool_heading.isHidden())
+        self.assertTrue(self.widget.tool_mode_control.isHidden())
+        self.assertTrue(self.widget.measure_tool_button.isHidden())
+        self.assertTrue(self.widget.measurement_label.isHidden())
+        self.assertFalse(self.widget._measurement_points)
+        self.assertEqual(self.widget._tool_mode, "navigate")
+        self.assertFalse(self.widget.fit_button.isHidden())
+        self.assertTrue(self.widget.legend_label.text())
+        self.assertEqual(self.widget.controls_panel.minimumWidth(), 220)
 
     def test_reset_selected_and_reset_all_require_confirmation(self):
         with patch.object(self.widget, "_ensure_web_view", return_value=False):
@@ -1055,6 +1104,10 @@ class MapPreviewControlsTests(unittest.TestCase):
         ):
             self.widget._render_scene()
 
+            deadline = time.monotonic() + 1.0
+            while self.widget._payload_task is not None and time.monotonic() < deadline:
+                QTest.qWait(5)
+
         javascript.assert_not_called()
         self.assertIn("too large", self.widget.status_label.text())
         self.assertIn("No vertices were simplified", self.widget.status_label.text())
@@ -1072,6 +1125,12 @@ class MapPreviewControlsTests(unittest.TestCase):
             self.widget._schedule_render()
             self.widget._render_timer.stop()
             self.widget._render_scene()
+            deadline = time.monotonic() + 1.0
+            while (
+                self.widget._payload_task is not None
+                or self.widget._payload_transfer_timer.isActive()
+            ) and time.monotonic() < deadline:
+                QTest.qWait(5)
             first_finish = next(
                 call.args[0]
                 for call in reversed(javascript.call_args_list)
@@ -1083,6 +1142,12 @@ class MapPreviewControlsTests(unittest.TestCase):
             self.widget._schedule_render()
             self.widget._render_timer.stop()
             self.widget._render_scene()
+            deadline = time.monotonic() + 1.0
+            while (
+                self.widget._payload_task is not None
+                or self.widget._payload_transfer_timer.isActive()
+            ) and time.monotonic() < deadline:
+                QTest.qWait(5)
             second_finish = next(
                 call.args[0]
                 for call in reversed(javascript.call_args_list)

@@ -7,11 +7,21 @@ import math
 import re
 import secrets
 import threading
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
-from PyQt6.QtCore import QObject, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QObject,
+    QRunnable,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Qt,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -31,7 +41,12 @@ from PyQt6.QtWidgets import (
 )
 
 from services.geodesy import inverse_distance_bearing
-from services.map_preview import PreviewScene, TraceAdjustment, preview_payload
+from services.map_preview import (
+    PreviewPresentation,
+    PreviewScene,
+    TraceAdjustment,
+    preview_payload,
+)
 
 try:  # WebEngine is optional until the user requests a preview.
     from PyQt6.QtWebChannel import QWebChannel
@@ -75,6 +90,56 @@ _CSP_DIRECTIVES = frozenset(
         "worker-src",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _PayloadResult:
+    revision: int
+    encoded: str = ""
+    error: str = ""
+    cancelled: bool = False
+
+
+class _PayloadSignals(QObject):
+    completed = pyqtSignal(object)
+
+
+class _PayloadTask(QRunnable):
+    def __init__(self, revision: int, scene: PreviewScene) -> None:
+        super().__init__()
+        self.revision = revision
+        self.scene = scene
+        self.cancel_event = threading.Event()
+        self.signals = _PayloadSignals()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        encoded = ""
+        error = ""
+        cancelled = False
+        try:
+            payload = preview_payload(
+                self.scene,
+                cancellation_check=self.cancel_event.is_set,
+            )
+            if self.cancel_event.is_set():
+                cancelled = True
+            else:
+                encoded = json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+        except RuntimeError as exception:
+            if self.cancel_event.is_set():
+                cancelled = True
+            else:
+                error = str(exception)
+        except Exception as exception:
+            error = str(exception) or "The preview payload could not be prepared."
+        self.signals.completed.emit(_PayloadResult(self.revision, encoded, error, cancelled))
 _WEB_FAILURE_MESSAGES = {
     "authentication": frozenset(
         {
@@ -976,11 +1041,22 @@ class MapPreviewWidget(QWidget):
         self._tool_mode = "navigate"
         self._measurement_points: list[tuple[float, float]] = []
         self._fit_scene_on_next_render = False
+        self._presentation = PreviewPresentation()
+        self._payload_pool = QThreadPool(self)
+        self._payload_pool.setMaxThreadCount(1)
+        self._payload_task: _PayloadTask | None = None
+        self._payload_chunks: list[str] = []
+        self._payload_chunk_index = 0
+        self._payload_transfer_revision = -1
+        self._payload_transfer_fit = False
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(140)
         self._render_timer.timeout.connect(self._render_scene)
+        self._payload_transfer_timer = QTimer(self)
+        self._payload_transfer_timer.setSingleShot(True)
+        self._payload_transfer_timer.timeout.connect(self._transfer_payload_chunks)
         self._shell_ready_timer = QTimer(self)
         self._shell_ready_timer.setSingleShot(True)
         self._shell_ready_timer.setInterval(_SHELL_READY_TIMEOUT_MS)
@@ -992,10 +1068,12 @@ class MapPreviewWidget(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
-        header = QHBoxLayout()
-        title = QLabel("Google Maps 3D preview")
-        title.setObjectName("dialogTitle")
-        header.addWidget(title)
+        self.header = QFrame()
+        header = QHBoxLayout(self.header)
+        header.setContentsMargins(0, 0, 0, 0)
+        self.title_label = QLabel("Google Maps 3D preview")
+        self.title_label.setObjectName("dialogTitle")
+        header.addWidget(self.title_label)
         header.addStretch()
         self.fullscreen_button = QPushButton("Full screen")
         self.fullscreen_button.setCheckable(True)
@@ -1004,7 +1082,7 @@ class MapPreviewWidget(QWidget):
         self.close_button = QPushButton("Cancel")
         self.close_button.clicked.connect(self.close_requested)
         header.addWidget(self.close_button)
-        root.addLayout(header)
+        root.addWidget(self.header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -1048,20 +1126,22 @@ class MapPreviewWidget(QWidget):
         loading_layout.addStretch()
         self.map_layout.addWidget(self.loading_screen)
 
-        controls = QFrame()
-        controls.setObjectName("workspacePanel")
-        controls.setMinimumWidth(300)
-        controls.setMaximumWidth(380)
-        panel = QVBoxLayout(controls)
+        self.controls_panel = QFrame()
+        self.controls_panel.setObjectName("workspacePanel")
+        self.controls_panel.setMinimumWidth(300)
+        self.controls_panel.setMaximumWidth(380)
+        panel = QVBoxLayout(self.controls_panel)
         panel.setContentsMargins(16, 16, 16, 16)
         panel.setSpacing(10)
-        panel.addWidget(QLabel("KML file", objectName="panelTitle"))
+        self.trace_selector_heading = QLabel("KML file", objectName="panelTitle")
+        panel.addWidget(self.trace_selector_heading)
         self.trace_selector = QComboBox()
         self.trace_selector.setAccessibleName("KML file to preview")
         self.trace_selector.currentIndexChanged.connect(self._selected_trace_changed)
         panel.addWidget(self.trace_selector)
 
-        panel.addWidget(QLabel("Tools", objectName="panelTitle"))
+        self.tool_heading = QLabel("Tools", objectName="panelTitle")
+        panel.addWidget(self.tool_heading)
         self.tool_mode_control = QFrame()
         self.tool_mode_control.setAccessibleName("Map tool")
         tool_row = QHBoxLayout(self.tool_mode_control)
@@ -1108,6 +1188,7 @@ class MapPreviewWidget(QWidget):
         self.navigate_tool_button.setChecked(True)
 
         self.axis_controls: dict[str, QDoubleSpinBox] = {}
+        self.adjustment_widgets: list[QWidget] = []
         specifications = (
             ("east_m", "East / West", -100_000.0, 100_000.0, " m"),
             ("north_m", "North / South", -100_000.0, 100_000.0, " m"),
@@ -1115,7 +1196,8 @@ class MapPreviewWidget(QWidget):
             ("yaw_deg", "Rotation", -180.0, 180.0, "°"),
         )
         for key, label, minimum, maximum, suffix in specifications:
-            panel.addWidget(QLabel(label))
+            axis_label = QLabel(label)
+            panel.addWidget(axis_label)
             spin = QDoubleSpinBox()
             spin.setAccessibleName(label)
             spin.setRange(minimum, maximum)
@@ -1125,6 +1207,7 @@ class MapPreviewWidget(QWidget):
             spin.valueChanged.connect(self._adjustment_changed)
             panel.addWidget(spin)
             self.axis_controls[key] = spin
+            self.adjustment_widgets.extend((axis_label, spin))
 
         self.up_warning = QLabel(
             "Changing the height raises or lowers items that normally follow the "
@@ -1134,6 +1217,7 @@ class MapPreviewWidget(QWidget):
         self.up_warning.setWordWrap(True)
         self.up_warning.hide()
         panel.addWidget(self.up_warning)
+        self.adjustment_widgets.append(self.up_warning)
 
         reset_row = QHBoxLayout()
         self.reset_selected_button = QPushButton("Reset selected KML")
@@ -1143,6 +1227,7 @@ class MapPreviewWidget(QWidget):
         reset_row.addWidget(self.reset_selected_button)
         reset_row.addWidget(self.reset_all_button)
         panel.addLayout(reset_row)
+        self.adjustment_widgets.extend((self.reset_selected_button, self.reset_all_button))
 
         self.fit_button = QPushButton("Recentre view")
         self.fit_button.clicked.connect(self.fit_traces)
@@ -1153,6 +1238,12 @@ class MapPreviewWidget(QWidget):
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         panel.addWidget(self.status_label)
+        self.legend_label = QLabel("")
+        self.legend_label.setObjectName("mutedText")
+        self.legend_label.setWordWrap(True)
+        self.legend_label.setAccessibleName("Preview legend")
+        self.legend_label.hide()
+        panel.addWidget(self.legend_label)
         self.retry_button = QPushButton("Retry map")
         self.retry_button.clicked.connect(self._reload_shell)
         self.retry_button.hide()
@@ -1170,7 +1261,7 @@ class MapPreviewWidget(QWidget):
         self.apply_export_button.clicked.connect(self._apply_and_export)
         panel.addWidget(self.apply_button)
         panel.addWidget(self.apply_export_button)
-        splitter.addWidget(controls)
+        splitter.addWidget(self.controls_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setSizes((900, 340))
@@ -1269,6 +1360,11 @@ class MapPreviewWidget(QWidget):
     def _dispose_web_runtime(self) -> None:
         self._shell_ready_timer.stop()
         self._stop_presentation_watchdog(clear_activity=True)
+        if self._payload_task is not None:
+            self._payload_task.cancel()
+            self._payload_task = None
+        self._payload_transfer_timer.stop()
+        self._payload_chunks.clear()
         self._fit_scene_on_next_render = False
         if self._web_view is not None:
             web_view = self._web_view
@@ -1283,9 +1379,16 @@ class MapPreviewWidget(QWidget):
         self._shell_ready = False
         self._session_reusable = False
 
-    def set_scene(self, scene: PreviewScene, api_key: str) -> bool:
+    def set_scene(
+        self,
+        scene: PreviewScene,
+        api_key: str,
+        presentation: PreviewPresentation | None = None,
+    ) -> bool:
         if not scene.traces:
             raise ValueError("A preview scene requires at least one trace.")
+        self._presentation = presentation or PreviewPresentation()
+        self._apply_presentation()
         previous_selected_trace_id = self.trace_selector.currentData(
             Qt.ItemDataRole.UserRole
         )
@@ -1336,6 +1439,38 @@ class MapPreviewWidget(QWidget):
             )
             return True
         return self._reload_shell()
+
+    def _apply_presentation(self) -> None:
+        read_only = self._presentation.read_only
+        embedded = self._presentation.embedded
+        measurement_enabled = self._presentation.measurement_enabled
+        self.title_label.setText(self._presentation.title)
+        self.header.setVisible(not embedded)
+        self.close_button.setText("Close" if read_only else "Cancel")
+        self.move_anchor_tool_button.setVisible(not read_only)
+        self.measure_tool_button.setVisible(measurement_enabled)
+        tool_controls_visible = measurement_enabled or not read_only
+        self.tool_heading.setVisible(tool_controls_visible)
+        self.tool_mode_control.setVisible(tool_controls_visible)
+        self.tool_help_label.setVisible(tool_controls_visible)
+        self.trace_selector_heading.setVisible(not embedded)
+        self.trace_selector.setVisible(not embedded)
+        self.controls_panel.setMinimumWidth(220 if embedded else 300)
+        self.controls_panel.setMaximumWidth(300 if embedded else 380)
+        for widget in self.adjustment_widgets:
+            widget.setVisible(not read_only)
+        self.apply_button.setVisible(not read_only)
+        self.apply_export_button.setVisible(not read_only)
+        self.legend_label.setText("\n".join(self._presentation.legend))
+        self.legend_label.setVisible(bool(self._presentation.legend))
+        if read_only and self._tool_mode == "move-anchor":
+            self.navigate_tool_button.setChecked(True)
+        if not measurement_enabled and self._tool_mode == "measure":
+            self.navigate_tool_button.setChecked(True)
+        if not measurement_enabled and self._measurement_points:
+            self._clear_measurement()
+        else:
+            self._render_measurement_state()
 
     @property
     def scene(self) -> PreviewScene | None:
@@ -1432,6 +1567,10 @@ class MapPreviewWidget(QWidget):
             self._set_apply_enabled(False)
             return
         self._session_reusable = False
+        if self._payload_task is not None:
+            self._payload_task.cancel()
+        self._payload_transfer_timer.stop()
+        self._payload_chunks.clear()
         self._fit_scene_on_next_render = (
             self._fit_scene_on_next_render or fit_scene
         )
@@ -1455,11 +1594,24 @@ class MapPreviewWidget(QWidget):
             or self._csp_failed_generation == self._page_generation
         ):
             return
-        encoded = json.dumps(
-            preview_payload(self._scene),
-            separators=(",", ":"),
-            ensure_ascii=False,
+        task = _PayloadTask(self._revision, self._scene)
+        task.signals.completed.connect(
+            self._payload_prepared,
+            Qt.ConnectionType.QueuedConnection,
         )
+        self._payload_task = task
+        self._update_loading("Preparing complete preview geometry…")
+        self._payload_pool.start(task)
+
+    def _payload_prepared(self, result: _PayloadResult) -> None:
+        if self._payload_task is not None and self._payload_task.revision == result.revision:
+            self._payload_task = None
+        if result.cancelled or result.revision != self._revision:
+            return
+        if result.error:
+            self._show_error("render", result.error)
+            return
+        encoded = result.encoded
         byte_count = len(encoded.encode("utf-8"))
         if byte_count > _MAX_PAYLOAD_BYTES:
             self._show_error(
@@ -1467,20 +1619,40 @@ class MapPreviewWidget(QWidget):
                 "This scene is too large for the embedded preview. No vertices were simplified; export remains available.",
             )
             return
-        chunks = [encoded[index:index + _CHUNK_SIZE] for index in range(0, len(encoded), _CHUNK_SIZE)] or [""]
-        revision = self._revision
-        fit_scene = self._fit_scene_on_next_render
+        self._payload_chunks = [
+            encoded[index:index + _CHUNK_SIZE]
+            for index in range(0, len(encoded), _CHUNK_SIZE)
+        ] or [""]
+        self._payload_chunk_index = 0
+        self._payload_transfer_revision = result.revision
+        self._payload_transfer_fit = self._fit_scene_on_next_render
         self._fit_scene_on_next_render = False
-        self._run_javascript(f"window.tasmead.beginScene({revision}, {len(chunks)});")
-        for chunk in chunks:
+        self._run_javascript(
+            f"window.tasmead.beginScene({result.revision}, {len(self._payload_chunks)});"
+        )
+        self._payload_transfer_timer.start(0)
+
+    def _transfer_payload_chunks(self) -> None:
+        revision = self._payload_transfer_revision
+        if revision != self._revision or not self._payload_chunks:
+            self._payload_chunks.clear()
+            return
+        stop = min(self._payload_chunk_index + 4, len(self._payload_chunks))
+        for index in range(self._payload_chunk_index, stop):
+            chunk = self._payload_chunks[index]
             self._run_javascript(
                 f"window.tasmead.appendSceneChunk({revision}, {json.dumps(chunk)});"
             )
+        self._payload_chunk_index = stop
+        if stop < len(self._payload_chunks):
+            self._payload_transfer_timer.start(0)
+            return
         self._run_javascript(
             "window.tasmead.finishScene("
-            f"{revision}, {'true' if fit_scene else 'false'}"
+            f"{revision}, {'true' if self._payload_transfer_fit else 'false'}"
             ");"
         )
+        self._payload_chunks.clear()
 
     def _run_javascript(self, source: str) -> None:
         if self._web_view is None:
@@ -1519,7 +1691,7 @@ class MapPreviewWidget(QWidget):
             and self._server is not None
         )
         self.status_label.setText(
-            "Preview matches the KML that will be exported."
+            self._presentation.ready_message
         )
         self.retry_button.hide()
         self.open_settings_button.hide()
@@ -1647,6 +1819,11 @@ class MapPreviewWidget(QWidget):
 
     def _show_error(self, kind: str, message: str) -> None:
         self._render_timer.stop()
+        if self._payload_task is not None:
+            self._payload_task.cancel()
+            self._payload_task = None
+        self._payload_transfer_timer.stop()
+        self._payload_chunks.clear()
         self._shell_ready_timer.stop()
         self._stop_presentation_watchdog(clear_activity=True)
         self._failed_generation = self._page_generation
@@ -1667,11 +1844,15 @@ class MapPreviewWidget(QWidget):
         self._reload_shell()
 
     def _set_apply_enabled(self, enabled: bool) -> None:
-        self.apply_button.setEnabled(enabled)
-        self.apply_export_button.setEnabled(enabled)
+        allowed = bool(enabled and not self._presentation.read_only)
+        self.apply_button.setEnabled(allowed)
+        self.apply_export_button.setEnabled(allowed)
 
     def _tool_mode_changed(self, mode: str, checked: bool) -> None:
         if not checked:
+            return
+        if mode == "measure" and not self._presentation.measurement_enabled:
+            self.navigate_tool_button.setChecked(True)
             return
         self._tool_mode = mode
         if mode == "measure":
@@ -1718,11 +1899,11 @@ class MapPreviewWidget(QWidget):
             or not -180.0 <= longitude <= 180.0
         ):
             return
-        if self._tool_mode == "measure":
+        if self._tool_mode == "measure" and self._presentation.measurement_enabled:
             self._measurement_points.append((latitude, longitude))
             self._render_measurement_state()
             self._sync_measurement_overlay()
-        elif self._tool_mode == "move-anchor":
+        elif self._tool_mode == "move-anchor" and not self._presentation.read_only:
             self._move_selected_anchor(latitude, longitude)
 
     def _move_selected_anchor(
@@ -1794,7 +1975,9 @@ class MapPreviewWidget(QWidget):
 
     def _render_measurement_state(self) -> None:
         point_count = len(self._measurement_points)
-        visible = self._tool_mode == "measure" or point_count > 0
+        visible = self._presentation.measurement_enabled and (
+            self._tool_mode == "measure" or point_count > 0
+        )
         self.measurement_label.setVisible(visible)
         self.undo_measurement_button.setVisible(visible)
         self.clear_measurement_button.setVisible(visible)
@@ -1956,6 +2139,8 @@ class MapPreviewWidget(QWidget):
         self._api_key = ""
         self._scene = None
         self._committed_scene = None
+        self._presentation = PreviewPresentation()
+        self._apply_presentation()
         self._measurement_points.clear()
         self._fit_scene_on_next_render = False
         self.navigate_tool_button.blockSignals(True)

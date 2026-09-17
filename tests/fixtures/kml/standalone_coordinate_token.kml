@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Placemark>
+  <name>Track</name>
+  <Style>
+    <LineStyle>
+      <color>ff0000ff</color>
+    </LineStyle>
+  </Style>
+  <LineString>
+    <tessellate>1</tessellate>
+    <altitudeMode>absolute</altitudeMode>
+    <coordinates>
+
+   68 12.417867,41.670955,193.099038 12.418224,41.670881,191.801193
+    </coordinates>
+  </LineString>
+</Placemark>
+</kml>

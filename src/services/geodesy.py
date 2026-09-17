@@ -151,6 +151,29 @@ class LocalEnuFrame:
             raise ValueError("WGS84 to ENU transformation failed.") from error
         return EnuCoordinate(east, north, up)
 
+    def to_enu_many(
+        self,
+        coordinates: Iterable[tuple[float, float]],
+    ) -> tuple[EnuCoordinate, ...]:
+        """Vectorise a batch of WGS84 positions in this frame."""
+        validated = tuple(_coordinate(latitude, longitude) for latitude, longitude in coordinates)
+        if not validated:
+            return ()
+        latitudes, longitudes = zip(*validated, strict=True)
+        try:
+            east, north, up = self._transformer.transform(
+                longitudes,
+                latitudes,
+                [0.0] * len(validated),
+                errcheck=True,
+            )
+        except ProjError as error:
+            raise ValueError("WGS84 to ENU transformation failed.") from error
+        return tuple(
+            EnuCoordinate(east_value, north_value, up_value)
+            for east_value, north_value, up_value in zip(east, north, up, strict=True)
+        )
+
     def to_wgs84(self, position: EnuCoordinate) -> tuple[float, float]:
         """Convert an ENU position back to WGS84 latitude/longitude."""
         try:

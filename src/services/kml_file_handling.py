@@ -2,22 +2,85 @@
 
 from __future__ import annotations
 
-import math
+from enum import Enum
+from itertools import chain
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 import xml.etree.ElementTree as ET
+
+from .kml_coordinates import (
+    CoordinateTokenInspection,
+    CoordinateTokenIssue,
+    inspect_gx_coordinate,
+    inspect_line_string_coordinate,
+)
+from .kml_source import has_ancestor, scan_xml_source
 
 
 KML_NAMESPACE = "http://www.opengis.net/kml/2.2"
+LEGACY_GOOGLE_KML_NAMESPACE = "http://earth.google.com/kml/2.1"
 GX_NAMESPACE = "http://www.google.com/kml/ext/2.2"
+SUPPORTED_KML_NAMESPACES = ("", KML_NAMESPACE, LEGACY_GOOGLE_KML_NAMESPACE)
 _COLOUR_RE = re.compile(r"[0-9a-fA-F]{8}\Z")
+
+
+class KmlDiagnosticSeverity(str, Enum):
+    ERROR = "error"
+
+
+class KmlDiagnosticCode(str, Enum):
+    XML_MALFORMED = "xml_malformed"
+    ROOT_ELEMENT = "root_element"
+    NAMESPACE_UNSUPPORTED = "namespace_unsupported"
+    STRUCTURE_UNSUPPORTED = "structure_unsupported"
+    GEOMETRY_MISSING = "geometry_missing"
+    GEOMETRY_AMBIGUOUS = "geometry_ambiguous"
+    COORDINATES_EMPTY = "coordinates_empty"
+    COORDINATE_ARITY = "coordinate_arity"
+    COORDINATE_NON_NUMERIC = "coordinate_non_numeric"
+    COORDINATE_NON_FINITE = "coordinate_non_finite"
+    COORDINATE_OUT_OF_RANGE = "coordinate_out_of_range"
+
+
+@dataclass(frozen=True, slots=True)
+class KmlSourceLocation:
+    """A reliable selection in normalized editor text."""
+
+    line: int
+    column: int
+    offset: int | None = None
+    length: int = 0
+
+    @property
+    def display(self) -> str:
+        return f"Line {self.line}, column {self.column}"
+
+
+@dataclass(frozen=True, slots=True)
+class KmlDiagnostic:
+    code: KmlDiagnosticCode
+    severity: KmlDiagnosticSeverity
+    message: str
+    explanation: str
+    suggestion: str
+    location: KmlSourceLocation | None = None
 
 
 class KmlParseError(ValueError):
     """Base class for user-correctable KML parsing failures."""
+
+    def __init__(self, message: str, diagnostic: KmlDiagnostic | None = None):
+        super().__init__(message)
+        self.diagnostic = diagnostic or KmlDiagnostic(
+            code=KmlDiagnosticCode.STRUCTURE_UNSUPPORTED,
+            severity=KmlDiagnosticSeverity.ERROR,
+            message=message,
+            explanation=message,
+            suggestion="Inspect the KML structure and correct the reported problem.",
+        )
 
 
 class KmlXmlError(KmlParseError):
@@ -43,6 +106,31 @@ class KmlPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class KmlSourceSpan:
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
+class KmlAlignedSourceSeries:
+    label: str
+    element_spans: tuple[KmlSourceSpan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class KmlTrackSourceBinding:
+    """Exact UTF-8 byte spans for the parser-selected flight path."""
+
+    geometry_kind: Literal["line_string", "gx_track"]
+    coordinate_spans: tuple[KmlSourceSpan, ...]
+    coordinate_body_span: KmlSourceSpan | None = None
+    aligned_series: tuple[KmlAlignedSourceSeries, ...] = ()
+    companion_point_count: int = 0
+    warnings: tuple[str, ...] = ()
+    unsafe_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class KmlTrack:
     """The single flight-path geometry selected from a KML document."""
 
@@ -51,6 +139,11 @@ class KmlTrack:
     placemark_name: str | None
     altitude_mode: str = "clampToGround"
     source_line_colour: str | None = None
+    source_binding: KmlTrackSourceBinding | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +152,88 @@ class _TrackCandidate:
     placemark: ET.Element
     geometry_kind: Literal["line_string", "gx_track"]
     placemark_name: str | None
+
+
+def _location_at(text: str | None, offset: int, length: int = 0) -> KmlSourceLocation | None:
+    if text is None or offset < 0 or offset > len(text):
+        return None
+    line_start = text.rfind("\n", 0, offset) + 1
+    return KmlSourceLocation(
+        line=text.count("\n", 0, offset) + 1,
+        column=offset - line_start + 1,
+        offset=offset,
+        length=max(0, length),
+    )
+
+
+def _location_from_line_column(
+    text: str | None,
+    line: int | None,
+    column: int | None,
+) -> KmlSourceLocation | None:
+    if text is None or line is None or column is None or line < 1 or column < 1:
+        return None
+    lines = text.splitlines(keepends=True)
+    if line > len(lines):
+        return None
+    line_text = lines[line - 1].rstrip("\r\n")
+    safe_column = min(column, len(line_text) + 1)
+    offset = sum(len(value) for value in lines[: line - 1]) + safe_column - 1
+    return KmlSourceLocation(line=line, column=safe_column, offset=offset, length=0)
+
+
+def _unique_text_location(text: str | None, value: str) -> KmlSourceLocation | None:
+    offset = _unique_text_offset(text, value)
+    if offset is None:
+        return None
+    return _location_at(text, offset, len(value))
+
+
+def _unique_text_offset(text: str | None, value: str | None) -> int | None:
+    if text is None or not value:
+        return None
+    offset = text.find(value)
+    if offset < 0 or text.find(value, offset + len(value)) >= 0:
+        return None
+    return offset
+
+
+def _element_location(text: str | None, local_name: str) -> KmlSourceLocation | None:
+    if text is None:
+        return None
+    pattern = re.compile(
+        rf"<\s*(?:(?:[A-Za-z_][\w.-]*):)?{re.escape(local_name)}(?=\s|/?>)"
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        return None
+    name_offset = matches[0].start() + 1
+    while name_offset < matches[0].end() and text[name_offset].isspace():
+        name_offset += 1
+    return _location_at(text, name_offset, matches[0].end() - name_offset)
+
+
+def _error(
+    error_type: type[KmlParseError],
+    message: str,
+    *,
+    code: KmlDiagnosticCode,
+    summary: str,
+    explanation: str,
+    suggestion: str,
+    location: KmlSourceLocation | None = None,
+) -> KmlParseError:
+    return error_type(
+        message,
+        KmlDiagnostic(
+            code=code,
+            severity=KmlDiagnosticSeverity.ERROR,
+            message=summary,
+            explanation=explanation,
+            suggestion=suggestion,
+            location=location,
+        ),
+    )
 
 
 def _qualified(namespace: str, local_name: str) -> str:
@@ -234,49 +409,77 @@ def _context(
     return context
 
 
-def _parse_number(
-    value: str,
-    component: str,
-    path: Path,
-    candidate: _TrackCandidate,
-    tuple_index: int,
-) -> float:
-    try:
-        number = float(value)
-    except ValueError as exc:
-        raise KmlCoordinateError(
-            f'{_context(path, candidate, tuple_index)}: {component} value "{value}" is not numeric.'
-        ) from exc
-
-    if not math.isfinite(number):
-        raise KmlCoordinateError(
-            f'{_context(path, candidate, tuple_index)}: {component} value "{value}" is not finite.'
-        )
-    return number
-
-
 def _make_point(
-    values: list[str],
+    inspection: CoordinateTokenInspection,
     path: Path,
     candidate: _TrackCandidate,
     tuple_index: int,
+    source_text: str | None,
+    location_offset: int | None,
+    location_length: int,
 ) -> KmlPoint:
-    longitude = _parse_number(values[0], "longitude", path, candidate, tuple_index)
-    latitude = _parse_number(values[1], "latitude", path, candidate, tuple_index)
-    altitude = (
-        _parse_number(values[2], "altitude", path, candidate, tuple_index)
-        if len(values) == 3
-        else None
-    )
+    location = None
+    if inspection.issue is not None and location_offset is not None:
+        location = _location_at(source_text, location_offset, location_length)
+    if inspection.issue in {
+        CoordinateTokenIssue.NON_NUMERIC,
+        CoordinateTokenIssue.NON_FINITE,
+    }:
+        component = inspection.component or "coordinate"
+        value = inspection.problem_value
+        non_numeric = inspection.issue == CoordinateTokenIssue.NON_NUMERIC
+        qualifier = "not numeric" if non_numeric else "not finite"
+        message = f'{_context(path, candidate, tuple_index)}: {component} value "{value}" is {qualifier}.'
+        raise _error(
+            KmlCoordinateError,
+            message,
+            code=(
+                KmlDiagnosticCode.COORDINATE_NON_NUMERIC
+                if non_numeric
+                else KmlDiagnosticCode.COORDINATE_NON_FINITE
+            ),
+            summary=(
+                f"Coordinate {tuple_index} has a non-numeric {component}."
+                if non_numeric
+                else f"Coordinate {tuple_index} has a non-finite {component}."
+            ),
+            explanation=(
+                f'The value "{value}" cannot be read as a finite decimal number in the '
+                f"selected {candidate.geometry_kind.replace('_', ' ')}."
+                if non_numeric
+                else "KML coordinates must use finite decimal numbers; NaN and infinity are invalid."
+            ),
+            suggestion=(
+                f"Replace the {component} with the intended decimal value."
+                if non_numeric
+                else f"Replace the {component} with the intended finite decimal value."
+            ),
+            location=location,
+        )
 
-    if not -180.0 <= longitude <= 180.0:
-        raise KmlCoordinateError(
-            f"{_context(path, candidate, tuple_index)}: longitude {longitude} is outside -180 to 180."
+    if inspection.issue in {
+        CoordinateTokenIssue.LONGITUDE_OUT_OF_RANGE,
+        CoordinateTokenIssue.LATITUDE_OUT_OF_RANGE,
+    }:
+        longitude_issue = inspection.issue == CoordinateTokenIssue.LONGITUDE_OUT_OF_RANGE
+        component = "longitude" if longitude_issue else "latitude"
+        value = inspection.problem_value
+        supported_range = "-180 to 180" if longitude_issue else "-90 to 90"
+        message = f"{_context(path, candidate, tuple_index)}: {component} {value} is outside {supported_range}."
+        raise _error(
+            KmlCoordinateError,
+            message,
+            code=KmlDiagnosticCode.COORDINATE_OUT_OF_RANGE,
+            summary=f"Coordinate {tuple_index} has an out-of-range {component}.",
+            explanation=f"{component.title()} {value} is outside the supported range {supported_range} degrees.",
+            suggestion=f"Check longitude/latitude ordering and enter the intended {component}.",
+            location=location,
         )
-    if not -90.0 <= latitude <= 90.0:
-        raise KmlCoordinateError(
-            f"{_context(path, candidate, tuple_index)}: latitude {latitude} is outside -90 to 90."
-        )
+
+    if not inspection.valid or inspection.numbers is None:
+        raise AssertionError("Coordinate arity must be checked before creating a KML point.")
+    longitude, latitude = inspection.numbers[:2]
+    altitude = inspection.numbers[2] if len(inspection.numbers) == 3 else None
     return KmlPoint(latitude=latitude, longitude=longitude, altitude_m=altitude)
 
 
@@ -284,28 +487,81 @@ def _parse_line_string(
     path: Path,
     candidate: _TrackCandidate,
     namespace: str,
+    source_text: str | None,
 ) -> tuple[KmlPoint, ...]:
     coordinates_tag = _qualified(namespace, "coordinates")
     containers = [child for child in candidate.element if child.tag == coordinates_tag]
     if len(containers) != 1:
-        raise KmlStructureError(
-            f"{_context(path, candidate)}: expected exactly one coordinates element, found {len(containers)}."
+        message = f"{_context(path, candidate)}: expected exactly one coordinates element, found {len(containers)}."
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.STRUCTURE_UNSUPPORTED,
+            summary="The LineString does not have exactly one coordinates element.",
+            explanation=f"A supported LineString requires one coordinates element; {len(containers)} were found.",
+            suggestion="Keep one coordinates element containing the intended flight path.",
+            location=_element_location(source_text, "LineString"),
         )
 
     text = containers[0].text
-    tokens = text.split() if text else []
-    if not tokens:
-        raise KmlCoordinateError(f"{_context(path, candidate)}: coordinates element is empty.")
+    token_matches = re.finditer(r"\S+", text) if text else iter(())
+    first_match = next(token_matches, None)
+    if first_match is None:
+        message = f"{_context(path, candidate)}: coordinates element is empty."
+        raise _error(
+            KmlCoordinateError,
+            message,
+            code=KmlDiagnosticCode.COORDINATES_EMPTY,
+            summary="The coordinates element is empty.",
+            explanation="The selected LineString contains no coordinate tuples.",
+            suggestion="Add at least two longitude,latitude tuples and optional altitude values.",
+            location=_element_location(source_text, "coordinates"),
+        )
 
+    container_offset = _unique_text_offset(source_text, text)
     points: list[KmlPoint] = []
-    for index, token in enumerate(tokens, start=1):
-        values = token.split(",")
-        if len(values) not in (2, 3) or any(value == "" for value in values):
-            raise KmlCoordinateError(
+    matches = chain((first_match,), token_matches)
+    for index, match in enumerate(matches, start=1):
+        token = match.group()
+        location_offset = (
+            container_offset + match.start() if container_offset is not None else None
+        )
+        inspection = inspect_line_string_coordinate(token)
+        if inspection.issue == CoordinateTokenIssue.ARITY:
+            message = (
                 f'{_context(path, candidate, index)}: "{token}" must contain longitude,latitude '
                 "and optional altitude."
             )
-        points.append(_make_point(values, path, candidate, index))
+            raise _error(
+                KmlCoordinateError,
+                message,
+                code=KmlDiagnosticCode.COORDINATE_ARITY,
+                summary=f"Coordinate {index} has the wrong number of values.",
+                explanation=(
+                    f'The token "{token}" is not a complete KML coordinate. LineString '
+                    "coordinates are whitespace-separated longitude,latitude tuples with an optional altitude."
+                ),
+                suggestion=(
+                    "Inspect whether the token is unintended and should be removed, or complete it "
+                    "with the intended longitude, latitude and optional altitude."
+                ),
+                location=(
+                    _location_at(source_text, location_offset, len(token))
+                    if location_offset is not None
+                    else None
+                ),
+            )
+        points.append(
+            _make_point(
+                inspection,
+                path,
+                candidate,
+                index,
+                source_text,
+                location_offset,
+                len(token),
+            )
+        )
     return tuple(points)
 
 
@@ -313,6 +569,7 @@ def _altitude_mode(
     path: Path,
     candidate: _TrackCandidate,
     namespace: str,
+    source_text: str | None,
 ) -> str:
     supported = {
         "absolute",
@@ -330,19 +587,40 @@ def _altitude_mode(
             value = child.text.strip()
             if value in supported:
                 return value
-            raise KmlStructureError(
-                f'{_context(path, candidate)}: unsupported altitude mode "{value}".'
+            message = f'{_context(path, candidate)}: unsupported altitude mode "{value}".'
+            raise _error(
+                KmlStructureError,
+                message,
+                code=KmlDiagnosticCode.STRUCTURE_UNSUPPORTED,
+                summary="The geometry uses an unsupported altitude mode.",
+                explanation=f'The altitude mode "{value}" is not supported by the shared KML parser.',
+                suggestion="Use a standard KML altitudeMode value appropriate for the source data.",
+                location=_unique_text_location(source_text, value),
             )
     return "clampToGround"
 
 
-def _parse_gx_track(path: Path, candidate: _TrackCandidate) -> tuple[KmlPoint, ...]:
+def _parse_gx_track(
+    path: Path,
+    candidate: _TrackCandidate,
+    namespace: str,
+    source_text: str | None,
+) -> tuple[KmlPoint, ...]:
     coord_tag = _qualified(GX_NAMESPACE, "coord")
     elements = [child for child in candidate.element if child.tag == coord_tag]
     if not elements:
-        raise KmlCoordinateError(f"{_context(path, candidate)}: gx:Track contains no gx:coord elements.")
+        message = f"{_context(path, candidate)}: gx:Track contains no gx:coord elements."
+        raise _error(
+            KmlCoordinateError,
+            message,
+            code=KmlDiagnosticCode.COORDINATES_EMPTY,
+            summary="The gx:Track contains no coordinates.",
+            explanation="A supported gx:Track requires at least two gx:coord elements.",
+            suggestion="Add gx:coord elements containing longitude latitude altitude values.",
+            location=_element_location(source_text, "Track"),
+        )
 
-    when_tags = {_qualified(KML_NAMESPACE, "when"), "when"}
+    when_tags = {_qualified(namespace, "when")}
     timestamps = [
         child.text.strip() if child.text and child.text.strip() else None
         for child in candidate.element
@@ -355,16 +633,49 @@ def _parse_gx_track(path: Path, candidate: _TrackCandidate) -> tuple[KmlPoint, .
     for index, element in enumerate(elements, start=1):
         text = element.text.strip() if element.text else ""
         if not text:
-            raise KmlCoordinateError(
+            message = (
                 f"{_context(path, candidate, index)}: empty gx:coord values require "
                 "interpolation, which is not supported."
             )
-        values = text.split()
-        if len(values) != 3:
-            raise KmlCoordinateError(
-                f'{_context(path, candidate, index)}: "{text}" must contain longitude latitude altitude.'
+            raise _error(
+                KmlCoordinateError,
+                message,
+                code=KmlDiagnosticCode.COORDINATES_EMPTY,
+                summary=f"Coordinate {index} is empty.",
+                explanation="Empty gx:coord values would require interpolation, which is not supported.",
+                suggestion="Enter the intended longitude latitude altitude values.",
+                location=None,
             )
-        point = _make_point(values, path, candidate, index)
+        inspection = inspect_gx_coordinate(text)
+        location_offset = (
+            _unique_text_offset(source_text, text)
+            if inspection.issue is not None
+            else None
+        )
+        if inspection.issue == CoordinateTokenIssue.ARITY:
+            message = f'{_context(path, candidate, index)}: "{text}" must contain longitude latitude altitude.'
+            raise _error(
+                KmlCoordinateError,
+                message,
+                code=KmlDiagnosticCode.COORDINATE_ARITY,
+                summary=f"Coordinate {index} has the wrong number of values.",
+                explanation="Each gx:coord must contain exactly longitude latitude altitude.",
+                suggestion="Complete or replace the coordinate with exactly three decimal values.",
+                location=(
+                    _location_at(source_text, location_offset, len(text))
+                    if location_offset is not None
+                    else None
+                ),
+            )
+        point = _make_point(
+            inspection,
+            path,
+            candidate,
+            index,
+            source_text,
+            location_offset,
+            len(text),
+        )
         points.append(
             KmlPoint(
                 latitude=point.latitude,
@@ -376,29 +687,33 @@ def _parse_gx_track(path: Path, candidate: _TrackCandidate) -> tuple[KmlPoint, .
     return tuple(points)
 
 
-def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
-    """Parse exactly one KML LineString or gx:Track into a shared track model.
-
-    Altitudes are returned exactly as encoded. A two-dimensional LineString
-    coordinate has ``altitude_m=None``; no altitude-mode or terrain conversion
-    is performed.
-    """
-    path = Path(file_path)
-    if path.suffix.lower() == ".kmz":
-        raise KmlStructureError(f"{path.name}: KMZ archives are not supported; select a KML file.")
-
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
-        line, column = getattr(exc, "position", (None, None))
-        location = f" at line {line}, column {column}" if line is not None else ""
-        raise KmlXmlError(f"{path.name}: invalid XML{location}: {exc}.") from exc
-
+def _parse_root(root: ET.Element, path: Path, source_text: str | None) -> KmlTrack:
     namespace, local_name = _split_tag(root.tag)
     if local_name != "kml":
-        raise KmlStructureError(f'{path.name}: expected a kml root element, found "{local_name}".')
-    if namespace not in ("", KML_NAMESPACE):
-        raise KmlStructureError(f'{path.name}: unsupported KML namespace "{namespace}".')
+        message = f'{path.name}: expected a kml root element, found "{local_name}".'
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.ROOT_ELEMENT,
+            summary="The document root is not kml.",
+            explanation=f'The root element is "{local_name}"; a KML document must start with kml.',
+            suggestion="Check that the selected file is KML and use a kml root element.",
+            location=_element_location(source_text, local_name),
+        )
+    if namespace not in SUPPORTED_KML_NAMESPACES:
+        message = f'{path.name}: unsupported KML namespace "{namespace}".'
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.NAMESPACE_UNSUPPORTED,
+            summary="The KML namespace is not supported.",
+            explanation=(
+                f'The root namespace is "{namespace}". Only namespace-free KML, OGC KML 2.2 '
+                "and the explicit Google KML 2.1 namespace are supported."
+            ),
+            suggestion="Confirm the document's KML version and correct the root xmlns value if it is wrong.",
+            location=_unique_text_location(source_text, namespace),
+        )
 
     placemark_tag = _qualified(namespace, "Placemark")
     line_string_tag = _qualified(namespace, "LineString")
@@ -414,8 +729,15 @@ def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
                 candidates.append(_TrackCandidate(element, placemark, "gx_track", name))
 
     if not candidates:
-        raise KmlStructureError(
-            f"{path.name}: no supported LineString or gx:Track flight path was found inside a Placemark."
+        message = f"{path.name}: no supported LineString or gx:Track flight path was found inside a Placemark."
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.GEOMETRY_MISSING,
+            summary="No supported flight-path geometry was found.",
+            explanation="The parser found no LineString or gx:Track inside a Placemark.",
+            suggestion="Place exactly one intended LineString or gx:Track flight path inside a Placemark.",
+            location=_element_location(source_text, "kml"),
         )
     if len(candidates) > 1:
         descriptions = [
@@ -423,29 +745,286 @@ def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
             f'({"LineString" if candidate.geometry_kind == "line_string" else "gx:Track"})'
             for candidate in candidates
         ]
-        raise KmlStructureError(
+        message = (
             f"{path.name}: found {len(candidates)} flight paths; exactly one is required: "
             + "; ".join(descriptions)
             + "."
         )
+        first_geometry = "LineString" if candidates[0].geometry_kind == "line_string" else "Track"
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.GEOMETRY_AMBIGUOUS,
+            summary=f"The document contains {len(candidates)} supported flight paths.",
+            explanation="The parser cannot choose between: " + "; ".join(descriptions) + ".",
+            suggestion="Keep only the intended flight path or move unrelated geometry outside its Placemark.",
+            location=_element_location(source_text, first_geometry),
+        )
 
     candidate = candidates[0]
     if candidate.geometry_kind == "line_string":
-        points = _parse_line_string(path, candidate, namespace)
+        points = _parse_line_string(path, candidate, namespace, source_text)
     else:
-        points = _parse_gx_track(path, candidate)
+        points = _parse_gx_track(path, candidate, namespace, source_text)
 
     if len(points) < 2:
-        raise KmlStructureError(
-            f"{_context(path, candidate)}: at least two coordinates are required; found {len(points)}."
+        message = f"{_context(path, candidate)}: at least two coordinates are required; found {len(points)}."
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.STRUCTURE_UNSUPPORTED,
+            summary="The flight path has fewer than two coordinates.",
+            explanation=f"A path needs at least two positions; this geometry contains {len(points)}.",
+            suggestion="Add the missing intended coordinate or select a different flight-path geometry.",
+            location=_element_location(
+                source_text,
+                "LineString" if candidate.geometry_kind == "line_string" else "Track",
+            ),
         )
     return KmlTrack(
         points=points,
         geometry_kind=candidate.geometry_kind,
         placemark_name=candidate.placemark_name,
-        altitude_mode=_altitude_mode(path, candidate, namespace),
+        altitude_mode=_altitude_mode(path, candidate, namespace, source_text),
         source_line_colour=_placemark_line_colour(root, candidate.placemark, namespace),
     )
+
+
+def _xml_error(path: Path, error: ET.ParseError, source_text: str | None) -> KmlXmlError:
+    line, zero_based_column = getattr(error, "position", (None, None))
+    location_text = (
+        f" at line {line}, column {zero_based_column}"
+        if line is not None
+        else ""
+    )
+    message = f"{path.name}: invalid XML{location_text}: {error}."
+    one_based_column = zero_based_column + 1 if zero_based_column is not None else None
+    diagnostic_location = _location_from_line_column(source_text, line, one_based_column)
+    if diagnostic_location is None and line is not None and one_based_column is not None:
+        diagnostic_location = KmlSourceLocation(line=line, column=one_based_column)
+    return _error(
+        KmlXmlError,
+        message,
+        code=KmlDiagnosticCode.XML_MALFORMED,
+        summary="The XML is not well formed.",
+        explanation=str(error),
+        suggestion="Inspect the nearby opening, closing and quoted XML syntax and correct the mismatch.",
+        location=diagnostic_location,
+    )
+
+
+def _source_span(node) -> KmlSourceSpan | None:
+    if node.end is None:
+        return None
+    return KmlSourceSpan(node.start, node.end)
+
+
+def _track_source_binding(
+    contents: str,
+    track: KmlTrack,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> KmlTrackSourceBinding:
+    """Bind the semantically selected track back to exact source bytes."""
+    root, nodes = scan_xml_source(contents, cancellation_check=cancellation_check)
+    if root is None:
+        raise ValueError("The KML source has no root element.")
+    namespace = root.namespace
+    local_name = "LineString" if track.geometry_kind == "line_string" else "Track"
+    geometry_namespace = namespace if track.geometry_kind == "line_string" else GX_NAMESPACE
+    candidates = [
+        node
+        for node in nodes
+        if node.namespace == geometry_namespace
+        and node.local_name == local_name
+        and has_ancestor(node, namespace=namespace, local_name="Placemark")
+    ]
+    if len(candidates) != 1:
+        raise ValueError("The selected flight path could not be mapped uniquely to its source.")
+    geometry = candidates[0]
+    points = [
+        node
+        for node in nodes
+        if node.namespace == namespace
+        and node.local_name == "Point"
+        and has_ancestor(node, namespace=namespace, local_name="Placemark")
+    ]
+    warnings: list[str] = []
+    if points:
+        warnings.append(
+            f"Preserved {len(points)} Point feature{'s' if len(points) != 1 else ''}; "
+            "their relationship to the flight path cannot be established safely."
+        )
+
+    if track.geometry_kind == "line_string":
+        containers = [
+            child
+            for child in geometry.children
+            if child.namespace == namespace and child.local_name == "coordinates"
+        ]
+        if len(containers) != 1 or containers[0].close_start is None:
+            raise ValueError("The selected LineString coordinates could not be mapped safely.")
+        container = containers[0]
+        data = contents.encode("utf-8")
+        body = data[container.content_start : container.close_start]
+        unsafe_reason = None
+        if b"<" in body or b"&" in body:
+            unsafe_reason = (
+                "Apply is unavailable because the selected coordinates use markup, "
+                "CDATA or entity references that cannot be rewritten source-safely."
+            )
+        spans = tuple(
+            KmlSourceSpan(
+                container.content_start + match.start(),
+                container.content_start + match.end(),
+            )
+            for match in re.finditer(rb"\S+", body)
+        )
+        return KmlTrackSourceBinding(
+            geometry_kind=track.geometry_kind,
+            coordinate_spans=spans,
+            coordinate_body_span=KmlSourceSpan(
+                container.content_start,
+                container.close_start,
+            ),
+            companion_point_count=len(points),
+            warnings=tuple(warnings),
+            unsafe_reason=unsafe_reason,
+        )
+
+    coordinate_nodes = [
+        child
+        for child in geometry.children
+        if child.namespace == GX_NAMESPACE and child.local_name == "coord"
+    ]
+    coordinate_spans = tuple(
+        span for node in coordinate_nodes if (span := _source_span(node)) is not None
+    )
+    aligned: list[KmlAlignedSourceSeries] = []
+    series_candidates: list[tuple[str, list]] = [
+        (
+            "timestamps",
+            [
+                child
+                for child in geometry.children
+                if child.namespace == namespace and child.local_name == "when"
+            ],
+        ),
+        (
+            "angles",
+            [
+                child
+                for child in geometry.children
+                if child.namespace == GX_NAMESPACE and child.local_name == "angles"
+            ],
+        ),
+    ]
+    def belongs_to_selected_geometry(node) -> bool:
+        parent = node.parent
+        while parent is not None:
+            if parent is geometry:
+                return True
+            parent = parent.parent
+        return False
+
+    simple_arrays = [
+        node
+        for node in nodes
+        if node.namespace == GX_NAMESPACE
+        and node.local_name == "SimpleArrayData"
+        and belongs_to_selected_geometry(node)
+    ]
+    for index, array in enumerate(simple_arrays, start=1):
+        series_candidates.append(
+            (
+                f"extended data array {index}",
+                [
+                    child
+                    for child in array.children
+                    if child.namespace == GX_NAMESPACE and child.local_name == "value"
+                ],
+            )
+        )
+    for label, elements in series_candidates:
+        spans = tuple(
+            span for node in elements if (span := _source_span(node)) is not None
+        )
+        if len(spans) == len(coordinate_spans) and spans:
+            aligned.append(KmlAlignedSourceSeries(label, spans))
+        elif spans:
+            warnings.append(
+                f"Preserved unaligned {label}; {len(spans)} values do not match "
+                f"{len(coordinate_spans)} flight-path points."
+            )
+    return KmlTrackSourceBinding(
+        geometry_kind=track.geometry_kind,
+        coordinate_spans=coordinate_spans,
+        aligned_series=tuple(aligned),
+        companion_point_count=len(points),
+        warnings=tuple(warnings),
+    )
+
+
+def parse_kml_text(
+    contents: str,
+    *,
+    source_name: str = "untitled.kml",
+    cancellation_check: Callable[[], bool] | None = None,
+) -> KmlTrack:
+    """Parse current editor text through the shared KML semantic parser."""
+    if not isinstance(contents, str):
+        raise TypeError("contents must be text")
+    path = Path(source_name)
+    try:
+        parser = ET.XMLParser()
+        chunk_size = 256 * 1024
+        for offset in range(0, len(contents), chunk_size):
+            if cancellation_check is not None and cancellation_check():
+                raise RuntimeError("KML validation was cancelled.")
+            parser.feed(contents[offset : offset + chunk_size])
+        root = parser.close()
+    except ET.ParseError as error:
+        raise _xml_error(path, error, contents) from error
+    track = _parse_root(root, path, contents)
+    try:
+        binding = _track_source_binding(contents, track, cancellation_check)
+    except Exception:
+        if cancellation_check is not None and cancellation_check():
+            raise RuntimeError("KML validation was cancelled.")
+        binding = KmlTrackSourceBinding(
+            geometry_kind=track.geometry_kind,
+            coordinate_spans=(),
+            unsafe_reason=(
+                "Apply is unavailable because the selected flight path could not be "
+                "mapped uniquely back to the source text."
+            ),
+        )
+    return replace(track, source_binding=binding)
+
+
+def parse_kml_track(file_path: str | os.PathLike[str]) -> KmlTrack:
+    """Parse exactly one KML LineString or gx:Track into a shared track model.
+
+    Altitudes are returned exactly as encoded. A two-dimensional LineString
+    coordinate has ``altitude_m=None``; no altitude-mode or terrain conversion
+    is performed.
+    """
+    path = Path(file_path)
+    if path.suffix.lower() == ".kmz":
+        message = f"{path.name}: KMZ archives are not supported; select a KML file."
+        raise _error(
+            KmlStructureError,
+            message,
+            code=KmlDiagnosticCode.STRUCTURE_UNSUPPORTED,
+            summary="KMZ archives are not supported.",
+            explanation="The shared parser accepts raw .kml XML documents, not compressed KMZ archives.",
+            suggestion="Extract and select the intended .kml document.",
+        )
+
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as error:
+        raise _xml_error(path, error, None) from error
+    return _parse_root(root, path, None)
 
 
 def parse_kml(file_path: str | os.PathLike[str]) -> list[tuple[float, float, float]]:

@@ -701,6 +701,7 @@ class ResponsivePageLayoutTests(unittest.TestCase):
         transpose_scroll = self.window.page_scrolls[self.window.transpose_page]
         debris_scroll = self.window.page_scrolls[self.window.debris_page]
         editor_scroll = self.window.page_scrolls[self.window.kml_editor_page]
+        self.window.kml_editor_page.crop_mode_button.click()
 
         for width, height in ((900, 600), (1000, 700), (1280, 768), (1440, 900)):
             self.window.resize(width, height)
@@ -731,6 +732,10 @@ class ResponsivePageLayoutTests(unittest.TestCase):
             self.assertLessEqual(
                 self.window.kml_editor_page.width(),
                 editor_scroll.viewport().width(),
+            )
+            self.assertLessEqual(
+                self.window.kml_editor_page.crop_preview_stack.width(),
+                self.window.kml_editor_page.crop_page.width(),
             )
             self.assertIs(editor_scroll.widget(), self.window.kml_editor_page)
 

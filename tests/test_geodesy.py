@@ -102,6 +102,14 @@ class LocalEnuFrameTests(unittest.TestCase):
         self.assertAlmostEqual(north.east_m, 0.0, places=5)
         self.assertAlmostEqual(north.north_m, 1_000.0, places=5)
 
+    def test_vectorised_batch_matches_individual_transformations(self):
+        frame = LocalEnuFrame(51.0, -1.0)
+        points = ((51.0, -1.0), (51.001, -0.999), (50.999, -1.002))
+        self.assertEqual(
+            frame.to_enu_many(points),
+            tuple(frame.to_enu(*point) for point in points),
+        )
+
     def test_invalid_enu_values_fail_explicitly(self):
         with self.assertRaises(ValueError):
             LocalEnuFrame(float("nan"), 0.0)

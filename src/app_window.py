@@ -12,6 +12,7 @@ from icon_utils import refresh_icons
 from map_preview_widget import MapPreviewWidget, WEBENGINE_AVAILABLE
 from resource_paths import find_icon_path
 from settings_dialog import SettingsDialog
+from services import PreviewPresentation
 from theme import ThemeController, apply_card_shadows
 
 
@@ -104,7 +105,10 @@ class App(QMainWindow):
 
         self.transpose_page = TransposePage()
         self.debris_page = DebrisPage()
-        self.kml_editor_page = KmlEditorPage()
+        self.kml_editor_page = KmlEditorPage(
+            settings=self.theme_controller.settings,
+            maps_settings=self.maps_settings,
+        )
         self.map_preview = MapPreviewWidget()
         self.workspace_stack.addWidget(self.map_preview)
         self.map_preview.close_requested.connect(self.close_map_preview)
@@ -122,17 +126,35 @@ class App(QMainWindow):
         self.debris_page.preview_requested.connect(
             lambda scene: self.open_map_preview(self.debris_page, scene)
         )
+        self.kml_editor_page.preview_requested.connect(
+            lambda scene: self.open_map_preview(
+                self.kml_editor_page,
+                scene,
+                presentation=PreviewPresentation(
+                    read_only=True,
+                    title="KML Editor comparison preview",
+                    ready_message="Read-only comparison matches the current in-memory KML draft.",
+                    legend=(
+                        "Bright line — retained/resulting path",
+                        "Grey line — excluded/original path",
+                    ),
+                ),
+            )
+        )
+        self.kml_editor_page.maps_settings_requested.connect(
+            lambda: self.open_settings("Google Maps")
+        )
         self.debris_page.simulation_busy_changed.connect(
             self._on_debris_simulation_busy_changed
         )
 
         self.page_scrolls = {
+            self.kml_editor_page: self._create_page_scroll(self.kml_editor_page),
             self.transpose_page: self._create_page_scroll(self.transpose_page),
             self.debris_page: self._create_page_scroll(self.debris_page),
-            self.kml_editor_page: self._create_page_scroll(self.kml_editor_page),
         }
 
-        self.set_page(self.transpose_page)
+        self.set_page(self.kml_editor_page)
         self.theme_controller.effective_mode_changed.connect(
             self._apply_theme_decorations
         )
@@ -203,20 +225,20 @@ class App(QMainWindow):
 
         # Keep these long-standing attribute names for compatibility with the
         # page-switching and simulation-lockout tests.
+        self.rb_kml_editor = QPushButton("KML Editor")
         self.rb_transpose = QPushButton("Transpose to Airfield")
         self.rb_debris = QPushButton("Debris Trajectory")
-        self.rb_kml_editor = QPushButton("KML Editor")
         self.top_level_mode_buttons = (
+            self.rb_kml_editor,
             self.rb_transpose,
             self.rb_debris,
-            self.rb_kml_editor,
         )
         for button in self.top_level_mode_buttons:
             button.setObjectName("modeSegment")
             button.setCheckable(True)
             switch_layout.addWidget(button, 1)
 
-        self.rb_transpose.setChecked(True)
+        self.rb_kml_editor.setChecked(True)
 
         self.mode_group.addButton(self.rb_transpose)
         self.mode_group.addButton(self.rb_debris)
@@ -332,7 +354,7 @@ class App(QMainWindow):
             return None
         return key
 
-    def open_map_preview(self, owner, scene) -> bool:
+    def open_map_preview(self, owner, scene, *, presentation=None) -> bool:
         if not WEBENGINE_AVAILABLE:
             QMessageBox.critical(
                 self,
@@ -353,7 +375,10 @@ class App(QMainWindow):
         self.map_preview.set_fullscreen_state(self.isFullScreen())
         self.map_preview.setFocus(Qt.FocusReason.OtherFocusReason)
         try:
-            started = self.map_preview.set_scene(scene, key)
+            if presentation is None:
+                started = self.map_preview.set_scene(scene, key)
+            else:
+                started = self.map_preview.set_scene(scene, key, presentation)
             if started is False:
                 raise RuntimeError(
                     "The secure local preview service could not be started."
@@ -466,6 +491,7 @@ class App(QMainWindow):
                 self._close_pending = False
                 event.ignore()
                 return
+            self.kml_editor_page.shutdown()
             self.map_preview.shutdown()
             event.accept()
             return

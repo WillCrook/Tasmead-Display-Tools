@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import math
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .geodesy import EnuCoordinate, LocalEnuFrame, inverse_distance_bearing
 from .kml_export import (
@@ -299,6 +299,7 @@ class PreparedTrace:
     adjustment: TraceAdjustment = field(default_factory=TraceAdjustment)
     anchor_altitude_mode: str = "clampToGround"
     adjusted_document: KmlDocument = field(init=False)
+    _adjusted_anchor: KmlCoordinate = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.trace_id, str) or not self.trace_id.strip():
@@ -310,6 +311,29 @@ class PreparedTrace:
         _maps_altitude_mode(self.anchor_altitude_mode)
         validated_anchor = _validated_coordinate(self.anchor, "Anchor")
         object.__setattr__(self, "anchor", validated_anchor)
+        if self.adjustment.east_m == 0.0 and self.adjustment.north_m == 0.0:
+            adjusted_latitude = validated_anchor.latitude
+            adjusted_longitude = validated_anchor.longitude
+        else:
+            frame = LocalEnuFrame(validated_anchor.latitude, validated_anchor.longitude)
+            adjusted_latitude, adjusted_longitude = frame.to_wgs84(
+                EnuCoordinate(
+                    east_m=self.adjustment.east_m,
+                    north_m=self.adjustment.north_m,
+                    up_m=0.0,
+                )
+            )
+        adjusted_altitude = (
+            self.adjustment.up_m
+            if self.anchor_altitude_mode == "clampToGround"
+            and self.adjustment.up_m != 0.0
+            else validated_anchor.altitude_m + self.adjustment.up_m
+        )
+        object.__setattr__(
+            self,
+            "_adjusted_anchor",
+            KmlCoordinate(adjusted_longitude, adjusted_latitude, adjusted_altitude),
+        )
         object.__setattr__(
             self,
             "adjusted_document",
@@ -330,22 +354,7 @@ class PreparedTrace:
     @property
     def adjusted_anchor(self) -> KmlCoordinate:
         """Return the trace anchor after its current ENU translation."""
-
-        frame = LocalEnuFrame(self.anchor.latitude, self.anchor.longitude)
-        latitude, longitude = frame.to_wgs84(
-            EnuCoordinate(
-                east_m=self.adjustment.east_m,
-                north_m=self.adjustment.north_m,
-                up_m=0.0,
-            )
-        )
-        altitude = (
-            self.adjustment.up_m
-            if self.anchor_altitude_mode == "clampToGround"
-            and self.adjustment.up_m != 0.0
-            else self.anchor.altitude_m + self.adjustment.up_m
-        )
-        return KmlCoordinate(longitude, latitude, altitude)
+        return self._adjusted_anchor
 
     @property
     def adjusted_anchor_altitude_mode(self) -> str:
@@ -407,6 +416,18 @@ class PreviewScene:
         object.__setattr__(self, "traces", traces)
 
 
+@dataclass(frozen=True, slots=True)
+class PreviewPresentation:
+    """Native control policy for the shared embedded preview workspace."""
+
+    read_only: bool = False
+    embedded: bool = False
+    measurement_enabled: bool = True
+    title: str = "Google Maps 3D preview"
+    ready_message: str = "Preview matches the KML that will be exported."
+    legend: tuple[str, ...] = ()
+
+
 def kml_colour_to_css(colour: str) -> str:
     """Convert an eight-digit KML ``aabbggrr`` colour to CSS ``#rrggbbaa``."""
 
@@ -451,6 +472,7 @@ def _geometry_payload(
     placemark: KmlPlacemark,
     style: KmlStyle,
     geometry_id: str,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     geometry = placemark.geometry
     common: dict[str, object] = {
@@ -461,35 +483,45 @@ def _geometry_payload(
         "altitudeMode": _maps_altitude_mode(geometry.altitude_mode),
     }
     if isinstance(geometry, KmlLineString):
+        coordinates = []
+        for index, coordinate in enumerate(geometry.coordinates):
+            if index % 2048 == 0 and cancellation_check is not None and cancellation_check():
+                raise RuntimeError("Preview payload preparation was cancelled.")
+            coordinates.append(_coordinate_payload(coordinate))
         return {
             **common,
             "type": "polyline",
             "extrude": geometry.extrude_to_ground,
             "tessellate": geometry.tessellate,
-            "coordinates": [
-                _coordinate_payload(coordinate)
-                for coordinate in geometry.coordinates
-            ],
+            "coordinates": coordinates,
         }
     if isinstance(geometry, KmlPolygon):
+        coordinates = []
+        for index, coordinate in enumerate(geometry.outer_ring):
+            if index % 2048 == 0 and cancellation_check is not None and cancellation_check():
+                raise RuntimeError("Preview payload preparation was cancelled.")
+            coordinates.append(_coordinate_payload(coordinate))
         return {
             **common,
             "type": "polygon",
-            "coordinates": [
-                _coordinate_payload(coordinate)
-                for coordinate in geometry.outer_ring
-            ],
+            "coordinates": coordinates,
         }
     raise TypeError("Unsupported KML geometry in preview document.")
 
 
-def preview_payload(scene: PreviewScene) -> dict[str, Any]:
+def preview_payload(
+    scene: PreviewScene,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Build a JSON-serializable Maps payload from canonical trace documents."""
 
     if not isinstance(scene, PreviewScene):
         raise TypeError("scene must be a PreviewScene.")
     traces: list[dict[str, object]] = []
     for trace in scene.traces:
+        if cancellation_check is not None and cancellation_check():
+            raise RuntimeError("Preview payload preparation was cancelled.")
         document = trace.adjusted_document
         styles: dict[str, KmlStyle] = {}
         for style in document.styles:
@@ -498,6 +530,8 @@ def preview_payload(scene: PreviewScene) -> dict[str, Any]:
             styles[style.style_id] = style
         geometries: list[dict[str, object]] = []
         for geometry_index, placemark in enumerate(document.placemarks):
+            if cancellation_check is not None and cancellation_check():
+                raise RuntimeError("Preview payload preparation was cancelled.")
             if not placemark.style_url.startswith("#"):
                 raise ValueError(
                     f'Placemark "{placemark.name}" has an invalid style URL.'
@@ -513,6 +547,7 @@ def preview_payload(scene: PreviewScene) -> dict[str, Any]:
                     placemark,
                     style,
                     f"geometry-{geometry_index}",
+                    cancellation_check,
                 )
             )
 
@@ -546,6 +581,7 @@ __all__ = [
     "MAX_HORIZONTAL_OFFSET_M",
     "MAX_VERTICAL_OFFSET_M",
     "PreparedTrace",
+    "PreviewPresentation",
     "PreviewScene",
     "TraceAdjustment",
     "apply_enu_adjustment",

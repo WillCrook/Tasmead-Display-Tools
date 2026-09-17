@@ -328,6 +328,15 @@ class ModernHeaderTests(unittest.TestCase):
         self.assertEqual(self.window.rb_transpose.text(), "Transpose to Airfield")
         self.assertEqual(self.window.rb_debris.text(), "Debris Trajectory")
         self.assertEqual(self.window.rb_kml_editor.text(), "KML Editor")
+        self.assertEqual(
+            tuple(button.text() for button in self.window.top_level_mode_buttons),
+            ("KML Editor", "Transpose to Airfield", "Debris Trajectory"),
+        )
+        self.assertTrue(self.window.rb_kml_editor.isChecked())
+        self.assertIs(
+            self.window.page_stack.currentWidget(),
+            self.window.page_scrolls[self.window.kml_editor_page],
+        )
         self.assertEqual(self.window.settings_button.accessibleName(), "Open settings")
         self.assertGreater(
             self.window.settings_button.mapTo(self.window, self.window.settings_button.pos()).x(),

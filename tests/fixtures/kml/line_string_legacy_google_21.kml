@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<legacy:kml xmlns:legacy="http://earth.google.com/kml/2.1">
+  <legacy:Placemark>
+    <legacy:name>Legacy route</legacy:name>
+    <legacy:LineString>
+      <legacy:altitudeMode>absolute</legacy:altitudeMode>
+      <legacy:coordinates>-0.7,51.2,100 -0.6,51.3,125</legacy:coordinates>
+    </legacy:LineString>
+  </legacy:Placemark>
+</legacy:kml>
