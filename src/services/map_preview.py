@@ -426,6 +426,7 @@ class PreviewPresentation:
     title: str = "Google Maps 3D preview"
     ready_message: str = "Preview matches the KML that will be exported."
     legend: tuple[str, ...] = ()
+    controls_panel_visible: bool = True
 
 
 def kml_colour_to_css(colour: str) -> str:

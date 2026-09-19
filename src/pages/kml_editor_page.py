@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from uuid import UUID
 
@@ -56,6 +57,9 @@ from services import (
     PreviewPresentation,
 )
 from services.kml_editor_operations import timestamp_info
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 PAGE_STYLE = """
@@ -490,11 +494,6 @@ class KmlEditorPage(QWidget):
         title = QLabel("Crop flight path")
         title.setObjectName("panelTitle")
         layout.addWidget(title)
-        self.crop_timing_label = QLabel("Select a valid KML flight path.")
-        self.crop_timing_label.setObjectName("mutedText")
-        self.crop_timing_label.setWordWrap(True)
-        self.crop_timing_label.setAccessibleName("Crop timeline availability")
-        layout.addWidget(self.crop_timing_label)
 
         self.crop_preview_stack = QStackedWidget()
         self.crop_preview_stack.setMinimumHeight(280)
@@ -566,13 +565,18 @@ class KmlEditorPage(QWidget):
         layout.addWidget(self.crop_status_label)
         actions = QHBoxLayout()
         self.crop_reset_btn = QPushButton("Reset range")
+        self.crop_recentre_btn = QPushButton("Recentre view")
+        self.crop_recentre_btn.setAccessibleName("Recentre crop map view")
+        self.crop_recentre_btn.setEnabled(False)
         self.crop_apply_btn = QPushButton("Apply Crop")
         self.crop_apply_btn.setObjectName("primaryButton")
         self.crop_cancel_btn = QPushButton("Cancel task")
         self.crop_reset_btn.clicked.connect(self.reset_crop)
+        self.crop_recentre_btn.clicked.connect(self.crop_map_preview.fit_traces)
         self.crop_apply_btn.clicked.connect(self.apply_crop)
         self.crop_cancel_btn.clicked.connect(self.cancel_active_operations)
         actions.addWidget(self.crop_reset_btn)
+        actions.addWidget(self.crop_recentre_btn)
         actions.addStretch()
         actions.addWidget(self.crop_cancel_btn)
         actions.addWidget(self.crop_apply_btn)
@@ -728,7 +732,9 @@ class KmlEditorPage(QWidget):
         self.setTabOrder(self.font_reset_btn, self.text_editor)
         self.setTabOrder(self.text_editor, self.crop_range_slider)
         self.setTabOrder(self.crop_range_slider, self.crop_reset_btn)
-        self.setTabOrder(self.crop_reset_btn, self.crop_apply_btn)
+        self.setTabOrder(self.crop_reset_btn, self.crop_recentre_btn)
+        self.setTabOrder(self.crop_recentre_btn, self.crop_cancel_btn)
+        self.setTabOrder(self.crop_cancel_btn, self.crop_apply_btn)
         self.setTabOrder(
             self.crop_apply_btn,
             self.simplification_preset_buttons["high"],
@@ -1079,7 +1085,6 @@ class KmlEditorPage(QWidget):
             self.crop_start_label.setText("Start point")
             self.crop_end_label.setText("End point")
             self.crop_count_label.setText("Retained points: —")
-            self.crop_timing_label.setText("Select a current valid KML flight path.")
             self.crop_status_label.setText("")
             self.crop_cancel_btn.setEnabled(False)
             message = (
@@ -1099,12 +1104,6 @@ class KmlEditorPage(QWidget):
         self.crop_start_label.setText(self._point_label("Start", document, start))
         self.crop_end_label.setText(self._point_label("End", document, end))
         self.crop_count_label.setText(f"Retained points: {end - start + 1} of {count}")
-        timing = timestamp_info(document.parse_state.track)
-        self.crop_timing_label.setText(
-            "Aligned timestamps are available; point indexes remain the exact crop boundaries."
-            if timing.reliable
-            else f"Using point index and progress because {timing.reason.lower()}"
-        )
         crop = document.crop_state
         binding = document.parse_state.track.source_binding
         source_safe = binding is not None and not binding.unsafe_reason
@@ -1112,11 +1111,9 @@ class KmlEditorPage(QWidget):
         self.crop_cancel_btn.setEnabled(busy)
         self.crop_apply_btn.setEnabled(enabled and not busy and start < end and source_safe)
         status = {
-            OperationStatus.PREPARING: "Preparing the complete crop comparison…",
             OperationStatus.APPLYING: "Applying the crop to in-memory editor contents…",
             OperationStatus.CANCELLED: "Crop task cancelled.",
             OperationStatus.ERROR: crop.error,
-            OperationStatus.READY: "Crop preview is ready.",
         }.get(crop.status, "")
         details = " ".join(
             (*crop.warnings, binding.unsafe_reason if binding and binding.unsafe_reason else "")
@@ -1217,6 +1214,7 @@ class KmlEditorPage(QWidget):
         self.crop_preview_settings_btn.setVisible(
             bool(show_settings and self._maps_settings is not None)
         )
+        self.crop_recentre_btn.setEnabled(False)
         self.crop_preview_stack.setCurrentWidget(self.crop_preview_placeholder)
 
     def _maps_api_key(self) -> str:
@@ -1282,7 +1280,10 @@ class KmlEditorPage(QWidget):
             self._crop_preview_refresh_pending = True
             return False
         self._crop_preview_refresh_pending = False
-        return self.model.request_crop_preview(document.document_id)
+        try:
+            return self.model.request_crop_preview(document.document_id)
+        except Exception as error:
+            return self._report_crop_callback_error("Crop preview", error)
 
     def _present_crop_scene(self, document_id, scene) -> None:
         if document_id != self.model.active_document_id:
@@ -1326,20 +1327,22 @@ class KmlEditorPage(QWidget):
             read_only=True,
             embedded=True,
             measurement_enabled=False,
+            controls_panel_visible=False,
             title="Crop comparison",
-            ready_message="The map matches the current crop range.",
-            legend=(
-                "Bright line — retained path",
-                "Grey line — excluded path",
-            ),
+            ready_message="",
         )
         try:
-            self.crop_map_preview.set_scene(scene, api_key, presentation)
+            preview_started = self.crop_map_preview.set_scene(
+                scene,
+                api_key,
+                presentation,
+            )
         except Exception as error:
             self._set_crop_preview_placeholder(
                 str(error) or "The crop comparison could not be displayed."
             )
             return
+        self.crop_recentre_btn.setEnabled(preview_started)
         self._crop_preview_document_id = document_id
         self._crop_preview_refresh_pending = False
 
@@ -1460,11 +1463,27 @@ class KmlEditorPage(QWidget):
 
     def preview_crop(self) -> bool:
         document = self.model.active_document
-        return bool(document is not None and self.model.request_crop_preview(document.document_id))
+        if document is None:
+            return False
+        try:
+            return self.model.request_crop_preview(document.document_id)
+        except Exception as error:
+            return self._report_crop_callback_error("Crop preview", error)
 
     def apply_crop(self) -> bool:
         document = self.model.active_document
-        return bool(document is not None and self.model.apply_crop(document.document_id))
+        if document is None:
+            return False
+        try:
+            return self.model.apply_crop(document.document_id)
+        except Exception as error:
+            return self._report_crop_callback_error("Apply Crop", error)
+
+    def _report_crop_callback_error(self, action: str, error: Exception) -> bool:
+        message = str(error) or "An unexpected crop operation error occurred."
+        LOGGER.exception("%s callback failed: %s", action, message)
+        self.crop_status_label.setText(f"{action} failed: {message}")
+        return False
 
     def reset_simplification(self) -> None:
         document = self.model.active_document

@@ -640,6 +640,8 @@ class KmlEditorWorkspaceModel(QObject):
             return CropState(0, maximum)
         start = min(maximum, max(0, crop.start_index))
         end = min(maximum, max(start, crop.end_index))
+        if start >= end:
+            return CropState(0, maximum)
         return CropState(start, end)
 
     def add_paths(self, paths) -> AddDocumentsResult:
@@ -935,17 +937,39 @@ class KmlEditorWorkspaceModel(QObject):
         self._operation_tasks[key] = _OperationHandle(task, future)
         return True
 
+    def _validated_crop_indices(
+        self,
+        document: KmlEditorDocumentState,
+    ) -> tuple[int, ...] | None:
+        track = document.parse_state.track
+        crop = document.crop_state
+        if track is None or document.parse_state.status != ParseStatus.VALID:
+            return None
+        try:
+            if crop.start_index is None or crop.end_index is None:
+                raise ValueError("Crop range must retain at least two current track points.")
+            return crop_indices(track, crop.start_index, crop.end_index)
+        except (TypeError, ValueError, OverflowError) as error:
+            self._cancel_operation_tasks(document.document_id, "crop")
+            rejected = replace(
+                crop,
+                status=OperationStatus.ERROR,
+                operation_revision=crop.operation_revision + 1,
+                warnings=(),
+                error=str(error) or "The crop range is invalid for the current track.",
+            )
+            self._replace_document(replace(document, crop_state=rejected))
+            return None
+
     def request_crop_preview(self, document_id: UUID) -> bool:
         if self._shutting_down:
             return False
         document = self.document(document_id)
         track = document.parse_state.track
         crop = document.crop_state
-        if track is None or document.parse_state.status != ParseStatus.VALID:
+        retained = self._validated_crop_indices(document)
+        if track is None or retained is None:
             return False
-        if crop.start_index is None or crop.end_index is None:
-            return False
-        crop_indices(track, crop.start_index, crop.end_index)
         operation_revision = crop.operation_revision + 1
         crop = replace(
             crop,
@@ -976,11 +1000,9 @@ class KmlEditorWorkspaceModel(QObject):
         document = self.document(document_id)
         track = document.parse_state.track
         crop = document.crop_state
-        if track is None or document.parse_state.status != ParseStatus.VALID:
+        retained = self._validated_crop_indices(document)
+        if track is None or retained is None:
             return False
-        if crop.start_index is None or crop.end_index is None:
-            return False
-        retained = crop_indices(track, crop.start_index, crop.end_index)
         operation_revision = crop.operation_revision + 1
         crop = replace(
             crop,
@@ -1132,10 +1154,21 @@ class KmlEditorWorkspaceModel(QObject):
                 current = self._documents.get(result.document_id)
                 if current is not None:
                     if result.kind == "crop":
+                        if (
+                            current.parse_state.status == ParseStatus.VALID
+                            and current.parse_state.point_count >= 2
+                        ):
+                            start_index = 0
+                            end_index = current.parse_state.point_count - 1
+                        else:
+                            start_index = None
+                            end_index = None
                         current = replace(
                             current,
                             crop_state=replace(
                                 current.crop_state,
+                                start_index=start_index,
+                                end_index=end_index,
                                 status=OperationStatus.READY,
                                 warnings=edit.warnings,
                             ),

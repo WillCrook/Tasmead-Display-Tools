@@ -1147,6 +1147,18 @@ class MapPreviewWidget(QWidget):
         self.loading_progress.setRange(0, 0)
         self.loading_progress.setTextVisible(False)
         loading_card_layout.addWidget(self.loading_progress)
+        loading_actions = QHBoxLayout()
+        loading_actions.addStretch()
+        self.loading_retry_button = QPushButton("Retry map")
+        self.loading_retry_button.clicked.connect(self._reload_shell)
+        self.loading_retry_button.hide()
+        loading_actions.addWidget(self.loading_retry_button)
+        self.loading_settings_button = QPushButton("Open Maps Settings")
+        self.loading_settings_button.clicked.connect(self.settings_requested)
+        self.loading_settings_button.hide()
+        loading_actions.addWidget(self.loading_settings_button)
+        loading_actions.addStretch()
+        loading_card_layout.addLayout(loading_actions)
         loading_layout.addWidget(
             loading_card, alignment=Qt.AlignmentFlag.AlignHCenter
         )
@@ -1309,6 +1321,8 @@ class MapPreviewWidget(QWidget):
         self.loading_title.setText("Loading preview")
         self.loading_message.setText(message)
         self.loading_progress.show()
+        self.loading_retry_button.hide()
+        self.loading_settings_button.hide()
         self.loading_screen.show()
         self.loading_screen.raise_()
 
@@ -1325,6 +1339,8 @@ class MapPreviewWidget(QWidget):
         self.loading_title.setText("Preview")
         self.loading_message.setText(self._idle_message)
         self.loading_progress.hide()
+        self.loading_retry_button.hide()
+        self.loading_settings_button.hide()
         self.loading_screen.show()
         self.loading_screen.raise_()
 
@@ -1482,6 +1498,7 @@ class MapPreviewWidget(QWidget):
         self.tool_help_label.setVisible(tool_controls_visible)
         self.trace_selector_heading.setVisible(not embedded)
         self.trace_selector.setVisible(not embedded)
+        self.controls_panel.setVisible(self._presentation.controls_panel_visible)
         self.controls_panel.setMinimumWidth(220 if embedded else 300)
         self.controls_panel.setMaximumWidth(300 if embedded else 380)
         for widget in self.adjustment_widgets:
@@ -1909,6 +1926,16 @@ class MapPreviewWidget(QWidget):
         self.open_settings_button.setVisible(
             kind in {"authentication", "missing-key"}
         )
+        if not self._presentation.controls_panel_visible:
+            self.loading_title.setText("Map preview unavailable")
+            self.loading_message.setText(message)
+            self.loading_progress.hide()
+            self.loading_retry_button.setVisible(WEBENGINE_AVAILABLE)
+            self.loading_settings_button.setVisible(
+                kind in {"authentication", "missing-key"}
+            )
+            self.loading_screen.show()
+            self.loading_screen.raise_()
 
     def set_api_key_and_retry(self, api_key: str) -> None:
         key = str(api_key).strip()

@@ -275,6 +275,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertTrue(self.widget.apply_button.isHidden())
         self.assertTrue(self.widget.apply_export_button.isHidden())
         self.assertTrue(self.widget.legend_label.text())
+        self.assertFalse(self.widget.controls_panel.isHidden())
         self.assertFalse(self.widget.navigate_tool_button.isHidden())
         self.assertFalse(self.widget.measure_tool_button.isHidden())
 
@@ -283,14 +284,17 @@ class MapPreviewControlsTests(unittest.TestCase):
             read_only=True,
             embedded=True,
             measurement_enabled=False,
+            controls_panel_visible=False,
             title="Crop comparison",
-            legend=("Bright — retained", "Grey — excluded"),
         )
         self.widget._measurement_points = [(51.0, -1.0), (51.001, -1.0)]
         self.widget.measure_tool_button.setChecked(True)
 
         with patch.object(self.widget, "_ensure_web_view", return_value=False):
             self.widget.set_scene(scene_with_two_traces(), "test-key", presentation)
+        self.widget.resize(900, 600)
+        self.widget.show()
+        self.app.processEvents()
 
         self.assertTrue(self.widget.header.isHidden())
         self.assertTrue(self.widget.trace_selector_heading.isHidden())
@@ -301,9 +305,34 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertTrue(self.widget.measurement_label.isHidden())
         self.assertFalse(self.widget._measurement_points)
         self.assertEqual(self.widget._tool_mode, "navigate")
-        self.assertFalse(self.widget.fit_button.isHidden())
-        self.assertTrue(self.widget.legend_label.text())
+        self.assertTrue(self.widget.controls_panel.isHidden())
+        self.assertFalse(self.widget.legend_label.text())
         self.assertEqual(self.widget.controls_panel.minimumWidth(), 220)
+        self.assertGreaterEqual(self.widget.map_host.width(), self.widget.width() - 30)
+        self.assertFalse(self.widget.loading_screen.isHidden())
+        self.assertEqual(self.widget.loading_title.text(), "Map preview unavailable")
+
+    def test_hidden_controls_panel_routes_map_recovery_into_overlay(self):
+        self.widget._presentation = PreviewPresentation(
+            embedded=True,
+            controls_panel_visible=False,
+        )
+        self.widget._apply_presentation()
+        settings_requests = QSignalSpy(self.widget.settings_requested)
+
+        self.widget._show_error("authentication", "Rejected")
+
+        self.assertTrue(self.widget.controls_panel.isHidden())
+        self.assertFalse(self.widget.loading_screen.isHidden())
+        self.assertTrue(self.widget.loading_progress.isHidden())
+        self.assertEqual(self.widget.loading_message.text(), "Rejected")
+        self.assertEqual(
+            self.widget.loading_retry_button.isHidden(),
+            not WEBENGINE_AVAILABLE,
+        )
+        self.assertFalse(self.widget.loading_settings_button.isHidden())
+        self.widget.loading_settings_button.click()
+        self.assertEqual(len(settings_requests), 1)
 
     def test_reset_selected_and_reset_all_require_confirmation(self):
         with patch.object(self.widget, "_ensure_web_view", return_value=False):

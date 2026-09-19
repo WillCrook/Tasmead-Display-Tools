@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from unittest.mock import patch
@@ -285,10 +286,70 @@ class KmlEditorWorkspaceModelTests(unittest.TestCase):
         document = self.model.document(document_id)
         self.assertTrue(document.dirty)
         self.assertEqual(document.parse_state.point_count, 2)
+        self.assertEqual(
+            (document.crop_state.start_index, document.crop_state.end_index),
+            (0, 1),
+        )
+        self.assertTrue(self.model.request_crop_preview(document_id))
+        self.wait_for_operations(document_id)
+        self.assertEqual(
+            self.model.document(document_id).crop_state.status,
+            OperationStatus.READY,
+        )
         self.assertEqual(self.first.read_bytes(), original_disk)
         self.model.restore_document(document_id)
         self.assertEqual(self.model.document(document_id).contents, VALID_KML)
         self.assertEqual(self.first.read_bytes(), original_disk)
+
+    def test_validation_preserves_valid_crop_and_resets_a_collapsed_range(self):
+        document_id = self.model.add_paths([self.first]).document_ids[0]
+        self.wait_for_validation(document_id)
+
+        self.model.update_crop(document_id, 0, 1)
+        changed = self.model.document(document_id).contents.replace("-1,51,10", "-1,51,11")
+        self.model.update_contents(document_id, changed)
+        self.wait_for_validation(document_id)
+        document = self.model.document(document_id)
+        self.assertEqual(
+            (document.crop_state.start_index, document.crop_state.end_index),
+            (0, 1),
+        )
+
+        self.model.update_crop(document_id, 1, 2)
+        shortened = document.contents.replace("-1,51,11 ", "")
+        self.model.update_contents(document_id, shortened)
+        self.wait_for_validation(document_id)
+        document = self.model.document(document_id)
+        self.assertEqual(document.parse_state.point_count, 2)
+        self.assertEqual(
+            (document.crop_state.start_index, document.crop_state.end_index),
+            (0, 1),
+        )
+
+    def test_invalid_crop_range_is_a_recoverable_preview_and_apply_error(self):
+        document_id = self.model.add_paths([self.first]).document_ids[0]
+        self.wait_for_validation(document_id)
+        document = self.model.document(document_id)
+        invalid_crop = replace(document.crop_state, start_index=2, end_index=2)
+        self.model._documents[document_id] = replace(document, crop_state=invalid_crop)
+
+        self.assertFalse(self.model.request_crop_preview(document_id))
+        preview_error = self.model.document(document_id).crop_state
+        self.assertEqual(preview_error.status, OperationStatus.ERROR)
+        self.assertIn("at least two", preview_error.error)
+        self.assertEqual(
+            preview_error.operation_revision,
+            invalid_crop.operation_revision + 1,
+        )
+
+        self.assertFalse(self.model.apply_crop(document_id))
+        apply_error = self.model.document(document_id).crop_state
+        self.assertEqual(apply_error.status, OperationStatus.ERROR)
+        self.assertIn("at least two", apply_error.error)
+        self.assertEqual(
+            apply_error.operation_revision,
+            preview_error.operation_revision + 1,
+        )
 
     def test_simplification_result_is_revision_bound_and_calculated_off_thread(self):
         document_id = self.model.add_paths([self.first]).document_ids[0]

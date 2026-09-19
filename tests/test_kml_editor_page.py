@@ -259,7 +259,25 @@ class KmlEditorPageTests(unittest.TestCase):
         self.assertEqual(api_key, "test-key")
         self.assertTrue(presentation.embedded)
         self.assertFalse(presentation.measurement_enabled)
+        self.assertFalse(presentation.controls_panel_visible)
+        self.assertEqual(presentation.ready_message, "")
+        self.assertEqual(presentation.legend, ())
         self.assertEqual(len(scene.traces[0].base_document.placemarks), 2)
+        self.assertFalse(hasattr(self.page, "crop_timing_label"))
+        self.assertEqual(self.page.crop_status_label.text(), "")
+
+        actions = self.page.crop_page.layout().itemAt(
+            self.page.crop_page.layout().count() - 1
+        ).layout()
+        self.assertIs(actions.itemAt(0).widget(), self.page.crop_reset_btn)
+        self.assertIs(actions.itemAt(1).widget(), self.page.crop_recentre_btn)
+        self.assertIs(
+            self.page.crop_reset_btn.nextInFocusChain(),
+            self.page.crop_recentre_btn,
+        )
+        with patch.object(self.page.crop_map_preview, "_run_javascript") as run_script:
+            self.page.crop_recentre_btn.click()
+        run_script.assert_called_once_with("window.tasmead.fitScene();")
 
     def test_crop_preview_is_revealed_before_deferred_webengine_start(self):
         document_id = self._add(self.first)[0]
@@ -359,6 +377,36 @@ class KmlEditorPageTests(unittest.TestCase):
         request_preview.assert_called_once_with(document_id)
         crop = self.page.model.document(document_id).crop_state
         self.assertEqual((crop.start_index, crop.end_index), (1, 2))
+
+    def test_crop_callbacks_report_unexpected_errors_without_escaping(self):
+        self._add(self.first)
+        self.maps_settings.set_api_key("test-key")
+
+        with (
+            patch.object(
+                self.page.model,
+                "request_crop_preview",
+                side_effect=RuntimeError("preview boom"),
+            ),
+            self.assertLogs("pages.kml_editor_page", level="ERROR") as preview_logs,
+        ):
+            self.page.model.set_mode(EditorMode.CROP)
+
+        self.assertIn("Crop preview failed: preview boom", self.page.crop_status_label.text())
+        self.assertIn("preview boom", "\n".join(preview_logs.output))
+
+        with (
+            patch.object(
+                self.page.model,
+                "apply_crop",
+                side_effect=RuntimeError("apply boom"),
+            ),
+            self.assertLogs("pages.kml_editor_page", level="ERROR") as apply_logs,
+        ):
+            self.assertFalse(self.page.apply_crop())
+
+        self.assertIn("Apply Crop failed: apply boom", self.page.crop_status_label.text())
+        self.assertIn("apply boom", "\n".join(apply_logs.output))
 
     def test_missing_maps_key_is_inline_and_does_not_disable_apply(self):
         self._add(self.first)
