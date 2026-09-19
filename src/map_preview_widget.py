@@ -50,10 +50,11 @@ from services.map_preview import (
 
 try:  # WebEngine is optional until the user requests a preview.
     from PyQt6.QtWebChannel import QWebChannel
-    from PyQt6.QtWebEngineCore import QWebEnginePage
+    from PyQt6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePage
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 except ImportError:  # pragma: no cover - exercised on installations without WebEngine
     QWebChannel = None
+    QWebEngineLoadingInfo = None
     QWebEnginePage = None
     QWebEngineView = None
 
@@ -62,6 +63,7 @@ WEBENGINE_AVAILABLE = QWebEngineView is not None
 _CHUNK_SIZE = 128 * 1024
 _MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MAX_CSP_DIAGNOSTICS = 32
+_NAVIGATION_TIMEOUT_MS = 30_000
 _SHELL_READY_TIMEOUT_MS = 10_000
 _PRESENTATION_REFRESH_INTERVAL_MS = 33
 _NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
@@ -854,6 +856,25 @@ class PreviewLoopbackServer:
         url.setQuery(f"generation={value}")
         return url
 
+    def generation_from_url(self, url: QUrl) -> int | None:
+        """Return the generation only for this server's tokenised preview URL."""
+        if self._server is None:
+            return None
+        candidate = QUrl(url)
+        expected = self.url
+        if (
+            candidate.scheme() != expected.scheme()
+            or candidate.host() != expected.host()
+            or candidate.port() != expected.port()
+            or candidate.path() != expected.path()
+            or candidate.hasFragment()
+        ):
+            return None
+        target = candidate.path()
+        if candidate.hasQuery():
+            target += f"?{candidate.query()}"
+        return _generation_from_request_target(target, expected.path())
+
     @property
     def port(self) -> int:
         return int(self._server.server_address[1])
@@ -1057,10 +1078,16 @@ class MapPreviewWidget(QWidget):
         self._payload_transfer_timer = QTimer(self)
         self._payload_transfer_timer.setSingleShot(True)
         self._payload_transfer_timer.timeout.connect(self._transfer_payload_chunks)
+        self._navigation_timer = QTimer(self)
+        self._navigation_timer.setSingleShot(True)
+        self._navigation_timer.setInterval(_NAVIGATION_TIMEOUT_MS)
+        self._navigation_timer.timeout.connect(self._on_navigation_timeout)
+        self._navigation_generation: int | None = None
         self._shell_ready_timer = QTimer(self)
         self._shell_ready_timer.setSingleShot(True)
         self._shell_ready_timer.setInterval(_SHELL_READY_TIMEOUT_MS)
         self._shell_ready_timer.timeout.connect(self._on_shell_ready_timeout)
+        self._shell_ready_generation: int | None = None
         self._presentation_timer = QTimer(self)
         self._presentation_timer.setInterval(_PRESENTATION_REFRESH_INTERVAL_MS)
         self._presentation_timer.timeout.connect(self._refresh_web_presentation)
@@ -1340,7 +1367,7 @@ class MapPreviewWidget(QWidget):
                 self._on_security_policy_violation
             )
             bridge.map_clicked.connect(self._on_map_clicked)
-            web_view.loadFinished.connect(self._on_load_finished)
+            page.loadingChanged.connect(self._on_loading_changed)
             if hasattr(page, "renderProcessTerminated"):
                 page.renderProcessTerminated.connect(
                     self._on_render_process_terminated
@@ -1358,7 +1385,7 @@ class MapPreviewWidget(QWidget):
             self.loading_screen.raise_()
 
     def _dispose_web_runtime(self) -> None:
-        self._shell_ready_timer.stop()
+        self._stop_loading_watchdogs()
         self._stop_presentation_watchdog(clear_activity=True)
         if self._payload_task is not None:
             self._payload_task.cancel()
@@ -1488,6 +1515,7 @@ class MapPreviewWidget(QWidget):
         return self._page_generation
 
     def _reload_shell(self) -> bool:
+        self._stop_loading_watchdogs()
         self._stop_presentation_watchdog(clear_activity=True)
         self._session_reusable = False
         if not WEBENGINE_AVAILABLE:
@@ -1514,20 +1542,66 @@ class MapPreviewWidget(QWidget):
         self.status_label.setText("Opening map preview…")
         self._show_loading("Preparing preview…")
         page_url = self._server.url_for_generation(self._page_generation)
-        self._shell_ready_timer.start()
+        self._navigation_generation = self._page_generation
+        self._navigation_timer.start()
         self._web_view.load(page_url)
         return True
 
-    def _on_load_finished(self, succeeded: bool) -> None:
-        if not succeeded:
-            self._shell_ready_timer.stop()
-            self._show_error(
-                "initialisation",
-                "The secure local preview shell could not be loaded.",
-            )
+    def _stop_loading_watchdogs(self) -> None:
+        self._navigation_timer.stop()
+        self._shell_ready_timer.stop()
+        self._navigation_generation = None
+        self._shell_ready_generation = None
+
+    def _on_loading_changed(self, loading_info: Any) -> None:
+        if self._server is None or QWebEngineLoadingInfo is None:
+            return
+        generation = self._server.generation_from_url(loading_info.url())
+        if (
+            generation != self._page_generation
+            or self._failed_generation == generation
+        ):
+            return
+        status = loading_info.status()
+        if status == QWebEngineLoadingInfo.LoadStatus.LoadStartedStatus:
+            return
+        if status == QWebEngineLoadingInfo.LoadStatus.LoadSucceededStatus:
+            self._navigation_timer.stop()
+            self._navigation_generation = None
+            if not self._shell_ready:
+                self._shell_ready_generation = generation
+                self._shell_ready_timer.start()
+            return
+        if status == QWebEngineLoadingInfo.LoadStatus.LoadStoppedStatus:
+            message = "The secure local preview shell load was interrupted."
+        elif status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus:
+            message = "The secure local preview shell could not be loaded."
+        else:
+            return
+        self._show_error("initialisation", message)
+
+    def _on_navigation_timeout(self) -> None:
+        generation = self._navigation_generation
+        self._navigation_generation = None
+        if (
+            generation != self._page_generation
+            or self._shell_ready
+            or self._failed_generation == generation
+        ):
+            return
+        self._show_error(
+            "initialisation",
+            "The secure local preview shell took too long to load. Retry the preview; KML export remains available.",
+        )
 
     def _on_shell_ready_timeout(self) -> None:
-        if self._shell_ready:
+        generation = self._shell_ready_generation
+        self._shell_ready_generation = None
+        if (
+            generation != self._page_generation
+            or self._shell_ready
+            or self._failed_generation == generation
+        ):
             return
         self._show_error(
             "initialisation",
@@ -1540,7 +1614,7 @@ class MapPreviewWidget(QWidget):
             or self._failed_generation == generation
         ):
             return
-        self._shell_ready_timer.stop()
+        self._stop_loading_watchdogs()
         self._shell_ready = True
         if not self._api_key:
             self._show_error("missing-key", "No Google Maps API key is configured.")
@@ -1824,7 +1898,7 @@ class MapPreviewWidget(QWidget):
             self._payload_task = None
         self._payload_transfer_timer.stop()
         self._payload_chunks.clear()
-        self._shell_ready_timer.stop()
+        self._stop_loading_watchdogs()
         self._stop_presentation_watchdog(clear_activity=True)
         self._failed_generation = self._page_generation
         self._session_reusable = False

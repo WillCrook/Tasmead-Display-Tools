@@ -261,6 +261,86 @@ class KmlEditorPageTests(unittest.TestCase):
         self.assertFalse(presentation.measurement_enabled)
         self.assertEqual(len(scene.traces[0].base_document.placemarks), 2)
 
+    def test_crop_preview_is_revealed_before_deferred_webengine_start(self):
+        document_id = self._add(self.first)[0]
+        self.maps_settings.set_api_key("test-key")
+        scene = object()
+
+        with (
+            patch.object(self.page.model, "request_crop_preview", return_value=False),
+            patch.object(
+                self.page.crop_map_preview,
+                "set_scene",
+                return_value=True,
+            ) as set_scene,
+        ):
+            self.page.model.set_mode(EditorMode.CROP)
+            self.page._present_crop_scene(document_id, scene)
+
+            self.assertIs(
+                self.page.crop_preview_stack.currentWidget(),
+                self.page.crop_map_preview,
+            )
+            self.assertTrue(self.page._crop_preview_start_timer.isActive())
+            set_scene.assert_not_called()
+
+            self.app.processEvents()
+
+            set_scene.assert_called_once()
+            self.assertIs(set_scene.call_args.args[0], scene)
+
+    def test_deferred_crop_preview_coalesces_to_latest_scene(self):
+        document_id = self._add(self.first)[0]
+        self.maps_settings.set_api_key("test-key")
+        first_scene = object()
+        latest_scene = object()
+
+        with (
+            patch.object(self.page.model, "request_crop_preview", return_value=False),
+            patch.object(
+                self.page.crop_map_preview,
+                "set_scene",
+                return_value=True,
+            ) as set_scene,
+        ):
+            self.page.model.set_mode(EditorMode.CROP)
+            self.page._present_crop_scene(document_id, first_scene)
+            self.page._present_crop_scene(document_id, latest_scene)
+            self.app.processEvents()
+
+            set_scene.assert_called_once()
+            self.assertIs(set_scene.call_args.args[0], latest_scene)
+
+    def test_deferred_crop_preview_is_cancelled_by_placeholder_mode_and_document(self):
+        first_id, second_id = self._add(self.first, self.second)
+        self.maps_settings.set_api_key("test-key")
+
+        with (
+            patch.object(self.page.model, "request_crop_preview", return_value=False),
+            patch.object(
+                self.page.crop_map_preview,
+                "set_scene",
+                return_value=True,
+            ) as set_scene,
+        ):
+            self.page.model.set_mode(EditorMode.CROP)
+
+            self.page._present_crop_scene(first_id, object())
+            self.page._set_crop_preview_placeholder("Cancelled")
+            self.app.processEvents()
+            set_scene.assert_not_called()
+
+            self.page._present_crop_scene(first_id, object())
+            self.page.model.set_mode(EditorMode.TEXT)
+            self.app.processEvents()
+            set_scene.assert_not_called()
+
+            self.page.model.set_mode(EditorMode.CROP)
+            self.page._present_crop_scene(first_id, object())
+            self.page.model.set_active_document(second_id)
+            self.app.processEvents()
+            set_scene.assert_not_called()
+
     def test_crop_preview_debounces_to_the_latest_range(self):
         document_id = self._add(self.first)[0]
         self.maps_settings.set_api_key("test-key")

@@ -24,9 +24,15 @@ configure_webengine_runtime()
 
 import map_preview_widget as preview_module
 
-from PyQt6.QtCore import QEventLoop, QTimer, Qt
+from PyQt6.QtCore import QEventLoop, QTimer, QUrl, Qt
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
+from PyQt6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMessageBox,
+    QStackedWidget,
+    QWidget,
+)
 
 from map_preview_widget import (
     MapPreviewBridge,
@@ -78,6 +84,42 @@ def scene_with_two_traces():
         return PreparedTrace(identity, identity.title(), anchor, document)
 
     return PreviewScene((trace("first", 0.0), trace("second", 0.01)))
+
+
+class _FakePreviewServer:
+    def url_for_generation(self, generation):
+        return QUrl(
+            "http://127.0.0.1:12345/token/preview"
+            f"?generation={generation}"
+        )
+
+    def generation_from_url(self, url):
+        candidate = QUrl(url)
+        if (
+            candidate.scheme() != "http"
+            or candidate.host() != "127.0.0.1"
+            or candidate.port() != 12345
+            or candidate.path() != "/token/preview"
+        ):
+            return None
+        return preview_module._generation_from_request_target(
+            f"{candidate.path()}?{candidate.query()}",
+            "/token/preview",
+        )
+
+
+def _loading_info(generation, status):
+    class FakeLoadingInfo:
+        def url(self):
+            return QUrl(
+                "http://127.0.0.1:12345/token/preview"
+                f"?generation={generation}"
+            )
+
+        def status(self):
+            return status
+
+    return FakeLoadingInfo()
 
 
 def parsed_csp(policy):
@@ -690,8 +732,86 @@ class MapPreviewControlsTests(unittest.TestCase):
             self.assertTrue(self.widget._loading_active)
             self.assertEqual(self.widget.loading_message.text(), "Preparing preview…")
             self.assertEqual(len(retry_web_view.loaded), 1)
+            self.assertTrue(self.widget._navigation_timer.isActive())
+            self.assertFalse(self.widget._shell_ready_timer.isActive())
         finally:
             self.widget._web_view = None
+            self.widget._server = None
+
+    @unittest.skipUnless(WEBENGINE_AVAILABLE, "requires Qt WebEngine loading types")
+    def test_navigation_success_starts_shell_watchdog_and_ignores_stale_loads(self):
+        self.widget._page_generation = 2
+        self.widget._server = _FakePreviewServer()
+        self.widget._navigation_generation = 2
+        self.widget._navigation_timer.start()
+        succeeded = preview_module.QWebEngineLoadingInfo.LoadStatus.LoadSucceededStatus
+        failed = preview_module.QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus
+        try:
+            self.widget._on_loading_changed(_loading_info(2, succeeded))
+
+            self.assertFalse(self.widget._navigation_timer.isActive())
+            self.assertTrue(self.widget._shell_ready_timer.isActive())
+            self.assertEqual(self.widget._shell_ready_generation, 2)
+
+            self.widget._on_loading_changed(_loading_info(1, failed))
+
+            self.assertTrue(self.widget._shell_ready_timer.isActive())
+            self.assertIsNone(self.widget._failed_generation)
+        finally:
+            self.widget._server = None
+
+    @unittest.skipUnless(WEBENGINE_AVAILABLE, "requires Qt WebEngine loading types")
+    def test_current_failed_and_stopped_loads_are_visible_failures(self):
+        self.widget._page_generation = 3
+        self.widget._server = _FakePreviewServer()
+        try:
+            failed = preview_module.QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus
+            self.widget._on_loading_changed(_loading_info(3, failed))
+            self.assertIn("could not be loaded", self.widget.status_label.text())
+            self.assertEqual(self.widget._failed_generation, 3)
+
+            self.widget._begin_page_generation()
+            stopped = preview_module.QWebEngineLoadingInfo.LoadStatus.LoadStoppedStatus
+            self.widget._on_loading_changed(_loading_info(4, stopped))
+            self.assertIn("interrupted", self.widget.status_label.text())
+            self.assertEqual(self.widget._failed_generation, 4)
+        finally:
+            self.widget._server = None
+
+    def test_navigation_timeout_fails_only_its_current_generation(self):
+        self.widget._page_generation = 5
+        self.widget._navigation_generation = 4
+        self.widget._on_navigation_timeout()
+        self.assertIsNone(self.widget._failed_generation)
+
+        self.widget._navigation_generation = 5
+        self.widget._on_navigation_timeout()
+        self.assertEqual(self.widget._failed_generation, 5)
+        self.assertIn("too long to load", self.widget.status_label.text())
+
+    @unittest.skipUnless(WEBENGINE_AVAILABLE, "requires Qt WebEngine loading types")
+    def test_shell_ready_before_load_success_does_not_restart_watchdog(self):
+        self.widget._page_generation = 6
+        self.widget._server = _FakePreviewServer()
+        self.widget._api_key = "test-key"
+        self.widget._navigation_generation = 6
+        self.widget._navigation_timer.start()
+        try:
+            with (
+                patch.object(self.widget, "_run_javascript"),
+                patch.object(self.widget, "_schedule_render"),
+            ):
+                self.widget._on_shell_ready(6)
+                succeeded = (
+                    preview_module.QWebEngineLoadingInfo.LoadStatus.LoadSucceededStatus
+                )
+                self.widget._on_loading_changed(_loading_info(6, succeeded))
+
+            self.assertTrue(self.widget._shell_ready)
+            self.assertFalse(self.widget._navigation_timer.isActive())
+            self.assertFalse(self.widget._shell_ready_timer.isActive())
+            self.assertIsNone(self.widget._failed_generation)
+        finally:
             self.widget._server = None
 
     def test_bridge_sanitises_policy_violation_before_emitting(self):
@@ -1085,6 +1205,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         )
 
     def test_shell_ready_timeout_is_a_visible_failure(self):
+        self.widget._shell_ready_generation = self.widget._page_generation
         self.widget._shell_ready = False
         self.widget._on_shell_ready_timeout()
 
@@ -1224,16 +1345,27 @@ class WebEngineShellSmokeTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication(["tasmead-webengine-smoke"])
 
     def test_local_shell_reaches_qwebchannel_without_contacting_google(self):
+        host = QStackedWidget()
+        placeholder = QWidget()
         widget = MapPreviewWidget()
+        host.addWidget(placeholder)
+        host.addWidget(widget)
         try:
-            self.assertTrue(widget._ensure_web_view())
+            host.resize(1200, 800)
+            host.show()
+            host.setCurrentWidget(widget)
+            QApplication.processEvents()
+
+            self.assertTrue(widget.set_scene(scene_with_two_traces(), ""))
+            deadline = time.monotonic() + 35.0
+            while not widget._shell_ready and time.monotonic() < deadline:
+                QTest.qWait(25)
+
+            self.assertTrue(widget._shell_ready, "The cold shell handshake timed out.")
+            self.assertEqual(widget._page_generation, 1)
+            self.assertIn("No Google Maps API key", widget.status_label.text())
             ready = QSignalSpy(widget._bridge.shell_ready)
             violations = QSignalSpy(widget._bridge.security_policy_violation)
-            widget._api_key = ""
-            widget._reload_shell()
-            while len(ready) == 0:
-                self.assertTrue(ready.wait(5000))
-            self.assertIn("No Google Maps API key", widget.status_label.text())
 
             result = []
             callback_loop = QEventLoop()
@@ -1264,15 +1396,15 @@ class WebEngineShellSmokeTests(unittest.TestCase):
             self.assertGreater(result[0]["rules"], 0)
 
             self.assertTrue(widget._reload_shell())
-            while len(ready) < 2:
+            while len(ready) < 1:
                 self.assertTrue(ready.wait(5000))
-            self.assertEqual([list(signal)[0] for signal in ready], [1, 2])
+            self.assertEqual([list(signal)[0] for signal in ready], [2])
             self.assertIn("No Google Maps API key", widget.status_label.text())
             QApplication.processEvents()
             self.assertEqual(len(violations), 0)
         finally:
             widget.shutdown()
-            widget.close()
+            host.close()
             QApplication.processEvents()
 
     def test_repeated_browser_csp_violations_cross_the_bridge_once(self):

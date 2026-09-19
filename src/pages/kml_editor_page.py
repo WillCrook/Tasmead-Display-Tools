@@ -168,6 +168,12 @@ class KmlEditorPage(QWidget):
         self._crop_preview_timer.setSingleShot(True)
         self._crop_preview_timer.setInterval(100)
         self._crop_preview_timer.timeout.connect(self._request_crop_preview)
+        self._crop_preview_start_timer = QTimer(self)
+        self._crop_preview_start_timer.setSingleShot(True)
+        self._crop_preview_start_timer.setInterval(0)
+        self._crop_preview_start_timer.timeout.connect(
+            self._start_pending_crop_preview
+        )
         self._pending_crop_scene = None
         self._crop_preview_document_id = None
         self._crop_preview_refresh_pending = False
@@ -863,6 +869,7 @@ class KmlEditorPage(QWidget):
             and document.document_id != self._rendered_document_id
         )
         if changing_document:
+            self._crop_preview_start_timer.stop()
             self._pending_crop_scene = None
             self._crop_preview_document_id = None
             if self.model.mode == EditorMode.CROP:
@@ -1195,6 +1202,7 @@ class KmlEditorPage(QWidget):
             self._schedule_crop_preview(immediate=True)
         else:
             self._crop_preview_timer.stop()
+            self._crop_preview_start_timer.stop()
         if selected == EditorMode.SIMPLIFY:
             self._simplification_timer.start()
 
@@ -1204,6 +1212,7 @@ class KmlEditorPage(QWidget):
         *,
         show_settings: bool = False,
     ) -> None:
+        self._crop_preview_start_timer.stop()
         self.crop_preview_placeholder_message.setText(message)
         self.crop_preview_settings_btn.setVisible(
             bool(show_settings and self._maps_settings is not None)
@@ -1286,6 +1295,33 @@ class KmlEditorPage(QWidget):
         if not api_key:
             self._schedule_crop_preview()
             return
+        self._crop_preview_refresh_pending = False
+        self.crop_preview_stack.setCurrentWidget(self.crop_map_preview)
+        self._crop_preview_start_timer.start()
+
+    def _start_pending_crop_preview(self) -> None:
+        pending = self._pending_crop_scene
+        document = self.model.active_document
+        if pending is None or document is None:
+            return
+        document_id, scene = pending
+        if document_id != document.document_id:
+            return
+        if (
+            self.model.mode != EditorMode.CROP
+            or not self.isVisible()
+            or self.crop_preview_stack.currentWidget() is not self.crop_map_preview
+        ):
+            self._crop_preview_refresh_pending = True
+            return
+        api_key = self._maps_api_key()
+        if not api_key:
+            self._set_crop_preview_placeholder(
+                "Add a Google Maps API key to display the crop comparison. "
+                "Cropping and Apply Crop remain available without it.",
+                show_settings=True,
+            )
+            return
         presentation = PreviewPresentation(
             read_only=True,
             embedded=True,
@@ -1297,7 +1333,6 @@ class KmlEditorPage(QWidget):
                 "Grey line — excluded path",
             ),
         )
-        self.crop_preview_stack.setCurrentWidget(self.crop_map_preview)
         try:
             self.crop_map_preview.set_scene(scene, api_key, presentation)
         except Exception as error:
@@ -1645,6 +1680,7 @@ class KmlEditorPage(QWidget):
     def shutdown(self) -> None:
         """Cooperatively stop editor work before the application is destroyed."""
         self._crop_preview_timer.stop()
+        self._crop_preview_start_timer.stop()
         self._simplification_timer.stop()
         self.crop_map_preview.shutdown()
         self.model.shutdown()
