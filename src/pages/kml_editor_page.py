@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 from uuid import UUID
 
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStyle,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -131,8 +134,23 @@ KmlEditorPage QFrame#diagnosticPanel {
 """
 
 KML_EDITOR_FONT_SIZE_SETTING = "kml-editor/font-size"
+KML_EDITOR_INPUT_FILES_SETTING = "kml-editor/input-files"
+KML_EDITOR_CURRENT_INPUT_FILE_SETTING = "kml-editor/current-input-file"
 KML_EDITOR_FONT_SIZE_MIN = 8
 KML_EDITOR_FONT_SIZE_MAX = 32
+
+_SESSION_PATH_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+@dataclass(frozen=True)
+class _InputSessionEntry:
+    path: Path
+    document_id: UUID | None = None
+    error: str = ""
+
+    @property
+    def unavailable(self) -> bool:
+        return self.document_id is None
 
 
 class KmlEditorPage(QWidget):
@@ -155,6 +173,13 @@ class KmlEditorPage(QWidget):
         self.model = model or KmlEditorWorkspaceModel(parent=self)
         self._settings = settings if settings is not None else QSettings()
         self._maps_settings = maps_settings
+        self._input_session_entries: list[_InputSessionEntry] = [
+            _InputSessionEntry(document.source_path, document.document_id)
+            for document in self.model.documents
+        ]
+        self._current_session_key: str | None = None
+        self._last_persisted_session: tuple[tuple[str, ...], str] | None = None
+        self._restoring_input_session = False
         self._default_editor_font_size = min(
             KML_EDITOR_FONT_SIZE_MAX,
             max(KML_EDITOR_FONT_SIZE_MIN, KmlCodeEditor.default_font_point_size()),
@@ -195,8 +220,8 @@ class KmlEditorPage(QWidget):
         self.splitter.setStretchFactor(1, 4)
         self.splitter.setSizes((235, 815))
 
-        self.model.documents_changed.connect(self._render_document_list)
-        self.model.active_document_changed.connect(self._render_active_document)
+        self.model.documents_changed.connect(self._documents_changed)
+        self.model.active_document_changed.connect(self._active_document_changed)
         self.model.document_changed.connect(self._document_changed)
         self.model.mode_changed.connect(self._render_mode)
         self.model.preview_ready.connect(self._preview_ready)
@@ -206,8 +231,8 @@ class KmlEditorPage(QWidget):
 
         self._build_shortcuts()
         self._set_tab_order()
-        self._render_document_list()
-        self._render_active_document(None)
+        self._restore_input_session()
+        self._render_active_document(self.model.active_document_id)
         self._render_mode(self.model.mode)
 
     def _build_sidebar(self) -> None:
@@ -801,53 +826,300 @@ class KmlEditorPage(QWidget):
         value = item.data(Qt.ItemDataRole.UserRole)
         return UUID(str(value)) if value else None
 
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+    @staticmethod
+    def _item_path(item: QListWidgetItem | None) -> Path | None:
+        if item is None:
+            return None
+        value = item.data(_SESSION_PATH_ROLE)
+        return Path(str(value)) if value else None
+
+    @classmethod
+    def _normalised_session_paths(cls, raw_files) -> list[Path]:
+        if isinstance(raw_files, str):
+            candidates = [raw_files]
+        elif isinstance(raw_files, (list, tuple)):
+            candidates = list(raw_files)
+        else:
+            candidates = []
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for raw_path in candidates:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            path = Path(raw_path).expanduser()
+            if path.suffix.lower() != ".kml":
+                continue
+            resolved = path.resolve(strict=False)
+            key = cls._path_key(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(resolved)
+        return paths
+
+    def _entry_for_key(self, key: str | None) -> _InputSessionEntry | None:
+        if key is None:
+            return None
+        return next(
+            (
+                entry
+                for entry in self._input_session_entries
+                if self._path_key(entry.path) == key
+            ),
+            None,
+        )
+
+    def _current_unavailable_entry(self) -> _InputSessionEntry | None:
+        entry = self._entry_for_key(self._current_session_key)
+        return entry if entry is not None and entry.unavailable else None
+
+    def _persist_input_session(self) -> None:
+        if self._restoring_input_session:
+            return
+        paths = tuple(str(entry.path) for entry in self._input_session_entries)
+        current_entry = self._entry_for_key(self._current_session_key)
+        current_path = "" if current_entry is None else str(current_entry.path)
+        snapshot = (paths, current_path)
+        if snapshot == self._last_persisted_session:
+            return
+        self._settings.setValue(KML_EDITOR_INPUT_FILES_SETTING, list(paths))
+        self._settings.setValue(KML_EDITOR_CURRENT_INPUT_FILE_SETTING, current_path)
+        self._settings.sync()
+        self._last_persisted_session = snapshot
+
+    def _restore_input_session(self) -> None:
+        paths = self._normalised_session_paths(
+            self._settings.value(KML_EDITOR_INPUT_FILES_SETTING, [])
+        )
+        self._restoring_input_session = True
+        try:
+            load_paths = [
+                path
+                for path in paths
+                if self.model.document_id_for_path(path) is None
+            ]
+            result = self.model.add_paths(load_paths)
+            errors = {
+                self._path_key(error.path): error.message
+                for error in result.errors
+            }
+            entries: list[_InputSessionEntry] = []
+            seen_document_ids: set[UUID] = set()
+            for path in paths:
+                document_id = self.model.document_id_for_path(path)
+                if document_id is not None:
+                    entries.append(_InputSessionEntry(path, document_id))
+                    seen_document_ids.add(document_id)
+                else:
+                    entries.append(
+                        _InputSessionEntry(
+                            path,
+                            error=errors.get(
+                                self._path_key(path),
+                                "The KML file could not be opened.",
+                            ),
+                        )
+                    )
+            for document in self.model.documents:
+                if document.document_id not in seen_document_ids:
+                    entries.append(
+                        _InputSessionEntry(
+                            document.source_path,
+                            document.document_id,
+                        )
+                    )
+            self._input_session_entries = entries
+
+            raw_current = self._settings.value(
+                KML_EDITOR_CURRENT_INPUT_FILE_SETTING,
+                "",
+            )
+            current_key = (
+                self._path_key(raw_current)
+                if isinstance(raw_current, str) and raw_current.strip()
+                else None
+            )
+            available_keys = {
+                self._path_key(entry.path) for entry in self._input_session_entries
+            }
+            if current_key not in available_keys:
+                active = self.model.active_document
+                current_key = (
+                    self._path_key(active.source_path)
+                    if active is not None
+                    else (
+                        self._path_key(self._input_session_entries[0].path)
+                        if self._input_session_entries
+                        else None
+                    )
+                )
+            self._current_session_key = current_key
+            current_entry = self._entry_for_key(current_key)
+            self.model.set_active_document(
+                None if current_entry is None else current_entry.document_id
+            )
+        finally:
+            self._restoring_input_session = False
+        self._last_persisted_session = None
+        self._persist_input_session()
+
+    def _reconcile_input_session_entries(self) -> None:
+        documents_by_id = {
+            document.document_id: document for document in self.model.documents
+        }
+        documents_by_path = {
+            self._path_key(document.source_path): document
+            for document in self.model.documents
+        }
+        current_entry = self._entry_for_key(self._current_session_key)
+        current_document_id = (
+            None if current_entry is None else current_entry.document_id
+        )
+        entries: list[_InputSessionEntry] = []
+        seen_document_ids: set[UUID] = set()
+        for entry in self._input_session_entries:
+            document = (
+                documents_by_id.get(entry.document_id)
+                if entry.document_id is not None
+                else documents_by_path.get(self._path_key(entry.path))
+            )
+            if document is None:
+                if entry.unavailable:
+                    entries.append(entry)
+                continue
+            if document.document_id in seen_document_ids:
+                continue
+            entries.append(
+                _InputSessionEntry(document.source_path, document.document_id)
+            )
+            seen_document_ids.add(document.document_id)
+        for document in self.model.documents:
+            if document.document_id not in seen_document_ids:
+                entries.append(
+                    _InputSessionEntry(document.source_path, document.document_id)
+                )
+                seen_document_ids.add(document.document_id)
+        self._input_session_entries = entries
+
+        if current_document_id in documents_by_id:
+            self._current_session_key = self._path_key(
+                documents_by_id[current_document_id].source_path
+            )
+        elif self._entry_for_key(self._current_session_key) is None:
+            active = self.model.active_document
+            self._current_session_key = (
+                self._path_key(active.source_path)
+                if active is not None
+                else (
+                    self._path_key(entries[0].path)
+                    if entries
+                    else None
+                )
+            )
+
+    def _documents_changed(self) -> None:
+        if self._restoring_input_session:
+            return
+        self._reconcile_input_session_entries()
+        self._render_document_list()
+        self._persist_input_session()
+
+    def _active_document_changed(self, document_id: UUID | None) -> None:
+        if self._restoring_input_session:
+            return
+        if document_id is not None:
+            self._current_session_key = self._path_key(
+                self.model.document(document_id).source_path
+            )
+        self._render_active_document(document_id)
+        self._persist_input_session()
+
     def _render_document_list(self) -> None:
-        active = self.model.active_document_id
+        documents = {
+            document.document_id: document for document in self.model.documents
+        }
         selected = {
-            self._item_document_id(item)
+            self._path_key(path)
             for item in self.file_list.selectedItems()
+            if (path := self._item_path(item)) is not None
         }
         self._rendering = True
         try:
             self.file_list.clear()
-            active_item = None
-            for document in self.model.documents:
-                state_label = {
-                    ParseStatus.INVALID: "Invalid",
-                    ParseStatus.STALE: "Needs validation",
-                    ParseStatus.VALIDATING: "Validating",
-                }.get(document.parse_state.status)
-                label = document.source_path.name
-                if state_label:
-                    label += f" — {state_label}"
-                if document.dirty:
-                    label += " *"
-                item = QListWidgetItem(label)
-                item.setData(Qt.ItemDataRole.UserRole, str(document.document_id))
-                item.setToolTip(str(document.source_path))
-                item.setData(
-                    Qt.ItemDataRole.AccessibleDescriptionRole,
-                    f"Full path: {document.source_path}. "
-                    + ("Has unsaved changes. " if document.dirty else "Saved. ")
-                    + f"Validation status: {document.parse_state.status.value}.",
+            current_item = None
+            for entry in self._input_session_entries:
+                document = (
+                    documents.get(entry.document_id)
+                    if entry.document_id is not None
+                    else None
                 )
+                if document is None:
+                    item = QListWidgetItem(entry.path.name)
+                    item.setIcon(
+                        self.style().standardIcon(
+                            QStyle.StandardPixmap.SP_MessageBoxWarning
+                        )
+                    )
+                    item.setToolTip(f"{entry.path}\n\nError: {entry.error}")
+                    item.setData(
+                        Qt.ItemDataRole.AccessibleDescriptionRole,
+                        f"Full path: {entry.path}. Error: {entry.error}",
+                    )
+                else:
+                    state_label = {
+                        ParseStatus.INVALID: "Invalid",
+                        ParseStatus.STALE: "Needs validation",
+                        ParseStatus.VALIDATING: "Validating",
+                    }.get(document.parse_state.status)
+                    label = document.source_path.name
+                    if state_label:
+                        label += f" — {state_label}"
+                    if document.dirty:
+                        label += " *"
+                    item = QListWidgetItem(label)
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        str(document.document_id),
+                    )
+                    item.setToolTip(str(document.source_path))
+                    item.setData(
+                        Qt.ItemDataRole.AccessibleDescriptionRole,
+                        f"Full path: {document.source_path}. "
+                        + ("Has unsaved changes. " if document.dirty else "Saved. ")
+                        + f"Validation status: {document.parse_state.status.value}.",
+                    )
+                item.setData(_SESSION_PATH_ROLE, str(entry.path))
                 self.file_list.addItem(item)
-                if document.document_id in selected:
+                key = self._path_key(entry.path)
+                if key in selected:
                     item.setSelected(True)
-                if document.document_id == active:
-                    active_item = item
-            if active_item is not None:
-                self.file_list.setCurrentItem(active_item)
+                if key == self._current_session_key:
+                    current_item = item
+            if current_item is not None:
+                self.file_list.setCurrentItem(current_item)
         finally:
             self._rendering = False
-        count = len(self.model.documents)
+        count = len(self._input_session_entries)
         self.file_count_label.setText(f"{count} file" if count == 1 else f"{count} files")
         self.file_list.updateGeometry()
 
     def _active_item_changed(self, current, _previous) -> None:
         if not self._rendering:
             self._flush_active_editor()
-            self.model.set_active_document(self._item_document_id(current))
+            path = self._item_path(current)
+            self._current_session_key = (
+                None if path is None else self._path_key(path)
+            )
+            document_id = self._item_document_id(current)
+            prior_document_id = self.model.active_document_id
+            self.model.set_active_document(document_id)
+            if prior_document_id == document_id:
+                self._render_active_document(document_id)
+            self._persist_input_session()
 
     def _document_changed(self, document_id: UUID) -> None:
         if document_id == self.model.active_document_id:
@@ -871,6 +1143,7 @@ class KmlEditorPage(QWidget):
 
     def _render_active_document(self, _document_id) -> None:
         document = self.model.active_document
+        unavailable = self._current_unavailable_entry()
         changing_document = (
             document is not None
             and document.document_id != self._rendered_document_id
@@ -892,16 +1165,36 @@ class KmlEditorPage(QWidget):
             self.restore_btn.setEnabled(enabled and document.dirty)
             self.validate_btn.setEnabled(enabled)
             self.format_coordinates_btn.setEnabled(enabled)
-            self.remove_files_btn.setEnabled(bool(self.model.documents))
+            self.remove_files_btn.setEnabled(bool(self._input_session_entries))
             if document is None:
                 self._rendered_document_id = None
-                self.active_file_label.setText("No KML file selected")
+                self.active_file_label.setText(
+                    f"{unavailable.path.name} — Unavailable"
+                    if unavailable is not None
+                    else "No KML file selected"
+                )
+                self.active_file_label.setToolTip(
+                    ""
+                    if unavailable is None
+                    else f"{unavailable.path}\n\nError: {unavailable.error}"
+                )
                 self.text_editor.clear()
                 self.format_status_label.clear()
                 self._set_parse_status(None)
                 self._render_diagnostics(None)
                 self._render_crop(None)
                 self._render_simplification(None)
+                if unavailable is not None:
+                    message = (
+                        f"KML file unavailable — {unavailable.error} "
+                        "Remove it from Input files to clear this entry."
+                    )
+                    self.parse_status_label.setProperty("parseStatus", "invalid")
+                    self.parse_status_label.setText(message)
+                    self.parse_status_label.style().unpolish(self.parse_status_label)
+                    self.parse_status_label.style().polish(self.parse_status_label)
+                    self._set_crop_preview_placeholder(message)
+                    self.simplification_status_label.setText(message)
                 return
             self.active_file_label.setText(
                 document.source_path.name + (" — Unsaved changes" if document.dirty else "")
@@ -1681,16 +1974,49 @@ class KmlEditorPage(QWidget):
 
     def remove_selected_files(self) -> bool:
         self._flush_active_editor()
-        selected = [
+        selected_items = list(self.file_list.selectedItems())
+        selected_document_ids = [
             document_id
-            for item in self.file_list.selectedItems()
+            for item in selected_items
             if (document_id := self._item_document_id(item)) is not None
         ]
-        if not selected:
+        selected_keys = {
+            self._path_key(path)
+            for item in selected_items
+            if (path := self._item_path(item)) is not None
+        }
+        if not selected_keys:
             return False
-        if not self._resolve_unsaved(selected, "removing them"):
+        if not self._resolve_unsaved(selected_document_ids, "removing them"):
             return False
-        self.model.remove_documents(selected)
+        self._input_session_entries = [
+            entry
+            for entry in self._input_session_entries
+            if not (
+                entry.unavailable
+                and self._path_key(entry.path) in selected_keys
+            )
+        ]
+        if selected_document_ids:
+            self.model.remove_documents(selected_document_ids)
+        else:
+            if self._entry_for_key(self._current_session_key) is None:
+                self._current_session_key = (
+                    self._path_key(self._input_session_entries[0].path)
+                    if self._input_session_entries
+                    else None
+                )
+                current_entry = self._entry_for_key(self._current_session_key)
+                prior_document_id = self.model.active_document_id
+                document_id = (
+                    None if current_entry is None else current_entry.document_id
+                )
+                self.model.set_active_document(document_id)
+                if prior_document_id == document_id:
+                    self._render_active_document(document_id)
+            else:
+                self._render_document_list()
+            self._persist_input_session()
         return True
 
     def confirm_close(self) -> bool:
@@ -1699,6 +2025,7 @@ class KmlEditorPage(QWidget):
 
     def shutdown(self) -> None:
         """Cooperatively stop editor work before the application is destroyed."""
+        self._persist_input_session()
         self._crop_preview_timer.stop()
         self._crop_preview_start_timer.stop()
         self._simplification_timer.stop()

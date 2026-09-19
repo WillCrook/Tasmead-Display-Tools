@@ -184,6 +184,126 @@ class KmlEditorPageTests(unittest.TestCase):
         remember.assert_called_once()
         self.assertEqual(self.page.model.active_document.source_path, self.first.resolve())
 
+    def test_input_session_restores_order_and_active_file(self):
+        first_id, second_id = self._add(self.first, self.second)
+        self.page.file_list.setCurrentRow(1)
+
+        self.assertEqual(
+            self.settings.values["kml-editor/input-files"],
+            [str(self.first.resolve()), str(self.second.resolve())],
+        )
+        self.assertEqual(
+            self.settings.values["kml-editor/current-input-file"],
+            str(self.second.resolve()),
+        )
+        self.assertEqual(self.page.model.active_document_id, second_id)
+
+        restored = KmlEditorPage(settings=self.settings)
+        try:
+            self.assertEqual(
+                [document.source_path for document in restored.model.documents],
+                [self.first.resolve(), self.second.resolve()],
+            )
+            self.assertEqual(
+                restored.model.active_document.source_path,
+                self.second.resolve(),
+            )
+            self.assertEqual(restored.file_list.currentRow(), 1)
+            self.assertEqual(restored.file_list.count(), 2)
+        finally:
+            restored.model._validation_pool.waitForDone(1000)
+            restored.model._operation_executor.wait_for_done(1.0)
+            restored.shutdown()
+            restored.close()
+
+    def test_unavailable_restored_file_is_warning_row_removable_only(self):
+        missing = self.root / "missing.kml"
+        settings = MemorySettings(
+            {
+                "kml-editor/input-files": [
+                    str(self.first),
+                    str(missing),
+                    "not-a-kml.txt",
+                    42,
+                    str(self.first),
+                    str(self.second),
+                ],
+                "kml-editor/current-input-file": str(missing),
+            }
+        )
+        restored = KmlEditorPage(settings=settings)
+        try:
+            self.assertEqual(restored.file_list.count(), 3)
+            self.assertEqual(
+                [restored.file_list.item(row).text().split(" — ")[0] for row in range(3)],
+                ["first.kml", "missing.kml", "second.kml"],
+            )
+            missing_item = restored.file_list.item(1)
+            self.assertEqual(restored.file_list.currentItem(), missing_item)
+            self.assertFalse(missing_item.icon().isNull())
+            self.assertIn("Error:", missing_item.toolTip())
+            self.assertIn(
+                "Error:",
+                missing_item.data(Qt.ItemDataRole.AccessibleDescriptionRole),
+            )
+            self.assertIsNone(restored.model.active_document)
+            self.assertIn("Unavailable", restored.active_file_label.text())
+            self.assertFalse(restored.text_editor.isEnabled())
+            self.assertFalse(restored.validate_btn.isEnabled())
+            self.assertFalse(restored.save_btn.isEnabled())
+            self.assertFalse(restored.save_as_btn.isEnabled())
+            self.assertFalse(restored.crop_apply_btn.isEnabled())
+            self.assertFalse(restored.simplification_apply_btn.isEnabled())
+            self.assertTrue(restored.remove_files_btn.isEnabled())
+            self.assertEqual(
+                settings.values["kml-editor/input-files"],
+                [
+                    str(self.first.resolve()),
+                    str(missing.resolve()),
+                    str(self.second.resolve()),
+                ],
+            )
+
+            missing_item.setSelected(True)
+            self.assertTrue(restored.remove_selected_files())
+            self.assertEqual(restored.file_list.count(), 2)
+            self.assertEqual(
+                settings.values["kml-editor/input-files"],
+                [str(self.first.resolve()), str(self.second.resolve())],
+            )
+            self.assertEqual(
+                settings.values["kml-editor/current-input-file"],
+                str(self.first.resolve()),
+            )
+            self.assertEqual(
+                restored.model.active_document.source_path,
+                self.first.resolve(),
+            )
+        finally:
+            restored.model._validation_pool.waitForDone(1000)
+            restored.model._operation_executor.wait_for_done(1.0)
+            restored.shutdown()
+            restored.close()
+
+    def test_unsaved_text_is_not_restored_with_the_input_session(self):
+        self._add(self.first)
+        self.page.text_editor.insertPlainText("<!-- unsaved session draft -->")
+        self.app.processEvents()
+        self.assertTrue(self.page.model.active_document.dirty)
+
+        restored = KmlEditorPage(settings=self.settings)
+        try:
+            self.assertNotIn(
+                "unsaved session draft",
+                restored.model.active_document.contents,
+            )
+            self.assertFalse(restored.model.active_document.dirty)
+        finally:
+            restored.model._validation_pool.waitForDone(1000)
+            restored.model._operation_executor.wait_for_done(1.0)
+            restored.shutdown()
+            restored.close()
+
     def test_active_switching_renders_isolated_text_and_dirty_marker(self):
         first_id, second_id = self._add(self.first, self.second)
         first_contents = self.page.model.document(first_id).contents
@@ -491,6 +611,14 @@ class KmlEditorPageTests(unittest.TestCase):
         remember.assert_called_once()
         self.assertEqual(self.page.model.document(document_id).source_path, destination.with_suffix(".kml").resolve())
         self.assertTrue(destination.with_suffix(".kml").exists())
+        self.assertEqual(
+            self.settings.values["kml-editor/input-files"],
+            [str(destination.with_suffix(".kml").resolve())],
+        )
+        self.assertEqual(
+            self.settings.values["kml-editor/current-input-file"],
+            str(destination.with_suffix(".kml").resolve()),
+        )
 
     def test_save_as_to_source_path_uses_source_validation_warning(self):
         self._add(self.first)
