@@ -14,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QFontDatabase, QKeySequence, QTextCursor
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPlainTextEdit
+from PyQt6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QPlainTextEdit
 
 from google_maps_settings import GoogleMapsSettings
 from pages.crop_range_slider import CropRangeSlider
@@ -438,6 +438,23 @@ class KmlEditorPageTests(unittest.TestCase):
             20.0,
         )
 
+    def test_resolution_configuration_is_compact_and_has_no_algorithm_help_text(self):
+        self._add(self.first)
+        self.page.resize(1100, 900)
+        self.page.simplify_mode_button.click()
+        self.app.processEvents()
+
+        self.assertEqual(
+            self.page.simplification_title.text(),
+            "Reduce Resolution Configuration",
+        )
+        labels = [label.text() for label in self.page.simplify_page.findChildren(QLabel)]
+        self.assertFalse(any("Ramer–Douglas–Peucker" in text for text in labels))
+        self.assertLess(
+            self.page.simplification_apply_btn.geometry().bottom(),
+            self.page.simplify_page.height() // 2,
+        )
+
     def test_source_save_cancel_restore_and_save_anyway_branches(self):
         document_id = self._add(self.first)[0]
         saved = self.page.model.document(document_id).saved_contents
@@ -534,9 +551,40 @@ class KmlEditorPageTests(unittest.TestCase):
         )
         self.assertEqual(self.page.open_shortcut.key(), QKeySequence(QKeySequence.StandardKey.Open))
         self.assertEqual(self.page.save_shortcut.key(), QKeySequence(QKeySequence.StandardKey.Save))
+        self.page.text_mode_button.setFocus()
+        QTest.keyClick(self.page.text_mode_button, Qt.Key.Key_Tab)
+        self.assertTrue(self.page.file_list.hasFocus())
         self.page.file_list.setFocus()
         QTest.keyClick(self.page.file_list, Qt.Key.Key_Tab)
         self.assertTrue(self.page.add_files_btn.hasFocus())
+
+    def test_sidebar_places_mode_above_compact_scrolling_file_list(self):
+        self.page.resize(1100, 900)
+        self.app.processEvents()
+
+        mode_top = self.page.mode_control.mapToGlobal(
+            self.page.mode_control.rect().topLeft()
+        ).y()
+        file_list_top = self.page.file_list.mapToGlobal(
+            self.page.file_list.rect().topLeft()
+        ).y()
+        natural_height = self.page.file_list.sizeHint().height()
+        self.assertLess(mode_top, file_list_top)
+        self.assertEqual(self.page.file_list.height(), natural_height)
+        self.assertLess(
+            self.page.file_list.height(),
+            self.page.sidebar.height() * 0.5,
+        )
+
+        initial_height = self.page.file_list.height()
+        self.page.file_list.addItems(
+            [f"display-{index}.kml" for index in range(100)]
+        )
+        self.page.file_list.updateGeometry()
+        self.app.processEvents()
+
+        self.assertEqual(self.page.file_list.height(), initial_height)
+        self.assertTrue(self.page.file_list.verticalScrollBar().isVisible())
 
     def test_code_editor_is_fixed_width_no_wrap_and_bounds_long_line_highlighting(self):
         self.assertEqual(

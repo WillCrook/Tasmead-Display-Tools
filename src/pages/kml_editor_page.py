@@ -218,38 +218,6 @@ class KmlEditorPage(QWidget):
         sidebar_layout.setContentsMargins(14, 14, 14, 14)
         sidebar_layout.setSpacing(10)
 
-        heading_row = QHBoxLayout()
-        heading = QLabel("Input files")
-        heading.setObjectName("panelTitle")
-        self.file_count_label = QLabel("0 files")
-        self.file_count_label.setObjectName("mutedText")
-        heading_row.addWidget(heading)
-        heading_row.addStretch()
-        heading_row.addWidget(self.file_count_label)
-        sidebar_layout.addLayout(heading_row)
-
-        self.file_list = QListWidget()
-        self.file_list.setAccessibleName("KML Editor input files")
-        self.file_list.setAccessibleDescription(
-            "Select the active KML file. An asterisk marks unsaved changes."
-        )
-        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.file_list.currentItemChanged.connect(self._active_item_changed)
-        sidebar_layout.addWidget(self.file_list, 1)
-
-        file_actions = QHBoxLayout()
-        self.add_files_btn = QPushButton("Add files")
-        self.add_files_btn.setAccessibleName("Add KML files")
-        set_button_icon(self.add_files_btn, AppIcon.FOLDER_PLUS)
-        self.remove_files_btn = QPushButton("Remove")
-        self.remove_files_btn.setAccessibleName("Remove selected KML files")
-        set_button_icon(self.remove_files_btn, AppIcon.TRASH)
-        self.add_files_btn.clicked.connect(self.browse_files)
-        self.remove_files_btn.clicked.connect(self.remove_selected_files)
-        file_actions.addWidget(self.add_files_btn)
-        file_actions.addWidget(self.remove_files_btn)
-        sidebar_layout.addLayout(file_actions)
-
         mode_heading = QLabel("Mode")
         mode_heading.setObjectName("panelTitle")
         sidebar_layout.addWidget(mode_heading)
@@ -279,6 +247,47 @@ class KmlEditorPage(QWidget):
             mode_layout.addWidget(button)
         self.text_mode_button.setChecked(True)
         sidebar_layout.addWidget(self.mode_control)
+
+        heading_row = QHBoxLayout()
+        heading = QLabel("Input files")
+        heading.setObjectName("panelTitle")
+        self.file_count_label = QLabel("0 files")
+        self.file_count_label.setObjectName("mutedText")
+        heading_row.addWidget(heading)
+        heading_row.addStretch()
+        heading_row.addWidget(self.file_count_label)
+        sidebar_layout.addLayout(heading_row)
+
+        self.file_list = QListWidget()
+        self.file_list.setAccessibleName("KML Editor input files")
+        self.file_list.setAccessibleDescription(
+            "Select the active KML file. An asterisk marks unsaved changes."
+        )
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.file_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
+        self.file_list.setMinimumHeight(0)
+        self.file_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.file_list.currentItemChanged.connect(self._active_item_changed)
+        sidebar_layout.addWidget(self.file_list)
+
+        file_actions = QHBoxLayout()
+        self.add_files_btn = QPushButton("Add files")
+        self.add_files_btn.setAccessibleName("Add KML files")
+        set_button_icon(self.add_files_btn, AppIcon.FOLDER_PLUS)
+        self.remove_files_btn = QPushButton("Remove")
+        self.remove_files_btn.setAccessibleName("Remove selected KML files")
+        set_button_icon(self.remove_files_btn, AppIcon.TRASH)
+        self.add_files_btn.clicked.connect(self.browse_files)
+        self.remove_files_btn.clicked.connect(self.remove_selected_files)
+        file_actions.addWidget(self.add_files_btn)
+        file_actions.addWidget(self.remove_files_btn)
+        sidebar_layout.addLayout(file_actions)
+        sidebar_layout.addStretch()
         self.splitter.addWidget(self.sidebar)
 
     def _build_workspace(self) -> None:
@@ -589,18 +598,9 @@ class KmlEditorPage(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
-        title = QLabel("Maximum path deviation")
-        title.setObjectName("panelTitle")
-        layout.addWidget(title)
-        help_label = QLabel(
-            "Ramer–Douglas–Peucker reduction in WGS84 local metres. Horizontal "
-            "deviation always applies; explicit absolute/relative-to-ground altitude "
-            "and reliable timing profiles also participate. Clamp-to-ground paths are "
-            "horizontal-only because terrain height is unavailable."
-        )
-        help_label.setObjectName("mutedText")
-        help_label.setWordWrap(True)
-        layout.addWidget(help_label)
+        self.simplification_title = QLabel("Reduce Resolution Configuration")
+        self.simplification_title.setObjectName("panelTitle")
+        layout.addWidget(self.simplification_title)
 
         presets = QGridLayout()
         presets.setHorizontalSpacing(12)
@@ -655,7 +655,6 @@ class KmlEditorPage(QWidget):
         self.simplification_status_label.setWordWrap(True)
         self.simplification_status_label.setAccessibleName("Resolution reduction status")
         layout.addWidget(self.simplification_status_label)
-        layout.addStretch()
         actions = QHBoxLayout()
         self.simplification_reset_btn = QPushButton("Reset settings")
         self.simplification_preview_btn = QPushButton("Preview reduction")
@@ -672,6 +671,7 @@ class KmlEditorPage(QWidget):
         actions.addWidget(self.simplification_preview_btn)
         actions.addWidget(self.simplification_apply_btn)
         layout.addLayout(actions)
+        layout.addStretch()
         return page
 
     def _build_shortcuts(self) -> None:
@@ -715,12 +715,12 @@ class KmlEditorPage(QWidget):
         )
 
     def _set_tab_order(self) -> None:
-        self.setTabOrder(self.file_list, self.add_files_btn)
-        self.setTabOrder(self.add_files_btn, self.remove_files_btn)
-        self.setTabOrder(self.remove_files_btn, self.text_mode_button)
         self.setTabOrder(self.text_mode_button, self.crop_mode_button)
         self.setTabOrder(self.crop_mode_button, self.simplify_mode_button)
-        self.setTabOrder(self.simplify_mode_button, self.restore_btn)
+        self.setTabOrder(self.simplify_mode_button, self.file_list)
+        self.setTabOrder(self.file_list, self.add_files_btn)
+        self.setTabOrder(self.add_files_btn, self.remove_files_btn)
+        self.setTabOrder(self.remove_files_btn, self.restore_btn)
         self.setTabOrder(self.restore_btn, self.validate_btn)
         self.setTabOrder(self.validate_btn, self.save_btn)
         self.setTabOrder(self.save_btn, self.save_as_btn)
@@ -842,6 +842,7 @@ class KmlEditorPage(QWidget):
             self._rendering = False
         count = len(self.model.documents)
         self.file_count_label.setText(f"{count} file" if count == 1 else f"{count} files")
+        self.file_list.updateGeometry()
 
     def _active_item_changed(self, current, _previous) -> None:
         if not self._rendering:
