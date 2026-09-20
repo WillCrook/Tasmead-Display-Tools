@@ -1,0 +1,2 @@
+# Optional development tooling; not part of the packaged application.
+psutil==7.2.2

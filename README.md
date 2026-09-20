@@ -71,6 +71,14 @@ same local ENU transformation as the numeric East and North controls. Use
 saved or exported, and moving an anchor changes only the adjusted preview and
 export document, not the source KML file.
 
+Hidden, settled previews can freeze until needed, and unchanged geometry is not
+uploaded again during scene updates. The graphics compatibility defaults remain
+unchanged. On macOS, try the opt-in Metal candidate with
+`TASMEAD_MAP_RENDERING_PROFILE=metal python src/main.py`; this selects Metal without
+periodic repainting. Explicit backend/watchdog overrides take precedence.
+See [map performance](docs/map-performance.md) for orbit and right-drag benchmarks,
+the compatibility fallback, and frame-rate measurement limits.
+
 ## Authors
 Will Crook – Tasmead Display Tool
 [GitHub](https://github.com/WillCrook)

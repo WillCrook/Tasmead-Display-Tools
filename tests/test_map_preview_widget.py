@@ -408,7 +408,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertIn("element.path = geometry.coordinates", _PREVIEW_HTML)
         self.assertIn("removeElement(item.element)", _PREVIEW_HTML)
         self.assertIn(
-            "if (mapCreated || Boolean(fitRequested)) fitScene();",
+            "if (camera) fitScene(camera);",
             _PREVIEW_HTML,
         )
         self.assertIn("selectedTraceId", _PREVIEW_HTML)
@@ -417,6 +417,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertIn("setSelectedTrace(traceId, fitRequested=false)", _PREVIEW_HTML)
 
     def test_trace_selection_switches_controls_clears_measurement_and_recentres(self):
+        self.widget.show()
         scene = scene_with_two_traces()
         traces = list(scene.traces)
         traces[1] = traces[1].with_adjustment(
@@ -500,6 +501,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertEqual(list(clicks[0]), [7, 51.25, -1.5])
 
     def test_measurement_collects_wgs84_legs_and_remains_until_cleared(self):
+        self.widget.show()
         self.widget._page_generation = 3
         with patch.object(self.widget, "_run_javascript") as javascript:
             self.widget.measure_tool_button.setChecked(True)
@@ -1243,6 +1245,7 @@ class MapPreviewControlsTests(unittest.TestCase):
         self.assertIn("KML export remains available", self.widget.status_label.text())
 
     def test_oversized_scene_is_a_visible_failure_and_is_not_simplified(self):
+        self.widget.show()
         with patch.object(self.widget, "_ensure_web_view", return_value=False):
             self.widget.set_scene(scene_with_two_traces(), "test-key")
         self.widget._shell_ready = True
@@ -1258,12 +1261,13 @@ class MapPreviewControlsTests(unittest.TestCase):
             while self.widget._payload_task is not None and time.monotonic() < deadline:
                 QTest.qWait(5)
 
-        javascript.assert_not_called()
+        self.assertFalse(any("Scene" in call.args[0] for call in javascript.call_args_list))
         self.assertIn("too large", self.widget.status_label.text())
         self.assertIn("No vertices were simplified", self.widget.status_label.text())
         self.assertFalse(self.widget.apply_button.isEnabled())
 
     def test_render_transport_coalesces_fit_requests_and_consumes_them_once(self):
+        self.widget.show()
         with patch.object(self.widget, "_ensure_web_view", return_value=False):
             self.widget.set_scene(scene_with_two_traces(), "test-key")
         self.widget._failed_generation = None
@@ -1568,6 +1572,94 @@ class LiveGoogleMapsCspSmokeTests(unittest.TestCase):
             "} : null;"
             "})()",
         )
+
+    def _assert_camera_change_renders_without_capture(self, widget):
+        from PyQt6.QtQuickWidgets import QQuickWidget
+
+        callbacks = []
+        windows = [child.quickWindow() for child in widget._web_view.findChildren(QQuickWidget)]
+        self.assertTrue(windows, "No passive Qt renderer observer is available.")
+        def rendered():
+            callbacks.append(True)
+        for window in windows:
+            window.afterRendering.connect(rendered)
+        try:
+            self.assertTrue(self._evaluate_javascript(widget,
+                "(() => { const map=document.querySelector('gmp-map-3d'); "
+                "map.heading=(Number(map.heading)+15)%360; return true; })()"))
+            deadline = time.monotonic() + 5
+            while not callbacks and time.monotonic() < deadline:
+                QTest.qWait(25)
+            self.assertTrue(callbacks, "Qt did not render the camera change without a capture.")
+        finally:
+            for window in windows:
+                window.afterRendering.disconnect(rendered)
+
+    def test_native_workspace_window_transitions_and_renderer_recovery(self):
+        if os.environ.get("QT_QPA_PLATFORM") in {"offscreen", "minimal"}:
+            self.skipTest("requires a visible native desktop")
+        import signal
+
+        host = QStackedWidget()
+        placeholder = QWidget()
+        widget = MapPreviewWidget()
+        host.addWidget(placeholder)
+        host.addWidget(widget)
+        host.resize(1200, 800)
+        host.setCurrentWidget(widget)
+        host.show()
+        try:
+            self.assertTrue(widget._ensure_web_view())
+            outcome = self._run_and_wait(widget, lambda: widget.set_scene(scene_with_two_traces(), LIVE_GOOGLE_MAPS_API_KEY))
+            self.assertTrue(outcome)
+            self.assertEqual(outcome[0][0], "acknowledged")
+            self._evaluate_javascript(widget, "document.querySelector('gmp-map-3d').__tasmeadRetainedSmoke=true")
+            generation = widget._page_generation
+            transitions = [
+                (lambda: host.setCurrentWidget(placeholder), lambda: host.setCurrentWidget(widget)),
+                (host.hide, host.show),
+                (host.showMinimized, host.showNormal),
+                (host.showFullScreen, host.showNormal),
+                (host.hide, host.show),
+            ]
+            for leave, restore in transitions:
+                before = self._map_snapshot(widget)
+                leave()
+                self._settle_events(600)
+                restore()
+                self._settle_events(1000)
+                after = self._map_snapshot(widget)
+                self.assertTrue(after["retained"])
+                self.assertEqual(widget._page_generation, generation)
+                for axis in ("lat", "lng", "altitude"):
+                    self.assertAlmostEqual(after["center"][axis], before["center"][axis], places=7)
+                for key in ("range", "tilt", "heading"):
+                    self.assertAlmostEqual(after[key], before[key], places=6)
+                self.assertEqual(after["point"], before["point"])
+                self._assert_camera_change_renders_without_capture(widget)
+                self._settle_events(300)
+
+            # Terminate only this standalone test view's renderer, then use the
+            # existing recovery path. A renderer restart necessarily reloads Maps.
+            renderer_pid = widget._web_view.page().renderProcessPid()
+            self.assertGreater(renderer_pid, 0)
+            self.assertNotEqual(renderer_pid, os.getpid())
+            os.kill(renderer_pid, signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while not widget._web_runtime_recreation_required and time.monotonic() < deadline:
+                QTest.qWait(25)
+            self.assertTrue(widget._web_runtime_recreation_required)
+            self.assertTrue(widget._reload_shell())
+            deadline = time.monotonic() + 45
+            while not widget.apply_button.isEnabled() and time.monotonic() < deadline:
+                QTest.qWait(25)
+            self.assertTrue(widget.apply_button.isEnabled(), "Renderer recovery did not acknowledge a scene.")
+            self.assertGreater(widget._page_generation, generation)
+            self._assert_camera_change_renders_without_capture(widget)
+        finally:
+            widget.shutdown()
+            host.close()
+            QApplication.processEvents()
 
     def test_live_map_reaches_steady_state_without_csp_failures(self):
         widget = MapPreviewWidget()

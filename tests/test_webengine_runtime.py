@@ -6,15 +6,24 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from webengine_runtime import select_scene_graph_backend
+from webengine_runtime import presentation_watchdog_enabled, select_scene_graph_backend
 
 
 class WebEngineRuntimeTests(unittest.TestCase):
+    def test_watchdog_defaults_to_compatibility_and_requires_explicit_opt_out(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(presentation_watchdog_enabled())
+            os.environ["TASMEAD_MAP_PRESENTATION_WATCHDOG"] = "0"
+            self.assertFalse(presentation_watchdog_enabled())
+            os.environ["TASMEAD_MAP_PRESENTATION_WATCHDOG"] = "unexpected"
+            self.assertTrue(presentation_watchdog_enabled())
+
     def test_macos_defaults_to_opengl(self):
         environment = {}
 
@@ -28,6 +37,32 @@ class WebEngineRuntimeTests(unittest.TestCase):
         select_scene_graph_backend(platform="darwin", environ=environment)
 
         self.assertEqual(environment["QSG_RHI_BACKEND"], "metal")
+
+    def test_metal_candidate_selects_native_presentation_only_on_macos(self):
+        for platform in ("darwin", "win32", "linux"):
+            with self.subTest(platform=platform):
+                environment = {"TASMEAD_MAP_RENDERING_PROFILE": "metal"}
+                select_scene_graph_backend(platform=platform, environ=environment)
+                self.assertEqual(environment.get("QSG_RHI_BACKEND"), "metal" if platform == "darwin" else None)
+                self.assertEqual(presentation_watchdog_enabled(platform=platform, environ=environment), platform != "darwin")
+
+    def test_candidate_preserves_backend_and_watchdog_overrides(self):
+        environment = {"TASMEAD_MAP_RENDERING_PROFILE": "metal", "QSG_RHI_BACKEND": "opengl"}
+        select_scene_graph_backend(platform="darwin", environ=environment)
+        self.assertEqual(environment["QSG_RHI_BACKEND"], "opengl")
+        self.assertTrue(presentation_watchdog_enabled(platform="darwin", environ=environment))
+        environment["TASMEAD_MAP_PRESENTATION_WATCHDOG"] = "0"
+        self.assertFalse(presentation_watchdog_enabled(platform="darwin", environ=environment))
+        environment["QSG_RHI_BACKEND"] = "metal"
+        for value in ("1", "unexpected", ""):
+            environment["TASMEAD_MAP_PRESENTATION_WATCHDOG"] = value
+            self.assertTrue(presentation_watchdog_enabled(platform="darwin", environ=environment))
+
+    def test_unknown_profile_keeps_compatibility(self):
+        environment = {"TASMEAD_MAP_RENDERING_PROFILE": "typo"}
+        select_scene_graph_backend(platform="darwin", environ=environment)
+        self.assertEqual(environment["QSG_RHI_BACKEND"], "opengl")
+        self.assertTrue(presentation_watchdog_enabled(platform="darwin", environ=environment))
 
     def test_other_platforms_keep_qt_defaults(self):
         for platform in ("win32", "linux"):

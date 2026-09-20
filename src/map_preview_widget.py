@@ -47,6 +47,7 @@ from services.map_preview import (
     TraceAdjustment,
     preview_payload,
 )
+from webengine_runtime import presentation_watchdog_enabled
 
 try:  # WebEngine is optional until the user requests a preview.
     from PyQt6.QtWebChannel import QWebChannel
@@ -315,8 +316,10 @@ _PREVIEW_HTML = r"""<!doctype html>
       map: null, payload: null, latestRevision: -1, renderTimeout: null,
       generation: initialGeneration, cspFailed: false, cspDiagnostics: new Map(),
       libraries: null, renderedTraces: new Map(), awaitingRevision: null,
+      librariesPromise: null, pendingRender: null, renderFrame: null,
+      appliedRevision: -1, isSteady: false, committing: false,
       toolMode: 'navigate', selectedTraceId: null,
-      measurement: {payload: {points: []}, line: null, markers: []}
+      measurement: {payload: {points: []}, renderedPoints: null, line: null, markers: []}
     };
     const status = document.getElementById('state');
     const host = document.getElementById('map-host');
@@ -432,13 +435,12 @@ _PREVIEW_HTML = r"""<!doctype html>
     function allCoordinates(trace) {
       const points = [];
       for (const geometry of trace.geometries || []) {
-        points.push(...(geometry.coordinates || []));
+        for (const point of geometry.coordinates || []) points.push(point);
       }
       return points;
     }
-    function fitScene() {
-      if (!state.map || !state.payload) return;
-      const trace = selectedTrace(state.payload);
+    function sceneCamera(payload) {
+      const trace = selectedTrace(payload);
       if (!trace) return;
       const points = allCoordinates(trace);
       if (!points.length) return;
@@ -467,10 +469,24 @@ _PREVIEW_HTML = r"""<!doctype html>
       while (centreLng < -180) centreLng += 360;
       const centreLat = originLat + centreNorth / latScale;
       const span = Math.max(eastMax-eastMin, northMax-northMin, altitudeMax-altitudeMin, 80);
-      state.map.center = { lat: centreLat, lng: centreLng, altitude: Math.max(0, altitudeMax * .25) };
-      state.map.range = Math.max(250, span * 2.8);
-      state.map.tilt = 60;
-      state.map.heading = 0;
+      return {
+        center: {lat: centreLat, lng: centreLng, altitude: Math.max(0, altitudeMax * .25)},
+        range: Math.max(250, span * 2.8), tilt: 60, heading: 0
+      };
+    }
+    function cameraDiffers(camera) {
+      if (!camera || !state.map) return Boolean(camera);
+      const current = state.map.center;
+      return !current || ['lat', 'lng', 'altitude'].some(key => current[key] !== camera.center[key])
+        || ['range', 'tilt', 'heading'].some(key => state.map[key] !== camera[key]);
+    }
+    function fitScene(camera=sceneCamera(state.payload)) {
+      if (!camera || !state.map || !cameraDiffers(camera)) return false;
+      state.map.center = camera.center;
+      state.map.range = camera.range;
+      state.map.tilt = camera.tilt;
+      state.map.heading = camera.heading;
+      return true;
     }
     function removeElement(element) {
       if (element && typeof element.remove === 'function') element.remove();
@@ -499,27 +515,81 @@ _PREVIEW_HTML = r"""<!doctype html>
         setElementAttached(rendered.anchor, visible);
       }
     }
-    function updateGeometry(element, geometry) {
+    function sameCoordinates(left, right) {
+      if (left === right) return true;
+      if (!left || !right || left.length !== right.length) return false;
+      for (let index = 0; index < left.length; index += 1) {
+        const a = left[index], b = right[index];
+        if (a.lat !== b.lat || a.lng !== b.lng || a.altitude !== b.altitude) return false;
+      }
+      return true;
+    }
+    function geometryChanges(geometry, previous) {
+      return {
+        altitude: !previous || previous.altitudeMode !== geometry.altitudeMode,
+        colour: !previous || previous.style.strokeColor !== geometry.style.strokeColor,
+        width: !previous || previous.style.strokeWidth !== geometry.style.strokeWidth,
+        path: !previous || !sameCoordinates(previous.coordinates, geometry.coordinates),
+        extrude: geometry.type === 'polyline' && (!previous || Boolean(previous.extrude) !== Boolean(geometry.extrude)),
+        tessellate: geometry.type === 'polyline' && (!previous || Boolean(previous.tessellate) !== Boolean(geometry.tessellate)),
+        fill: geometry.type === 'polygon' && (!previous || previous.style.fillColor !== geometry.style.fillColor)
+      };
+    }
+    function sameAnchor(left, right) {
+      return left && right && ['lat', 'lng', 'altitude', 'altitudeMode', 'label']
+        .every(key => left[key] === right[key]);
+    }
+    function prepareScene(payload) {
+      // Compare the full, exact coordinates before the drawing callback. Keep
+      // references to committed payloads; do not clone or simplify path arrays.
+      const traces = new Map();
+      for (const trace of payload.traces) {
+        const rendered = state.renderedTraces.get(String(trace.id));
+        const geometries = new Map();
+        const anchorChanged = !rendered || !sameAnchor(rendered.anchorPayload, trace.anchor);
+        let changed = anchorChanged || trace.geometries.length !== rendered.geometries.size;
+        for (const geometry of trace.geometries) {
+          const item = rendered && rendered.geometries.get(String(geometry.id));
+          const changes = geometryChanges(geometry,
+            item && item.type === geometry.type ? item.payload : null);
+          changed ||= Object.values(changes).some(Boolean);
+          geometries.set(String(geometry.id), changes);
+        }
+        traces.set(String(trace.id), {geometries, anchorChanged, changed});
+      }
+      return {traces};
+    }
+    function visibleSceneChanged(payload, prepared) {
+      const visibleId = String(selectedTrace(payload).id);
+      if (prepared.traces.get(visibleId).changed) return true;
+      for (const [traceId, rendered] of state.renderedTraces) {
+        if (traceId !== visibleId && (
+          (rendered.anchor && rendered.anchor.parentElement === state.map)
+          || [...rendered.geometries.values()].some(item => item.element.parentElement === state.map)
+        )) return true;
+      }
+      return false;
+    }
+    function updateGeometry(element, geometry, changes) {
       const {AltitudeMode} = state.libraries;
-      element.altitudeMode = altitudeMode(AltitudeMode, geometry.altitudeMode);
-      element.strokeColor = geometry.style.strokeColor;
-      element.strokeWidth = geometry.style.strokeWidth;
-      element.path = geometry.coordinates;
+      if (changes.altitude) element.altitudeMode = altitudeMode(AltitudeMode, geometry.altitudeMode);
+      if (changes.colour) element.strokeColor = geometry.style.strokeColor;
+      if (changes.width) element.strokeWidth = geometry.style.strokeWidth;
+      if (changes.path) element.path = geometry.coordinates;
       if (geometry.type === 'polyline') {
-        element.extruded = Boolean(geometry.extrude);
-        element.geodesic = Boolean(geometry.tessellate);
-      } else {
+        if (changes.extrude) element.extruded = Boolean(geometry.extrude);
+        if (changes.tessellate) element.geodesic = Boolean(geometry.tessellate);
+      } else if (changes.fill) {
         // KML's default PolyStyle is opaque white when no fill is supplied.
         element.fillColor = geometry.style.fillColor || '#ffffffff';
       }
     }
-    function createGeometry(geometry) {
+    function createGeometry(geometry, changes) {
       const {Polyline3DElement, Polygon3DElement} = state.libraries;
       const element = geometry.type === 'polyline'
         ? new Polyline3DElement()
         : new Polygon3DElement();
-      updateGeometry(element, geometry);
-      state.map.append(element);
+      updateGeometry(element, geometry, changes);
       return element;
     }
     function createPin(options) {
@@ -536,7 +606,6 @@ _PREVIEW_HTML = r"""<!doctype html>
           glyphColor: '#ffffff', glyphText: 'A'
         });
         if (pin && rendered.anchor.append) rendered.anchor.append(pin);
-        state.map.append(rendered.anchor);
       }
       rendered.anchor.position = {
         lat: trace.anchor.lat,
@@ -547,11 +616,13 @@ _PREVIEW_HTML = r"""<!doctype html>
         AltitudeMode, trace.anchor.altitudeMode
       );
       rendered.anchor.label = trace.anchor.label;
+      rendered.anchorPayload = trace.anchor;
     }
-    function reconcileScene(payload) {
+    function reconcileScene(payload, prepared) {
       const retainedTraceIds = new Set();
       for (const trace of payload.traces) {
         const traceId = String(trace.id);
+        const changes = prepared.traces.get(traceId);
         retainedTraceIds.add(traceId);
         let rendered = state.renderedTraces.get(traceId);
         if (!rendered) {
@@ -565,11 +636,13 @@ _PREVIEW_HTML = r"""<!doctype html>
           let item = rendered.geometries.get(geometryId);
           if (!item || item.type !== geometry.type) {
             if (item) removeElement(item.element);
-            item = {type: geometry.type, element: createGeometry(geometry)};
+            item = {type: geometry.type,
+              element: createGeometry(geometry, changes.geometries.get(geometryId))};
             rendered.geometries.set(geometryId, item);
           } else {
-            updateGeometry(item.element, geometry);
+            updateGeometry(item.element, geometry, changes.geometries.get(geometryId));
           }
+          item.payload = geometry;
         }
         for (const [geometryId, item] of rendered.geometries) {
           if (!retainedGeometryIds.has(geometryId)) {
@@ -577,7 +650,7 @@ _PREVIEW_HTML = r"""<!doctype html>
             rendered.geometries.delete(geometryId);
           }
         }
-        updateAnchor(rendered, trace);
+        if (changes.anchorChanged) updateAnchor(rendered, trace);
       }
       for (const [traceId, rendered] of state.renderedTraces) {
         if (!retainedTraceIds.has(traceId)) {
@@ -592,6 +665,8 @@ _PREVIEW_HTML = r"""<!doctype html>
         ? payload : {points: []};
       if (!state.map || !state.libraries) return;
       const points = state.measurement.payload.points;
+      if (sameCoordinates(points, state.measurement.renderedPoints)) return;
+      state.measurement.renderedPoints = points;
       const {AltitudeMode, Marker3DElement, Polyline3DElement} = state.libraries;
       if (points.length >= 2) {
         if (!state.measurement.line) {
@@ -631,13 +706,13 @@ _PREVIEW_HTML = r"""<!doctype html>
       }
     }
     function acknowledgeRevisionIfReady(isSteady) {
-      const revision = state.latestRevision;
+      const revision = state.appliedRevision;
       if (state.bridge && revision >= 0) {
         state.bridge.presentationStateChanged(
           state.generation, revision, Boolean(isSteady)
         );
       }
-      if (!isSteady || state.awaitingRevision !== revision) return;
+      if (!isSteady || state.committing || state.awaitingRevision !== revision) return;
       state.awaitingRevision = null;
       if (state.renderTimeout) clearTimeout(state.renderTimeout);
       state.renderTimeout = null;
@@ -669,7 +744,8 @@ _PREVIEW_HTML = r"""<!doctype html>
         'Google rejected the map configuration. Check the API key, restrictions, Maps JavaScript API access, and billing.'
       ));
       map.addEventListener('gmp-steadychange', event => {
-        if (!state.cspFailed) acknowledgeRevisionIfReady(Boolean(event.isSteady));
+        state.isSteady = Boolean(event.isSteady);
+        if (!state.cspFailed) acknowledgeRevisionIfReady(state.isSteady);
       });
       map.addEventListener('gmp-click', event => {
         if (state.toolMode === 'navigate' || !event.position) return;
@@ -695,11 +771,10 @@ _PREVIEW_HTML = r"""<!doctype html>
         if (state.bridge) state.bridge.renderStarted(state.generation, Number(revision));
         if (!state.map) setStatus('Opening KML preview…');
         if (!state.libraries) {
-          const [maps3d, markerLibrary] = await Promise.all([
-            google.maps.importLibrary('maps3d'),
-            google.maps.importLibrary('marker')
-          ]);
-          state.libraries = {...maps3d, PinElement: markerLibrary.PinElement};
+          state.librariesPromise ||= Promise.all([
+            google.maps.importLibrary('maps3d'), google.maps.importLibrary('marker')
+          ]).then(([maps3d, markerLibrary]) => ({...maps3d, PinElement: markerLibrary.PinElement}));
+          state.libraries = await state.librariesPromise;
         }
         if (state.cspFailed || Number(revision) !== state.latestRevision) return;
         const {Map3DElement, Polyline3DElement, Polygon3DElement} = state.libraries;
@@ -709,21 +784,49 @@ _PREVIEW_HTML = r"""<!doctype html>
         if (!payload || payload.version !== 2 || !Array.isArray(payload.traces) || !payload.traces.length) {
           throw new Error('Unsupported preview payload.');
         }
-        const mapCreated = ensureMap(payload);
-        state.awaitingRevision = Number(revision);
-        state.payload = payload;
-        reconcileScene(payload);
-        if (mapCreated || Boolean(fitRequested)) fitScene();
-        if (state.renderTimeout) clearTimeout(state.renderTimeout);
-        state.renderTimeout = setTimeout(() => {
-          if (state.awaitingRevision === Number(revision) && Number(revision) === state.latestRevision) {
-            fail('render', 'Google Maps did not reach a stable rendered state. Check WebGL support and try again.');
-          }
-        }, 20000);
+        const fit = Boolean(fitRequested) || Boolean(state.pendingRender && state.pendingRender.fitRequested);
+        state.pendingRender = {
+          payload, revision: Number(revision), fitRequested: fit,
+          prepared: prepareScene(payload),
+          camera: !state.map || fit ? sceneCamera(payload) : null
+        };
+        if (state.renderFrame === null) state.renderFrame = requestAnimationFrame(commitPendingScene);
       } catch (_) {
         if (Number(revision) === state.latestRevision) {
           fail('render', 'Google Maps could not render this 3D scene. Check Maps 3D availability and WebGL support.');
         }
+      }
+    }
+
+    function commitPendingScene() {
+      state.renderFrame = null;
+      const pending = state.pendingRender;
+      state.pendingRender = null;
+      if (!pending || state.cspFailed || pending.revision !== state.latestRevision) return;
+      const {payload, revision, prepared, camera} = pending;
+      try {
+        const changed = !state.map || visibleSceneChanged(payload, prepared) || cameraDiffers(camera);
+        state.appliedRevision = revision;
+        state.awaitingRevision = revision;
+        state.committing = true;
+        if (changed) state.isSteady = false;
+        if (state.renderTimeout) clearTimeout(state.renderTimeout);
+        state.renderTimeout = setTimeout(() => {
+          if (state.awaitingRevision === revision && revision === state.latestRevision) {
+            fail('render', 'Google Maps did not reach a stable rendered state. Check WebGL support and try again.');
+          }
+        }, 20000);
+        ensureMap(payload);
+        state.payload = payload;
+        reconcileScene(payload, prepared);
+        if (camera) fitScene(camera);
+        state.committing = false;
+        // No-op updates need no new Maps event. A changed scene must first
+        // report steady; rAF merely schedules work, it is not a render receipt.
+        if (state.isSteady) acknowledgeRevisionIfReady(true);
+      } catch (_) {
+        state.committing = false;
+        fail('render', 'Google Maps could not render this 3D scene. Check Maps 3D availability and WebGL support.');
       }
     }
 
@@ -743,13 +846,18 @@ _PREVIEW_HTML = r"""<!doctype html>
           + '&v=quarterly&loading=async&libraries=maps3d,marker&auth_referrer_policy=origin&callback=tasmeadGoogleReady';
         document.head.append(script);
       },
-      beginScene(revision, total) { state.chunks.set(Number(revision), {total: Number(total), parts: []}); },
+      beginScene(revision, total) {
+        // An interrupted native transfer must not retain abandoned chunks.
+        state.chunks.clear();
+        state.chunks.set(Number(revision), {total: Number(total), parts: []});
+      },
       appendSceneChunk(revision, chunk) {
         const item = state.chunks.get(Number(revision));
         if (item) item.parts.push(String(chunk));
       },
       finishScene(revision, fitRequested=false) {
         const key = Number(revision);
+        if (key < state.latestRevision) return;
         const item = state.chunks.get(key);
         if (!item || item.parts.length !== item.total) {
           fail('transport', 'The preview scene was not transferred completely. Try again.');
@@ -1059,6 +1167,13 @@ class MapPreviewWidget(QWidget):
         self._loading_controls = False
         self._loading_active = False
         self._presentation_active = False
+        self._presentation_watchdog_enabled = presentation_watchdog_enabled()
+        self._page_has_rendered = False
+        self._browser_pending_revision: int | None = None
+        self._browser_revision: int | None = None
+        self._render_deferred = False
+        self._controls_deferred = False
+        self._selection_fit_deferred = False
         self._tool_mode = "navigate"
         self._measurement_points: list[tuple[float, float]] = []
         self._fit_scene_on_next_render = False
@@ -1384,6 +1499,12 @@ class MapPreviewWidget(QWidget):
             )
             bridge.map_clicked.connect(self._on_map_clicked)
             page.loadingChanged.connect(self._on_loading_changed)
+            page.visibleChanged.connect(
+                lambda _visible: self._page_visibility_changed(page)
+            )
+            page.recommendedStateChanged.connect(
+                lambda _state: self._update_page_lifecycle(page)
+            )
             if hasattr(page, "renderProcessTerminated"):
                 page.renderProcessTerminated.connect(
                     self._on_render_process_terminated
@@ -1409,6 +1530,12 @@ class MapPreviewWidget(QWidget):
         self._payload_transfer_timer.stop()
         self._payload_chunks.clear()
         self._fit_scene_on_next_render = False
+        self._page_has_rendered = False
+        self._browser_pending_revision = None
+        self._browser_revision = None
+        self._render_deferred = False
+        self._controls_deferred = False
+        self._selection_fit_deferred = False
         if self._web_view is not None:
             web_view = self._web_view
             self._web_view = None
@@ -1448,7 +1575,12 @@ class MapPreviewWidget(QWidget):
         )
         key = str(api_key).strip()
         reuse_session = (
-            self._session_reusable
+            (self._session_reusable or (
+                self._render_deferred
+                and self._page_has_rendered
+                and self._failed_generation != self._page_generation
+                and self._csp_failed_generation != self._page_generation
+            ))
             and self._shell_ready
             and self._web_view is not None
             and self._server is not None
@@ -1532,6 +1664,16 @@ class MapPreviewWidget(QWidget):
         return self._page_generation
 
     def _reload_shell(self) -> bool:
+        self._render_timer.stop()
+        if self._payload_task is not None:
+            self._payload_task.cancel()
+            self._payload_task = None
+        self._payload_transfer_timer.stop()
+        self._payload_chunks.clear()
+        self._render_deferred = False
+        self._browser_pending_revision = None
+        self._browser_revision = None
+        self._page_has_rendered = False
         self._stop_loading_watchdogs()
         self._stop_presentation_watchdog(clear_activity=True)
         self._session_reusable = False
@@ -1551,6 +1693,9 @@ class MapPreviewWidget(QWidget):
         if self._web_view is None or self._server is None:
             return False
         self._begin_page_generation()
+        # Invalidate queued worker results from the previous page as well.
+        self._revision += 1
+        self._activate_page()
         self._shell_ready = False
         self._acknowledged_revision = -1
         self._set_apply_enabled(False)
@@ -1660,6 +1805,7 @@ class MapPreviewWidget(QWidget):
         self._session_reusable = False
         if self._payload_task is not None:
             self._payload_task.cancel()
+            self._payload_task = None
         self._payload_transfer_timer.stop()
         self._payload_chunks.clear()
         self._fit_scene_on_next_render = (
@@ -1671,6 +1817,11 @@ class MapPreviewWidget(QWidget):
         self.status_label.setText("Updating preview…")
         self.retry_button.hide()
         self.open_settings_button.hide()
+        self._render_deferred = not self._preview_visible()
+        if self._render_deferred:
+            self._render_timer.stop()
+            self._update_page_lifecycle()
+            return
         if immediate:
             self._render_timer.stop()
             self._render_scene()
@@ -1685,6 +1836,10 @@ class MapPreviewWidget(QWidget):
             or self._csp_failed_generation == self._page_generation
         ):
             return
+        if not self._preview_visible():
+            self._render_deferred = True
+            return
+        self._render_deferred = False
         task = _PayloadTask(self._revision, self._scene)
         task.signals.completed.connect(
             self._payload_prepared,
@@ -1698,6 +1853,10 @@ class MapPreviewWidget(QWidget):
         if self._payload_task is not None and self._payload_task.revision == result.revision:
             self._payload_task = None
         if result.cancelled or result.revision != self._revision:
+            return
+        if self._render_deferred or not self._preview_visible():
+            self._render_deferred = True
+            self._update_page_lifecycle()
             return
         if result.error:
             self._show_error("render", result.error)
@@ -1724,6 +1883,9 @@ class MapPreviewWidget(QWidget):
         self._payload_transfer_timer.start(0)
 
     def _transfer_payload_chunks(self) -> None:
+        if not self._preview_visible():
+            self._defer_hidden_render()
+            return
         revision = self._payload_transfer_revision
         if revision != self._revision or not self._payload_chunks:
             self._payload_chunks.clear()
@@ -1738,6 +1900,8 @@ class MapPreviewWidget(QWidget):
         if stop < len(self._payload_chunks):
             self._payload_transfer_timer.start(0)
             return
+        self._browser_pending_revision = revision
+        self._browser_revision = revision
         self._run_javascript(
             "window.tasmead.finishScene("
             f"{revision}, {'true' if self._payload_transfer_fit else 'false'}"
@@ -1751,6 +1915,7 @@ class MapPreviewWidget(QWidget):
         page_getter = getattr(self._web_view, "page", None)
         page = page_getter() if callable(page_getter) else None
         if page is not None:
+            self._activate_page()
             page.runJavaScript(source)
 
     def _on_render_started(self, generation: int, revision: int) -> None:
@@ -1765,6 +1930,16 @@ class MapPreviewWidget(QWidget):
 
     def _on_render_acknowledged(self, generation: int, revision: int) -> None:
         if (
+            generation == self._page_generation
+            and revision == self._browser_pending_revision
+            and self._failed_generation != generation
+            and self._csp_failed_generation != generation
+        ):
+            self._browser_pending_revision = None
+            self._page_has_rendered = True
+            self._presentation_active = False
+            self._update_page_lifecycle()
+        if (
             generation != self._page_generation
             or revision != self._revision
             or self._failed_generation == generation
@@ -1776,6 +1951,7 @@ class MapPreviewWidget(QWidget):
         self._stop_presentation_watchdog(clear_activity=True)
         QTimer.singleShot(0, self._refresh_web_presentation)
         self._acknowledged_revision = revision
+        self._page_has_rendered = True
         self._session_reusable = (
             self._shell_ready
             and self._web_view is not None
@@ -1788,6 +1964,7 @@ class MapPreviewWidget(QWidget):
         self.open_settings_button.hide()
         self._set_apply_enabled(True)
         self._sync_measurement_overlay()
+        self._update_page_lifecycle()
 
     def _on_render_failed(self, generation: int, kind: str, message: str) -> None:
         if (
@@ -1811,7 +1988,7 @@ class MapPreviewWidget(QWidget):
     ) -> None:
         if (
             generation != self._page_generation
-            or revision != self._revision
+            or revision not in (self._revision, self._browser_revision)
             or self._failed_generation == generation
             or self._csp_failed_generation == generation
         ):
@@ -1820,12 +1997,91 @@ class MapPreviewWidget(QWidget):
         if is_steady:
             self._presentation_timer.stop()
             QTimer.singleShot(0, self._refresh_web_presentation)
-        elif self.isVisible() and self._web_view is not None:
+        elif self._presentation_watchdog_enabled and self._preview_visible():
             self._presentation_timer.start()
+        self._update_page_lifecycle()
 
     def _refresh_web_presentation(self) -> None:
-        if self._web_view is not None and self.isVisible():
+        if self._web_view is not None and self._preview_visible():
             self._web_view.update()
+
+    def _web_page(self):
+        getter = getattr(self._web_view, "page", None)
+        return getter() if callable(getter) else None
+
+    def _preview_visible(self) -> bool:
+        if not self.isVisible() or self.window().isMinimized():
+            return False
+        page = self._web_page()
+        return page is None or page.isVisible()
+
+    def _activate_page(self) -> None:
+        page = self._web_page()
+        if page is not None and page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
+            page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+
+    def _update_page_lifecycle(self, source_page=None) -> None:
+        page = self._web_page()
+        if page is None or (source_page is not None and source_page is not page):
+            return
+        if page.isVisible():
+            self._activate_page()
+            return
+        # A queued scene has no browser acknowledgement to wait for. An already
+        # submitted scene does: freezing it would suspend its timeout and events.
+        if (
+            not self._page_has_rendered
+            or not self._shell_ready
+            or page.isLoading()
+            or self._browser_pending_revision is not None
+            or self._presentation_active
+            or self._payload_task is not None
+            or self._payload_chunks
+            or self._render_timer.isActive()
+        ):
+            return
+        states = QWebEnginePage.LifecycleState
+        if page.recommendedState() in (states.Frozen, states.Discarded):
+            if page.lifecycleState() != states.Frozen:
+                page.setLifecycleState(states.Frozen)
+
+    def _defer_hidden_render(self) -> None:
+        self._presentation_timer.stop()
+        if self._render_timer.isActive() or self._payload_task is not None or self._payload_chunks:
+            self._render_deferred = True
+        self._render_timer.stop()
+        if self._payload_task is not None:
+            self._payload_task.cancel()
+            self._payload_task = None
+        if self._payload_chunks:
+            self._fit_scene_on_next_render |= self._payload_transfer_fit
+        self._payload_transfer_timer.stop()
+        self._payload_chunks.clear()
+        self._update_page_lifecycle()
+
+    def _resume_preview(self) -> None:
+        if not self._preview_visible():
+            return
+        self._activate_page()
+        if self._controls_deferred and self._shell_ready:
+            self._controls_deferred = False
+            fit_scene = self._selection_fit_deferred
+            self._selection_fit_deferred = False
+            self._sync_tool_mode()
+            self._sync_selected_trace(fit_scene=fit_scene)
+            self._sync_measurement_overlay()
+        if self._render_deferred and self._shell_ready:
+            self._render_scene()
+        if self._presentation_watchdog_enabled and self._presentation_active:
+            self._presentation_timer.start()
+
+    def _page_visibility_changed(self, page) -> None:
+        if page is not self._web_page():
+            return
+        if self._preview_visible():
+            self._resume_preview()
+        else:
+            self._defer_hidden_render()
 
     def _stop_presentation_watchdog(self, *, clear_activity: bool) -> None:
         self._presentation_timer.stop()
@@ -1833,13 +2089,14 @@ class MapPreviewWidget(QWidget):
             self._presentation_active = False
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt virtual method
+        self._activate_page()
         super().showEvent(event)
-        if self._presentation_active and self._web_view is not None:
-            self._presentation_timer.start()
+        self._resume_preview()
+        QTimer.singleShot(0, self._resume_preview)
         QTimer.singleShot(0, self._refresh_web_presentation)
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt virtual method
-        self._presentation_timer.stop()
+        self._defer_hidden_render()
         super().hideEvent(event)
 
     def _on_security_policy_violation(
@@ -1909,6 +2166,8 @@ class MapPreviewWidget(QWidget):
         )
 
     def _show_error(self, kind: str, message: str) -> None:
+        self._browser_pending_revision = None
+        self._render_deferred = False
         self._render_timer.stop()
         if self._payload_task is not None:
             self._payload_task.cancel()
@@ -1970,6 +2229,9 @@ class MapPreviewWidget(QWidget):
         self._sync_tool_mode()
 
     def _sync_tool_mode(self) -> None:
+        if not self._preview_visible():
+            self._controls_deferred = True
+            return
         self._run_javascript(
             "window.tasmead.setToolMode("
             f"{json.dumps(self._tool_mode)}"
@@ -2102,6 +2364,9 @@ class MapPreviewWidget(QWidget):
             )
 
     def _sync_measurement_overlay(self) -> None:
+        if not self._preview_visible():
+            self._controls_deferred = True
+            return
         payload = {
             "points": [
                 {"lat": latitude, "lng": longitude, "altitude": 0.0}
@@ -2131,6 +2396,10 @@ class MapPreviewWidget(QWidget):
         self._sync_selected_trace(fit_scene=True)
 
     def _sync_selected_trace(self, *, fit_scene: bool) -> None:
+        if not self._preview_visible():
+            self._controls_deferred = True
+            self._selection_fit_deferred |= fit_scene
+            return
         trace_id = self.trace_selector.currentData(Qt.ItemDataRole.UserRole)
         if not isinstance(trace_id, str) or not trace_id:
             return

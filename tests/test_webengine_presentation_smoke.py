@@ -21,6 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QCoreApplication, QEvent, QEventLoop, QTimer
 from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtQuickWidgets import QQuickWidget
 from PyQt6.QtWidgets import QApplication
 
 try:
@@ -99,10 +100,18 @@ class WebEnginePresentationSmokeTests(unittest.TestCase):
             )
             self.assertGreater(first.red(), first.green() + 50)
 
+            render_callbacks = []
+            quick_widgets = view.findChildren(QQuickWidget)
+            self.assertTrue(quick_widgets, "No passive Qt render observer is available.")
+            for quick_widget in quick_widgets:
+                quick_widget.quickWindow().afterRendering.connect(lambda: render_callbacks.append(True))
+
             self.assertTrue(
                 self._run_javascript(view, "window.paint(0, 1, 0);")
             )
             self._wait(250)
+            # Assert before grab(): a screenshot can itself trigger rendering.
+            self.assertTrue(render_callbacks, "Qt did not render the changed WebGL content without a forced repaint.")
             second_image = view.grab().toImage()
             second = second_image.pixelColor(
                 second_image.width() // 2,

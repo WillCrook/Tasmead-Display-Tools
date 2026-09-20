@@ -7,17 +7,37 @@ import sys
 from collections.abc import MutableMapping
 
 
+def presentation_watchdog_enabled(
+    *,
+    platform: str | None = None,
+    environ: MutableMapping[str, str] | None = None,
+) -> bool:
+    """Retain compatibility by default; the opt-in Metal profile uses native paints."""
+
+    active_platform = sys.platform if platform is None else platform
+    active_environ = os.environ if environ is None else environ
+    override = active_environ.get("TASMEAD_MAP_PRESENTATION_WATCHDOG")
+    if override is not None:
+        return override != "0"
+    return not (
+        active_platform == "darwin"
+        and active_environ.get("TASMEAD_MAP_RENDERING_PROFILE") == "metal"
+        and active_environ.get("QSG_RHI_BACKEND", "metal") == "metal"
+    )
+
+
 def select_scene_graph_backend(
     *,
     platform: str | None = None,
     environ: MutableMapping[str, str] | None = None,
 ) -> None:
-    """Choose the stable macOS Qt Quick backend without overriding the user."""
+    """Select compatibility or the opt-in macOS candidate, preserving overrides."""
 
     active_platform = sys.platform if platform is None else platform
     active_environ = os.environ if environ is None else environ
     if active_platform == "darwin":
-        active_environ.setdefault("QSG_RHI_BACKEND", "opengl")
+        candidate = active_environ.get("TASMEAD_MAP_RENDERING_PROFILE") == "metal"
+        active_environ.setdefault("QSG_RHI_BACKEND", "metal" if candidate else "opengl")
 
 
 def configure_webengine_runtime() -> None:
@@ -35,4 +55,8 @@ def configure_webengine_runtime() -> None:
     )
 
 
-__all__ = ["configure_webengine_runtime", "select_scene_graph_backend"]
+__all__ = [
+    "configure_webengine_runtime",
+    "presentation_watchdog_enabled",
+    "select_scene_graph_backend",
+]
